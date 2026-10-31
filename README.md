@@ -21,7 +21,7 @@
 
 准备一个 Cloudflare 账号和 GitHub 账号，随后：
 
-1. 点击上方 **Deploy to Cloudflare**。授权 Cloudflare 连接 GitHub，按页面提示选择或复制此仓库，应用名可用 `repotrace`。
+1. **仓库所有者推荐连接现有仓库**：进入 Cloudflare 控制台 → **Workers & Pages → 创建应用 → 导入现有 Git 仓库 / 连接 GitHub**，选择 GitHub 账号 `shihuili1218` 和仓库 `repotrace`，生产分支选 `main`。如果想把项目复制到另一个账号的新仓库，可使用上方 **Deploy to Cloudflare** 按钮。
 2. 保留仓库中的 Wrangler 配置。构建使用 `npm ci` 安装依赖，部署命令为 `npx wrangler deploy`（或 `npm run deploy`）。`wrangler.jsonc` 内置的构建命令会先执行 `npm run build`。
 3. Cloudflare 自动创建并绑定 D1 数据库 **DB**，同时配置 Cron。第一版不依赖 KV、R2、队列或付费外部数据库；部署后表结构会在首次 API / 定时执行时自动初始化，无需手动执行 SQL。
 4. 打开 Cloudflare 返回的 `*.workers.dev` 地址，**立即设置管理员密码**（12–256 个字符，建议密码管理器生成）。首次成功初始化者成为唯一管理员。
@@ -29,6 +29,29 @@
 6. 在 Cloudflare 的 Worker → **设置 → 变量和机密**中，建议添加 **Secret / 机密** `GITHUB_TOKEN`，保存并部署。然后在网页「设置」检查是否显示“已配置 GitHub Token”。
 
 如果部署按钮无法使用（例如仓库私有或已有同名仓库），在 Cloudflare 控制台 **Workers & Pages → 创建应用 → 连接 Git 仓库**，选择本仓库，构建和部署命令使用上面的值，部署到 **Workers**。这是 Worker + D1 应用，不是纯静态 Pages 站点。
+
+创建应用时使用以下设置（界面名称可能略有不同）：
+
+| 设置            | 值                                |
+| --------------- | --------------------------------- |
+| 仓库 / 生产分支 | `shihuili1218/repotrace` / `main` |
+| 根目录          | `/`（仓库根目录）                 |
+| 构建命令        | `npm run build`                   |
+| 部署命令        | `npx wrangler deploy`             |
+| 构建环境变量    | `NODE_VERSION=24`                 |
+
+Wrangler 也会执行其配置中的构建命令；控制台配置构建命令时可能重复构建一次，不影响结果。
+
+### 出现 `Failed to get repository contents` 怎么办
+
+这个错误出现在读取 GitHub 源码的阶段，尚未进入应用构建。它本身不能说明是代码问题，也不能单凭提示断定授权一定缺失。
+
+1. 打开 [GitHub 已安装的应用](https://github.com/settings/installations)，找到 **Cloudflare Workers and Pages** → **Configure**。
+2. 检查 **Repository access** 是否包含 `shihuili1218/repotrace`。使用 **Only select repositories** 时，保留原有选择，补选 `repotrace`，再保存。确认配置的是 `shihuili1218` 这个 GitHub 账号的安装。
+3. 返回 Cloudflare，从 **Workers & Pages → 创建应用 → 导入现有 Git 仓库**选择 `repotrace`，使用上表设置。此路径直接部署现有仓库，无需经过部署按钮的模板复制流程。
+4. 如果仓库仍不出现，使用 Cloudflare 仓库选择页的 **Manage GitHub installation / 管理 GitHub 授权**，核对它指向的 GitHub 账号和安装是否与第 1 步一致。若授权正确但仍报错，需要检查 Cloudflare 错误页提供的请求状态 / Request ID，以区分连接授权异常与平台获取源码失败。
+
+应用运行时使用的 `GITHUB_TOKEN` 在部署后配置；Cloudflare 读取源码使用它自己的 GitHub App 授权。
 
 ### 可选：保护首次初始化
 
