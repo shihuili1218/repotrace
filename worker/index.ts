@@ -302,7 +302,8 @@ export default {
         : await env.ASSETS.fetch(request);
     } catch (error) {
       if (error instanceof AppError) response = json({ error: error.message }, error.status);
-      else if (error instanceof GitHubError) response = json({ error: error.message }, 502);
+      else if (error instanceof GitHubError)
+        response = json({ error: error.message, github: error.diagnostic }, 502);
       else {
         // Log a class only: SQL bindings / upstream errors may contain sensitive data.
         console.error('Request failed:', error instanceof Error ? error.name : 'UnknownError');

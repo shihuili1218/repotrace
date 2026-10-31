@@ -51,6 +51,7 @@ worker/index.ts            路由、鉴权、定时入口、安全响应头
 worker/auth.ts             密码、会话、限速
 worker/db.ts               版本化、幂等 D1 迁移
 worker/github.ts           GitHub 数据源与分页/权限适配
+worker/github-errors.ts    上游错误诊断、临时限制识别与凭据脱敏
 worker/token-vault.ts      项目 Token 加密存储，密钥单独保存在 KV
 worker/monitors/stars.ts   Star 任务、租约、检查点、快照发布与集合差异
 worker/dashboard.ts        历史、统计和分页查询
@@ -59,3 +60,5 @@ e2e/                       Chromium 浏览器验证
 ```
 
 后续指标可在 `worker/monitors/` 新增独立采集模块，通过 `worker/db.ts` 追加迁移，再注册到定时入口和 `/api/settings` 的能力列表。GitHub 数据源由 `StarProvider` 接口注入测试；新增指标不必改写密码、会话与 Star 差异算法。没有为未实现的功能建立假接口或假统计数据。
+
+GitHub 失败响应会附带接口类别、HTTP 状态、脱敏后的 `message` 和 `Request ID`，便于区分权限、组织策略与临时限制。原始请求头、完整响应体及 SSO 授权参数不会返回到页面。

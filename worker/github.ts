@@ -1,4 +1,6 @@
-import { AppError, nowSeconds } from './types';
+import { AppError } from './types';
+import { githubFailure, GitHubError } from './github-errors';
+export { GitHubError } from './github-errors';
 
 export interface GitHubRepo {
   id: number;
@@ -19,16 +21,6 @@ export interface StarPage {
 export interface StarProvider {
   repository(name: string): Promise<GitHubRepo>;
   stargazers(name: string, page: number): Promise<StarPage>;
-}
-
-export class GitHubError extends Error {
-  constructor(
-    message: string,
-    public retryAt = 0,
-    public transient = false,
-  ) {
-    super(message);
-  }
 }
 
 export function validateGitHubToken(input: unknown): string {
@@ -72,42 +64,8 @@ export function github(input: string): StarProvider {
     } catch {
       throw new GitHubError('GitHub 暂时无法连接，将自动重试。', 0, true);
     }
-    if (!response.ok) {
-      if (
-        response.status === 429 ||
-        (response.status === 403 &&
-          (response.headers.get('X-RateLimit-Remaining') === '0' ||
-            response.headers.has('Retry-After')))
-      ) {
-        const retryAt = Math.max(
-          nowSeconds() + 60,
-          Number(response.headers.get('X-RateLimit-Reset')) || 0,
-          nowSeconds() + (Number(response.headers.get('Retry-After')) || 60),
-        );
-        throw new GitHubError('GitHub API 暂时限流，等待恢复后自动继续采集。', retryAt, true);
-      }
-      if (response.status === 401)
-        throw new GitHubError('此项目的 GitHub Token 无效或已过期，请在监控项目中更新 Token。');
-      if (response.status === 404)
-        throw new GitHubError(
-          '仓库不存在或此项目的 Token 无权访问。请检查仓库名称，以及 Token 的 Resource owner 和 Repository access。',
-        );
-      if (response.status === 403) {
-        const body = await response
-          .json<{ message?: string }>()
-          .catch(() => ({}) as { message?: string });
-        if (/secondary rate limit|abuse detection/i.test(body.message ?? ''))
-          throw new GitHubError('GitHub 暂时限制请求，稍后自动重试。', nowSeconds() + 300, true);
-        throw new GitHubError(
-          'GitHub 拒绝此项目 Token 的访问（403）。请检查组织访问策略及仓库读取权限，并更新项目 Token。',
-        );
-      }
-      throw new GitHubError(
-        `GitHub 请求失败（HTTP ${response.status}）。`,
-        0,
-        response.status >= 500,
-      );
-    }
+    if (!response.ok)
+      throw await githubFailure(response, token, stars ? 'stargazers' : 'repository');
     return response;
   }
   return {

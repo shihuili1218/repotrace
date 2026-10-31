@@ -487,7 +487,7 @@ describe('project credentials', () => {
       String(input).includes('/stargazers?')
         ? Response.json(
             { message: 'Resource not accessible by personal access token' },
-            { status: 403 },
+            { status: 403, headers: { 'X-GitHub-Request-Id': 'ABCD:1234:0001' } },
           )
         : Response.json({
             id: 100,
@@ -504,7 +504,18 @@ describe('project credentials', () => {
       session,
     );
     expect(rejected.status).toBe(502);
-    expect(await rejected.json()).toMatchObject({ error: expect.stringContaining('403') });
+    const rejection = await rejected.json();
+    expect(rejection).toMatchObject({
+      error: expect.stringContaining('403'),
+      github: {
+        status: 403,
+        operation: 'stargazers',
+        reason: 'permission',
+        message: 'Resource not accessible by personal access token',
+        requestId: 'ABCD:1234:0001',
+      },
+    });
+    expect(JSON.stringify(rejection)).not.toContain('project-token');
     expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM repositories').first('count')).toBe(
       0,
     );
