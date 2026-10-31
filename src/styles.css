@@ -700,7 +700,7 @@ strong {
   border-radius: 4px;
   background: transparent;
 }
-.range-switch button.selected {
+.range-switch button.active {
   background: #fff;
   color: #6272cf;
   box-shadow: 0 1px 4px #202b4820;
@@ -950,45 +950,6 @@ strong {
   margin: 0 2px;
   color: #c8cedb;
 }
-.collection-progress {
-  margin: 0 0 14px;
-}
-.collection-progress progress {
-  appearance: none;
-  display: block;
-  border: 0;
-  height: 3px;
-  width: 100%;
-  background: #edf0fb;
-  border-radius: 3px;
-}
-.collection-progress progress::-webkit-progress-bar {
-  background: #edf0fb;
-  border-radius: 3px;
-}
-.collection-progress progress::-webkit-progress-value {
-  background: #8c9bf0;
-  border-radius: 3px;
-}
-.collection-progress progress::-moz-progress-bar {
-  background: #8c9bf0;
-}
-.collection-progress small {
-  font-size: 9px;
-  color: #99a3c1;
-  display: block;
-  margin-top: 5px;
-}
-.repo-error {
-  font-size: 10px;
-  color: #d28282;
-  margin-bottom: 10px;
-  overflow-wrap: anywhere;
-}
-.repo-error .text-button {
-  font-size: 10px;
-  margin-left: 4px;
-}
 .changes-panel {
   margin-top: 27px;
 }
@@ -1009,7 +970,7 @@ strong {
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
 }
-.change-tabs button.selected {
+.change-tabs button.active {
   color: #6978cd;
   border-bottom-color: #6576dc;
 }
@@ -1275,26 +1236,26 @@ td small {
 .info-note > svg {
   flex-shrink: 0;
 }
-.token-banner {
+.webhook-banner {
   margin: 0 0 18px;
   align-items: center;
   flex-wrap: wrap;
   color: #6675b1;
 }
-.token-banner > span {
+.webhook-banner > span {
   flex: 1;
   min-width: 150px;
 }
-.token-banner strong {
+.webhook-banner strong {
   display: block;
   font-size: 12px;
 }
-.token-banner small {
+.webhook-banner small {
   display: block;
   margin-top: 3px;
   font-size: 11px;
 }
-.token-banner > button {
+.webhook-banner > button {
   margin-left: auto;
   font-size: 11px;
 }
@@ -1379,7 +1340,7 @@ td small {
 .settings-panel .settings-title > svg {
   color: #7f8ca9;
 }
-.token-guide {
+.webhook-guide {
   padding: 14px;
   border: 1px solid #eff1f8;
   border-radius: 7px;
@@ -1387,15 +1348,15 @@ td small {
   font-size: 10px;
   color: #9ca8bf;
 }
-.token-guide strong {
+.webhook-guide strong {
   color: #7c8aab;
   font-size: 10px;
 }
-.token-guide p {
+.webhook-guide p {
   line-height: 2;
   margin-top: 6px;
 }
-.token-guide code {
+.webhook-guide code {
   color: #7687bd;
   font-size: 11px;
 }
@@ -1428,7 +1389,8 @@ td small {
   max-width: calc(100vw - 30px);
   box-shadow: 0 25px 80px #25325825;
   color: #37425e;
-  overflow: visible;
+  overflow: auto;
+  max-height: calc(100dvh - 36px);
 }
 .dialog::backdrop {
   background: #26304f40;
@@ -2364,4 +2326,135 @@ td small {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+.copy-field {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.copy-field input {
+  min-width: 0;
+  font-family: monospace;
+}
+.copy-field .button {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 8px 12px;
+}
+.connection-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+  padding: 11px;
+  background: #f6f7fc;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #818ba6;
+}
+.connection-state.connected {
+  background: #eff9f4;
+  color: #378c69;
+}
+.webhook-steps {
+  padding-left: 20px;
+  margin-top: 22px;
+  font-size: 12px;
+  line-height: 1.9;
+  color: #73809c;
+}
+.webhook-steps li {
+  margin-bottom: 10px;
+}
+.webhook-steps a {
+  color: #5369c5;
+}
+.webhook-steps strong {
+  color: #566381;
+  font-weight: 600;
+}
+.secret-note {
+  color: #9a7d4a;
+  margin: 8px 0;
+}
+.rotate-button {
+  margin-top: 20px;
+}
+.rotate-confirm {
+  margin-top: 20px;
+  padding: 12px;
+  background: #fff6ef;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.rotate-confirm .button {
+  margin: 10px 8px 0 0;
+  font-size: 11px;
+}
+.hook-timestamp {
+  font-size: 10px;
+  color: #8793ad;
+  line-height: 1.9;
+  margin: 0 0 14px;
+}
+.cell-subtitle {
+  display: block;
+  color: #8e9bb6;
+  font-size: 10px;
+  margin-top: 4px;
+}
+.text-green {
+  color: #369778;
+}
+.text-red {
+  color: #c57070;
+}
+.repo-management > .panel > .repo-card {
+  border: 0;
+  box-shadow: none;
+}
+.repo-card h3 a {
+  overflow-wrap: anywhere;
+}
+.section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.section-heading h2 {
+  font-size: 15px;
+}
+.repo-card h3 > a {
+  flex-shrink: 1;
+  color: #4d556c;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.repo-card h3 > a > svg {
+  flex-shrink: 0;
+  color: #a2abc0;
+}
+.repo-metrics > div > span {
+  display: block;
+  font-size: 10px;
+  color: #97a2ba;
+  margin-bottom: 7px;
+}
+.repo-metrics > div > strong {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 22px;
+  line-height: 1.2;
+  color: #495068;
+}
+.repo-metrics > div > strong svg {
+  color: #c9aa71;
+}
+.button.danger {
+  background: #cf5e61;
+  color: white;
 }

@@ -8,7 +8,7 @@ export function TrendChart({ history }: { history: Dashboard['history'] }) {
       <div className="chart-empty">
         <ChartNoAxesCombined size={32} />
         <strong>让时间记录你的成长</strong>
-        <span>首份完整快照生成后，这里会展示每日 Star 趋势。</span>
+        <span>连接 Webhook 后，这里会展示初始基线与每日汇总。</span>
       </div>
     );
   const max = Math.max(5, ...data.map((p) => p.total));
@@ -57,7 +57,7 @@ export function TrendChart({ history }: { history: Dashboard['history'] }) {
           strokeWidth="1.5"
         >
           <title>
-            {p.day} · {p.total.toLocaleString()} Stars · 已有 {p.repos} 个项目的完整数据
+            {p.day} · {p.total.toLocaleString()} Stars · 已有 {p.repos} 个项目的上报数据
           </title>
         </circle>
       ))}
@@ -84,7 +84,7 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
       <div className="chart-empty compact">
         <Activity size={28} />
         <strong>变化即将发生</strong>
-        <span>每日快照会记录新增与流失。</span>
+        <span>每晚汇总已收到的新增与取消事件。</span>
       </div>
     );
   const max = Math.max(1, ...data.flatMap((p) => [p.added, p.removed]));

@@ -30,13 +30,56 @@ export const migrations = [
     `CREATE TABLE IF NOT EXISTS monitor_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
     `INSERT OR IGNORE INTO monitor_settings(key,value) VALUES ('daily_hour','23')`,
   ],
+  [], // Version 2 was used by the retired polling implementation.
   [
-    `CREATE TABLE IF NOT EXISTS repository_tokens (
-      repo_id TEXT PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
-      key_id TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at INTEGER NOT NULL
+    `CREATE TABLE projects (id TEXT PRIMARY KEY, github_id INTEGER UNIQUE, full_name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL DEFAULT '', language TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+    `INSERT INTO projects SELECT * FROM repositories`,
+    `CREATE TABLE webhook_connections (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+      key_id TEXT NOT NULL, ciphertext TEXT NOT NULL, configured_at INTEGER NOT NULL,
+      first_received_at INTEGER, last_received_at INTEGER, last_star_at INTEGER,
+      current_total INTEGER, total_reported_at INTEGER
     )`,
-    `UPDATE snapshots SET error = 'GitHub 暂时限制请求，稍后自动重试。'
-      WHERE error LIKE '%GitHub API 额度受限%' OR error LIKE '%配置 GITHUB_TOKEN 提高额度%'`,
+    `CREATE TABLE webhook_deliveries (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      delivery_id TEXT NOT NULL, event_name TEXT NOT NULL, received_at INTEGER NOT NULL,
+      observed_total INTEGER NOT NULL, recorded INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(project_id,delivery_id)
+    )`,
+    `CREATE INDEX delivery_period ON webhook_deliveries(project_id,received_at,seq)`,
+    `CREATE INDEX delivery_sequence ON webhook_deliveries(project_id,seq)`,
+    `CREATE TABLE star_events (
+      delivery_seq INTEGER PRIMARY KEY REFERENCES webhook_deliveries(seq) ON DELETE CASCADE,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL, login TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('added','removed')),
+      starred_at TEXT, received_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX event_period ON star_events(project_id,received_at,delivery_seq)`,
+    `CREATE TABLE summaries (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL, source TEXT NOT NULL, day TEXT NOT NULL,
+      period_start INTEGER NOT NULL, period_end INTEGER NOT NULL, computed_at INTEGER NOT NULL,
+      total INTEGER, added INTEGER NOT NULL DEFAULT 0, removed INTEGER NOT NULL DEFAULT 0,
+      event_count INTEGER NOT NULL DEFAULT 0, delivery_cursor INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(project_id,source,kind,day)
+    )`,
+    `CREATE INDEX summary_history ON summaries(project_id,period_end)`,
+    `CREATE TABLE summary_changes (
+      summary_id TEXT NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL, login TEXT NOT NULL, kind TEXT NOT NULL, starred_at TEXT,
+      observed_at INTEGER NOT NULL, PRIMARY KEY(summary_id,user_id)
+    )`,
+    `INSERT INTO summaries(id,project_id,kind,source,day,period_start,period_end,computed_at,total,added,removed)
+      SELECT id,repo_id,kind,'legacy',day,started_at,COALESCE(completed_at,started_at),COALESCE(completed_at,started_at),total,added,removed
+      FROM snapshots WHERE status = 'complete'`,
+    `INSERT INTO summary_changes SELECT c.snapshot_id,c.user_id,c.login,c.kind,c.starred_at,s.period_end
+      FROM star_changes c JOIN summaries s ON s.id = c.snapshot_id`,
+    `DROP TABLE IF EXISTS repository_tokens`,
+    `DELETE FROM monitor_settings WHERE key = 'token_vault_key'`,
+    `DROP TABLE snapshot_members`,
+    `DROP TABLE star_changes`,
+    `DROP TABLE snapshots`,
+    `DROP TABLE repositories`,
   ],
 ];
 
@@ -56,10 +99,23 @@ export async function initDB(db: D1Database) {
             .first()
         )
           continue;
-        await db.batch([
-          ...migrations[index].map((sql) => db.prepare(sql)),
-          db.prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)').bind(index + 1),
-        ]);
+        try {
+          await db.batch([
+            ...migrations[index].map((sql) => db.prepare(sql)),
+            db
+              .prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)')
+              .bind(index + 1),
+          ]);
+        } catch (error) {
+          // Another isolate can finish this atomic migration after our version read.
+          if (
+            !(await db
+              .prepare('SELECT 1 FROM schema_migrations WHERE version=?')
+              .bind(index + 1)
+              .first())
+          )
+            throw error;
+        }
       }
     })();
     initialized.set(db, promise);

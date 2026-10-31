@@ -1,10 +1,10 @@
-import type { Dashboard, Repository, Snapshot, StarChange } from '../shared/types';
-import { localDay } from './monitors/stars';
+import type { Dashboard, RepoSummary, StarChange, Summary } from '../shared/types';
+import { localDay } from './summaries';
 import { AppError, nowSeconds } from './types';
 
 export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
-  const repoId = url.searchParams.get('repo') || null;
-  const snapshotId = url.searchParams.get('snapshot') || null;
+  const project = url.searchParams.get('repo') || null;
+  const summary = url.searchParams.get('summary') || null;
   const kind = url.searchParams.get('kind') || 'all';
   const days = Number(url.searchParams.get('days') || 30);
   const page = Number(url.searchParams.get('page') || 1);
@@ -16,69 +16,72 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     !['all', 'added', 'removed'].includes(kind)
   )
     throw new AppError(400, '筛选参数无效。');
-  const [repoResult, recent, list, history] = await Promise.all([
+  const repositories = await db
+    .prepare(
+      `SELECT p.*,c.first_received_at,c.last_received_at,c.last_star_at,c.current_total,c.total_reported_at,
+    c.project_id IS NOT NULL AS webhookConfigured,(SELECT COUNT(*) FROM star_events WHERE project_id=p.id) AS event_count
+    FROM projects p LEFT JOIN webhook_connections c ON c.project_id=p.id ORDER BY p.created_at,p.full_name`,
+    )
+    .all<RepoSummary>();
+  if (project && !repositories.results.some((p) => p.id === project))
+    throw new AppError(404, '仓库不存在。');
+  if (
+    summary &&
+    !(await db
+      .prepare('SELECT 1 FROM summaries WHERE id=? AND (? IS NULL OR project_id=?)')
+      .bind(summary, project, project)
+      .first())
+  )
+    throw new AppError(404, '汇总不存在。');
+  const since = nowSeconds() - days * 86400;
+  const [summaries, history, eventCounts] = await Promise.all([
     db
       .prepare(
-        `SELECT r.*, EXISTS(SELECT 1 FROM repository_tokens t WHERE t.repo_id = r.id) AS token_configured
-      FROM repositories r ORDER BY created_at,full_name`,
+        `SELECT s.*,p.full_name FROM summaries s JOIN projects p ON p.id=s.project_id
+      WHERE (? IS NULL OR project_id=?) ORDER BY period_end DESC,s.rowid DESC LIMIT 100`,
       )
-      .all<Repository & { token_configured: number }>(),
+      .bind(project, project)
+      .all<Summary>(),
     db
       .prepare(
-        `SELECT * FROM (SELECT s.*, ROW_NUMBER() OVER (PARTITION BY repo_id,status ORDER BY started_at DESC,rowid DESC) AS rn FROM snapshots s) WHERE rn = 1`,
-      )
-      .all<Snapshot>(),
-    db
-      .prepare(
-        `SELECT s.*, r.full_name, p.day AS comparison_day FROM snapshots s JOIN repositories r ON r.id = s.repo_id
-      LEFT JOIN snapshots p ON p.id = s.comparison_id WHERE (? IS NULL OR s.repo_id = ?) ORDER BY s.started_at DESC,s.rowid DESC LIMIT 100`,
-      )
-      .bind(repoId, repoId)
-      .all<Snapshot & { full_name: string; comparison_day: string | null }>(),
-    db
-      .prepare(
-        `WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day,'+1 day') FROM days WHERE day < ?)
-      SELECT d.day,
-        COALESCE(SUM(COALESCE((SELECT s.total FROM snapshots s WHERE s.repo_id = r.id AND s.status = 'complete'
-          AND s.kind IN ('daily','baseline') AND s.day <= d.day ORDER BY s.day DESC,s.started_at DESC,s.rowid DESC LIMIT 1),0)),0) AS total,
-        (SELECT COALESCE(SUM(s.added),0) FROM snapshots s WHERE s.day = d.day AND s.kind = 'daily' AND s.status = 'complete' AND (? IS NULL OR s.repo_id = ?)) AS added,
-        (SELECT COALESCE(SUM(s.removed),0) FROM snapshots s WHERE s.day = d.day AND s.kind = 'daily' AND s.status = 'complete' AND (? IS NULL OR s.repo_id = ?)) AS removed,
-        COUNT(CASE WHEN EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = r.id AND s.status = 'complete' AND s.kind IN ('daily','baseline') AND s.day <= d.day) THEN 1 END) AS repos
-      FROM days d LEFT JOIN repositories r ON (? IS NULL OR r.id = ?) GROUP BY d.day ORDER BY d.day`,
+        `WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day,'+1 day') FROM days WHERE day<?)
+      SELECT d.day,COALESCE(SUM((SELECT s.total FROM summaries s WHERE s.project_id=p.id AND s.total IS NOT NULL AND s.day<=d.day
+        ORDER BY s.day DESC,s.period_end DESC,s.rowid DESC LIMIT 1)),0) AS total,
+      (SELECT COALESCE(SUM(s.added),0) FROM summaries s WHERE s.day=d.day AND s.kind='daily' AND (? IS NULL OR s.project_id=?)) AS added,
+      (SELECT COALESCE(SUM(s.removed),0) FROM summaries s WHERE s.day=d.day AND s.kind='daily' AND (? IS NULL OR s.project_id=?)) AS removed,
+      COUNT(CASE WHEN EXISTS(SELECT 1 FROM summaries s WHERE s.project_id=p.id AND s.day<=d.day AND s.total IS NOT NULL) THEN 1 END) AS repos
+      FROM days d LEFT JOIN projects p ON (? IS NULL OR p.id=?) GROUP BY d.day ORDER BY d.day`,
       )
       .bind(
         localDay(nowSeconds() - (days - 1) * 86400),
         localDay(nowSeconds()),
-        repoId,
-        repoId,
-        repoId,
-        repoId,
-        repoId,
-        repoId,
+        project,
+        project,
+        project,
+        project,
+        project,
+        project,
       )
       .all<Dashboard['history'][number]>(),
-  ]);
-  if (repoId && !repoResult.results.some((repo) => repo.id === repoId))
-    throw new AppError(404, '仓库不存在。');
-  if (
-    snapshotId &&
-    !(await db
+    db
       .prepare(
-        "SELECT 1 FROM snapshots WHERE id = ? AND status = 'complete' AND (? IS NULL OR repo_id = ?)",
+        `SELECT COALESCE(SUM(kind='added'),0) AS added,COALESCE(SUM(kind='removed'),0) AS removed
+      FROM star_events WHERE received_at>=? AND (? IS NULL OR project_id=?)`,
       )
-      .bind(snapshotId, repoId, repoId)
-      .first())
-  )
-    throw new AppError(404, '完整快照不存在。');
-  const selected = `WITH latest AS (SELECT id FROM (SELECT id,ROW_NUMBER() OVER (PARTITION BY repo_id ORDER BY started_at DESC,rowid DESC) AS rn
-    FROM snapshots WHERE status = 'complete' AND (? IS NULL OR repo_id = ?)) WHERE rn = 1)
-    SELECT c.*, r.full_name, s.completed_at AS observed_at FROM star_changes c JOIN snapshots s ON s.id = c.snapshot_id
-    JOIN repositories r ON r.id = s.repo_id WHERE s.status = 'complete' AND (? IS NULL OR s.repo_id = ?)
-    AND ((? IS NOT NULL AND c.snapshot_id = ?) OR (? IS NULL AND c.snapshot_id IN (SELECT id FROM latest))) AND (? = 'all' OR c.kind = ?)`;
-  const params = [repoId, repoId, repoId, repoId, snapshotId, snapshotId, snapshotId, kind, kind];
+      .bind(since, project, project)
+      .first<Dashboard['eventCounts']>(),
+  ]);
+  const selected = summary
+    ? `SELECT c.user_id,c.login,c.kind,c.starred_at,c.observed_at,p.full_name,s.id||':'||c.user_id AS id
+       FROM summary_changes c JOIN summaries s ON s.id=c.summary_id JOIN projects p ON p.id=s.project_id
+       WHERE s.id=? AND (?='all' OR c.kind=?)`
+    : `SELECT e.user_id,e.login,e.kind,e.starred_at,e.received_at AS observed_at,p.full_name,CAST(e.delivery_seq AS TEXT) AS id
+       FROM star_events e JOIN projects p ON p.id=e.project_id
+       WHERE (? IS NULL OR e.project_id=?) AND e.received_at>=? AND (?='all' OR e.kind=?)`;
+  const params = summary ? [summary, kind, kind] : [project, project, since, kind, kind];
   const [changes, count] = await Promise.all([
     db
-      .prepare(`${selected} ORDER BY s.completed_at DESC,c.login COLLATE NOCASE LIMIT 30 OFFSET ?`)
+      .prepare(`${selected} ORDER BY observed_at DESC,id DESC LIMIT 30 OFFSET ?`)
       .bind(...params, (page - 1) * 30)
       .all<StarChange>(),
     db
@@ -87,26 +90,15 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
       .first<{ count: number }>(),
   ]);
   return {
-    repositories: repoResult.results.map(({ token_configured, ...repo }) => ({
-      ...repo,
-      tokenConfigured: !!token_configured,
-      latest: recent.results.find((s) => s.repo_id === repo.id && s.status === 'complete') ?? null,
-      active:
-        recent.results.find((s) => s.repo_id === repo.id && s.status === 'collecting') ?? null,
-      lastError: (() => {
-        const failed = recent.results.find((s) => s.repo_id === repo.id && s.status === 'failed');
-        const success = recent.results.find(
-          (s) => s.repo_id === repo.id && s.status === 'complete',
-        );
-        return failed && (!success || failed.started_at >= success.started_at)
-          ? failed.error
-          : null;
-      })(),
+    repositories: repositories.results.map((p) => ({
+      ...p,
+      webhookConfigured: !!p.webhookConfigured,
     })),
     history: history.results,
-    snapshots: list.results,
+    summaries: summaries.results,
     changes: changes.results,
     changeTotal: count?.count ?? 0,
     page,
+    eventCounts: eventCounts ?? { added: 0, removed: 0 },
   };
 }

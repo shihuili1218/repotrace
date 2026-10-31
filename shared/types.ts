@@ -1,56 +1,56 @@
-export interface Repository {
+export interface RepoSummary {
   id: string;
-  github_id: number;
+  github_id: number | null;
   full_name: string;
   description: string;
   language: string | null;
-  created_at: number;
   enabled: number;
+  created_at: number;
+  webhookConfigured: boolean;
+  first_received_at: number | null;
+  last_received_at: number | null;
+  last_star_at: number | null;
+  current_total: number | null;
+  total_reported_at: number | null;
+  event_count: number;
 }
-
-export interface Snapshot {
+export interface Summary {
   id: string;
-  repo_id: string;
+  project_id: string;
+  full_name: string;
   kind: 'baseline' | 'daily' | 'manual';
+  source: 'webhook' | 'legacy';
   day: string;
-  status: 'collecting' | 'complete' | 'failed';
-  page: number;
-  total: number;
-  expected_total: number;
+  period_start: number;
+  period_end: number;
+  computed_at: number;
+  total: number | null;
   added: number;
   removed: number;
-  comparison_id: string | null;
-  started_at: number;
-  completed_at: number | null;
-  error: string | null;
-  retry_at: number;
-  failures: number;
-  lease_token: string | null;
-  lease_until: number;
+  event_count: number;
 }
-
-export interface RepoSummary extends Repository {
-  tokenConfigured: boolean;
-  latest: Snapshot | null;
-  active: Snapshot | null;
-  lastError: string | null;
-}
-
 export interface StarChange {
   user_id: number;
   login: string;
   kind: 'added' | 'removed';
   starred_at: string | null;
   full_name: string;
-  snapshot_id: string;
   observed_at: number;
+  id: string;
 }
-
 export interface Dashboard {
   repositories: RepoSummary[];
   history: { day: string; total: number; added: number; removed: number; repos: number }[];
-  snapshots: (Snapshot & { full_name: string; comparison_day: string | null })[];
+  summaries: Summary[];
   changes: StarChange[];
   changeTotal: number;
   page: number;
+  eventCounts: { added: number; removed: number };
+}
+export interface WebhookConfig {
+  id: string;
+  full_name: string;
+  url: string;
+  secret?: string;
+  settingsUrl: string;
 }

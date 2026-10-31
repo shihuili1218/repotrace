@@ -1,7 +1,7 @@
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
-  TOKEN_KEYS: KVNamespace;
+  WEBHOOK_KEYS: KVNamespace;
   SETUP_TOKEN?: string;
 }
 

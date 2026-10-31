@@ -4,30 +4,21 @@ import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test'
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../worker';
 import { initDB, migrations } from '../worker/db';
-import { getRepositoryToken, saveRepositoryToken } from '../worker/token-vault';
-import {
-  collectStars,
-  continueSnapshot,
-  enqueueDue,
-  enqueueSnapshot,
-  latestDue,
-  localDay,
-  retrySnapshot,
-} from '../worker/monitors/stars';
-import {
-  github,
-  GitHubError,
-  parseRepository,
-  type Stargazer,
-  type StarProvider,
-} from '../worker/github';
+import { getWebhookCredentials } from '../worker/webhook-secrets';
+import { latestDue, localDay, summarizeDue, summarizePeriod } from '../worker/summaries';
+import { parseRepository } from '../worker/projects';
 import { nowSeconds, type Env } from '../worker/types';
-import type { Dashboard, Snapshot } from '../shared/types';
+import type { Dashboard, WebhookConfig } from '../shared/types';
 
 const env = bindings as unknown as Env;
 const password = 'a-secure-test-password-2026';
 const origin = 'https://repotrace.test';
-
+async function send(request: Request, environment = env) {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request, environment, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
 async function request(
   path: string,
   method = 'GET',
@@ -36,8 +27,7 @@ async function request(
   extra?: Record<string, string>,
   environment = env,
 ) {
-  const ctx = createExecutionContext();
-  const response = await worker.fetch(
+  return send(
     new Request(`${origin}/api${path}`, {
       method,
       headers: {
@@ -49,80 +39,94 @@ async function request(
       body: method !== 'GET' ? JSON.stringify(data ?? {}) : undefined,
     }),
     environment,
-    ctx,
   );
-  await waitOnExecutionContext(ctx);
-  return response;
 }
 async function setup() {
   const response = await request('/auth/setup', 'POST', { password });
   expect(response.status).toBe(201);
   return response.headers.get('Set-Cookie')!.split(';')[0];
 }
-const githubId = (id: string) =>
-  id === 'repo' ? 100 : 1000 + [...id].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-async function addRepo(
-  id = 'repo',
-  createdAt = nowSeconds() - 86400,
-  token: string | null = 'test-token',
-) {
-  await env.DB.prepare(
-    'INSERT INTO repositories(id,github_id,full_name,description,language,created_at) VALUES (?,?,?,?,?,?)',
-  )
-    .bind(id, githubId(id), `owner/${id}`, 'Test repository', 'TypeScript', createdAt)
-    .run();
-  if (token) await saveRepositoryToken(env, id, token);
+async function add(session: string, repository = 'owner/repo') {
+  const response = await request('/repositories', 'POST', { repository }, session);
+  expect(response.status).toBe(201);
+  return await response.json<WebhookConfig & { secret: string }>();
 }
-const users = (...ids: number[]): Stargazer[] =>
-  ids.map((id) => ({ id, login: `user-${id}`, starred_at: '2026-10-01T12:00:00Z' }));
-function provider(list: Stargazer[]): StarProvider {
-  return {
-    repository: vi.fn(async () => ({
-      id: 100,
-      full_name: 'owner/repo',
-      description: 'Test repository',
-      language: 'TypeScript',
-      stargazers_count: list.length,
-    })),
-    stargazers: vi.fn(async (_name, page) => ({
-      users: list.slice((page - 1) * 100, page * 100),
-      hasNext: page * 100 < list.length,
-    })),
-  };
+async function dashboard(session: string, query = '') {
+  return (await request(`/dashboard${query}`, 'GET', undefined, session)).json<Dashboard>();
 }
-async function snapshot(
-  list: Stargazer[],
-  kind: Snapshot['kind'] = 'baseline',
-  day = localDay(nowSeconds()),
+async function signed(
+  config: WebhookConfig,
+  event = 'ping',
+  patch: Record<string, unknown> = {},
+  delivery = crypto.randomUUID(),
   at = nowSeconds(),
 ) {
-  const id = await enqueueSnapshot(env.DB, 'repo', kind, day, at);
-  await collectStars(env, provider(list));
-  const value = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?')
-    .bind(id)
-    .first<Snapshot>();
-  expect(value?.status).toBe('complete');
-  return value!;
+  const payload = JSON.stringify({
+    repository: {
+      id: 100,
+      full_name: 'owner/repo',
+      description: 'A project',
+      language: 'TypeScript',
+      stargazers_count: 10,
+    },
+    ...(event === 'star'
+      ? {
+          action: 'created',
+          sender: { id: 1, login: 'octocat' },
+          starred_at: '2026-10-30T12:00:00Z',
+        }
+      : {}),
+    ...patch,
+  });
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(config.secret!),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = [
+    ...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload))),
+  ]
+    .map((n) => n.toString(16).padStart(2, '0'))
+    .join('');
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(at * 1000);
+  try {
+    return await send(
+      new Request(config.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Hub-Signature-256': `sha256=${signature}`,
+          'X-GitHub-Event': event,
+          'X-GitHub-Delivery': delivery,
+        },
+        body: payload,
+      }),
+    );
+  } finally {
+    clock.mockRestore();
+  }
 }
-
+async function scalar(sql: string, ...params: unknown[]) {
+  return env.DB.prepare(sql)
+    .bind(...params)
+    .first<number>('count');
+}
 beforeEach(async () => {
   await initDB(env.DB);
-  const keys = await env.TOKEN_KEYS.list();
-  await Promise.all(keys.keys.map((key) => env.TOKEN_KEYS.delete(key.name)));
   await env.DB.batch(
     [
-      'DELETE FROM repositories',
-      'DELETE FROM snapshots',
+      'DELETE FROM projects',
       'DELETE FROM sessions',
       'DELETE FROM admin',
       'DELETE FROM login_limits',
-      "DELETE FROM monitor_settings WHERE key != 'daily_hour'",
+      "DELETE FROM monitor_settings WHERE key!='daily_hour'",
       "UPDATE monitor_settings SET value='23' WHERE key='daily_hour'",
     ].map((sql) => env.DB.prepare(sql)),
   );
 });
 afterEach(() => vi.restoreAllMocks());
-
 describe('private admin workspace', () => {
   it('exposes only bootstrap state before login and rejects cross-origin writes', async () => {
     expect(await (await request('/auth/status')).json()).toEqual({
@@ -237,656 +241,548 @@ describe('private admin workspace', () => {
       ).status,
     ).toBe(429);
   });
-
-  it('handles repository lifecycle through authenticated API and keeps data private', async () => {
-    const session = await setup();
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.includes('/stargazers?'))
-        return Response.json([
-          { starred_at: '2026-10-01T12:00:00Z', user: { id: 1, login: 'first-user' } },
-        ]);
-      return Response.json({
-        id: 100,
-        full_name: 'owner/repo',
-        description: 'Test',
-        language: 'TypeScript',
-        stargazers_count: 1,
-      });
-    });
-    const added = await request(
-      '/repositories',
-      'POST',
-      { repository: 'owner/repo', token: 'test-token' },
-      session,
-    );
-    expect(added.status).toBe(201);
-    const { id } = await added.json<{ id: string }>();
-    const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(data.repositories[0].latest?.total).toBe(1);
-    expect(data.changes).toHaveLength(0);
-    expect(
-      (
-        await request(
-          '/repositories',
-          'POST',
-          { repository: 'owner/repo', token: 'test-token' },
-          session,
-        )
-      ).status,
-    ).toBe(409);
-    expect(
-      (await request(`/repositories/${id}`, 'PATCH', { enabled: false }, session)).status,
-    ).toBe(200);
-    expect((await request(`/repositories/${id}/sync`, 'POST', {}, session)).status).toBe(409);
-    expect((await request('/settings', 'PATCH', { dailyHour: 25 }, session)).status).toBe(400);
-    expect((await request('/settings', 'PATCH', { dailyHour: 22 }, session)).status).toBe(200);
-    expect(
-      (await (await request('/settings', 'GET', undefined, session)).json<{ dailyHour: number }>())
-        .dailyHour,
-    ).toBe(22);
-    expect((await request(`/repositories/${id}`, 'DELETE', {}, session)).status).toBe(200);
-    expect(
-      await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshot_members').first('count'),
-    ).toBe(0);
-  });
 });
 
-describe('project credentials', () => {
-  it('rejects missing or malformed project tokens before any outgoing request', async () => {
+describe('project setup without outgoing GitHub requests', () => {
+  it('creates an unverified project and reveals its secret once, stored encrypted', async () => {
+    const session = await setup();
     const outbound = vi
       .spyOn(globalThis, 'fetch')
-      .mockRejectedValue(new Error('Unexpected request'));
-    const session = await setup();
-    for (const token of [undefined, '', '   ', 'bad\ntoken']) {
-      await expect(github(token as string).repository('owner/repo')).rejects.toMatchObject({
-        status: 400,
-      });
-      const response = await request(
-        '/repositories',
-        'POST',
-        { repository: 'owner/repo', token },
-        session,
-      );
-      expect(response.status).toBe(400);
-    }
+      .mockRejectedValue(new Error('No outgoing request allowed'));
+    const config = await add(session);
+    expect(config.secret).toMatch(/^[a-f0-9]{64}$/);
+    expect(config.url).toBe(`${origin}/hooks/github/${config.id}`);
+    expect((await getWebhookCredentials(env, config.id))?.secret).toBe(config.secret);
+    const stored = await env.DB.prepare('SELECT * FROM webhook_connections').first<{
+      ciphertext: string;
+    }>();
+    expect(stored?.ciphertext).not.toContain(config.secret);
+    const get = await request(`/repositories/${config.id}/webhook`, 'GET', undefined, session);
+    expect(await get.text()).not.toContain(config.secret);
+    const data = await dashboard(session);
+    expect(JSON.stringify(data)).not.toContain(config.secret);
+    expect(data.repositories[0]).toMatchObject({
+      github_id: null,
+      current_total: null,
+      webhookConfigured: true,
+      last_received_at: null,
+    });
     expect(outbound).not.toHaveBeenCalled();
   });
-
-  it('encrypts tokens with separate KV key material and never returns token contents', async () => {
-    await addRepo('repo', undefined, 'private-project-token');
-    const stored = await env.DB.prepare('SELECT * FROM repository_tokens WHERE repo_id = ?')
-      .bind('repo')
-      .first<{ key_id: string; ciphertext: string }>();
-    expect(stored?.ciphertext).not.toContain('private-project-token');
-    expect(await getRepositoryToken(env, 'repo')).toBe('private-project-token');
-    const rawKey = await env.TOKEN_KEYS.get(`vault/${stored!.key_id}`, 'arrayBuffer');
-    expect(rawKey?.byteLength).toBe(32);
+  it('rejects duplicate projects, invalid names, missing sessions and cross-origin changes', async () => {
     const session = await setup();
-    const response = await request('/dashboard', 'GET', undefined, session);
-    const json = await response.json<Dashboard>();
-    expect(json.repositories[0].tokenConfigured).toBe(true);
-    expect(JSON.stringify(json)).not.toContain('private-project-token');
-    expect(JSON.stringify(json)).not.toContain(stored!.ciphertext);
-  });
-
-  it('initializes the vault safely for concurrent projects and binds ciphertext to its project', async () => {
-    await addRepo('alpha', undefined, null);
-    await addRepo('beta', undefined, null);
-    await Promise.all([
-      saveRepositoryToken(env, 'alpha', 'token-alpha'),
-      saveRepositoryToken(env, 'beta', 'token-beta'),
-    ]);
-    expect(await getRepositoryToken(env, 'alpha')).toBe('token-alpha');
-    expect(await getRepositoryToken(env, 'beta')).toBe('token-beta');
-    const records = await env.DB.prepare(
-      'SELECT key_id,ciphertext FROM repository_tokens ORDER BY repo_id',
-    ).all<{ key_id: string; ciphertext: string }>();
-    expect(records.results[0].key_id).toBe(records.results[1].key_id);
-    expect((await env.TOKEN_KEYS.list()).keys).toHaveLength(1);
-    await env.DB.prepare('UPDATE repository_tokens SET ciphertext = ? WHERE repo_id = ?')
-      .bind(records.results[0].ciphertext, 'beta')
-      .run();
-    await expect(getRepositoryToken(env, 'beta')).rejects.toMatchObject({ status: 503 });
-  });
-
-  it('uses each repository own token for all collection requests', async () => {
-    await addRepo('alpha', undefined, 'token-alpha');
-    await addRepo('beta', undefined, 'token-beta');
-    for (const id of ['alpha', 'beta']) await enqueueSnapshot(env.DB, id, 'baseline');
-    const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
-      const url = new URL(String(input));
-      const name = url.pathname.split('/')[3];
-      expect((options?.headers as Record<string, string>).Authorization).toBe(
-        `Bearer token-${name}`,
-      );
-      if (url.pathname.endsWith('/stargazers'))
-        return Response.json([
-          {
-            starred_at: '2026-11-01T00:00:00Z',
-            user: { id: name === 'alpha' ? 1 : 2, login: `${name}-user` },
-          },
-        ]);
-      return Response.json({
-        id: githubId(name),
-        full_name: `owner/${name}`,
-        description: '',
-        language: null,
-        stargazers_count: 1,
-      });
-    });
-    await collectStars(env);
-    expect(outbound).toHaveBeenCalledTimes(6);
+    await add(session);
     expect(
-      await env.DB.prepare(
-        "SELECT COUNT(*) AS count FROM snapshots WHERE status = 'complete'",
-      ).first('count'),
-    ).toBe(2);
-  });
-
-  it('starts the newly added project even when another project already has a queued job', async () => {
-    await addRepo('alpha', undefined, 'token-alpha');
-    await enqueueSnapshot(env.DB, 'alpha', 'baseline');
-    const session = await setup();
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
-      expect(String(input)).toContain('/owner/beta');
-      expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer token-beta');
-      return String(input).includes('/stargazers?')
-        ? Response.json([
-            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'beta-user' } },
-          ])
-        : Response.json({
-            id: githubId('beta'),
-            full_name: 'owner/beta',
-            description: '',
-            language: null,
-            stargazers_count: 1,
-          });
-    });
+      (await request('/repositories', 'POST', { repository: 'OWNER/REPO' }, session)).status,
+    ).toBe(409);
+    expect(
+      (await request('/repositories', 'POST', { repository: 'https://evil.example/repo' }, session))
+        .status,
+    ).toBe(400);
+    expect((await request('/repositories', 'POST', { repository: 'x/y' })).status).toBe(401);
     expect(
       (
-        await request(
-          '/repositories',
-          'POST',
-          { repository: 'owner/beta', token: 'token-beta' },
-          session,
-        )
+        await request('/repositories', 'POST', { repository: 'x/y' }, session, {
+          Origin: 'https://evil.test',
+        })
       ).status,
-    ).toBe(201);
-    const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(data.repositories.find((r) => r.full_name === 'owner/beta')?.latest?.total).toBe(1);
-    expect(data.repositories.find((r) => r.id === 'alpha')?.active?.total).toBe(0);
-  });
-
-  it('keeps historical data while an existing project waits for its own token', async () => {
-    await addRepo();
-    const baseline = await snapshot(users(1, 2));
-    await env.DB.prepare('DELETE FROM repository_tokens WHERE repo_id = ?').bind('repo').run();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'manual');
-    const source = provider(users(1, 2, 3));
-    await collectStars(env, source);
-    expect(source.repository).not.toHaveBeenCalled();
-    const session = await setup();
-    const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(data.repositories[0].latest?.id).toBe(baseline.id);
-    expect(data.repositories[0].tokenConfigured).toBe(false);
-    expect((await request('/repositories/repo/sync', 'POST', {}, session)).status).toBe(409);
-    await saveRepositoryToken(env, 'repo', 'new-project-token');
-    await collectStars(env, source);
-    expect(
-      await env.DB.prepare('SELECT status,total FROM snapshots WHERE id = ?').bind(id).first(),
-    ).toEqual({ status: 'complete', total: 3 });
-  });
-
-  it('validates a replacement before saving, then clears obsolete backoff and resumes', async () => {
-    await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    await env.DB.prepare('UPDATE snapshots SET retry_at=?, error=? WHERE id=?')
-      .bind(nowSeconds() + 3600, 'old error', id)
-      .run();
-    const session = await setup();
-    const outbound = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(new Response('{}', { status: 401 }));
-    expect(
-      (await request('/repositories/repo/token', 'PUT', { token: 'bad-token' }, session)).status,
-    ).toBe(502);
-    expect(await getRepositoryToken(env, 'repo')).toBe('test-token');
-    outbound.mockImplementation(async (input) =>
-      String(input).includes('/stargazers?')
-        ? Response.json([
-            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'first-user' } },
-          ])
-        : Response.json({
-            id: 100,
-            full_name: 'owner/repo',
-            description: '',
-            language: null,
-            stargazers_count: 1,
-          }),
+    ).toBe(403);
+    expect((await request('/repositories/missing/webhook', 'GET', undefined, session)).status).toBe(
+      404,
     );
-    const response = await request(
-      '/repositories/repo/token',
-      'PUT',
-      { token: 'updated-token' },
-      session,
-    );
-    expect(response.status).toBe(200);
-    expect(await response.text()).not.toContain('updated-token');
-    expect(await getRepositoryToken(env, 'repo')).toBe('updated-token');
-    expect(
-      await env.DB.prepare('SELECT status,error,retry_at FROM snapshots WHERE id = ?')
-        .bind(id)
-        .first(),
-    ).toEqual({ status: 'complete', error: null, retry_at: 0 });
   });
-
-  it('rejects inaccessible stargazers before creating a project and ends a revoked-token job', async () => {
-    const session = await setup();
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) =>
-      String(input).includes('/stargazers?')
-        ? Response.json(
-            { message: 'Resource not accessible by personal access token' },
-            { status: 403, headers: { 'X-GitHub-Request-Id': 'ABCD:1234:0001' } },
-          )
-        : Response.json({
-            id: 100,
-            full_name: 'owner/repo',
-            description: '',
-            language: null,
-            stargazers_count: 1,
-          }),
-    );
-    const rejected = await request(
-      '/repositories',
-      'POST',
-      { repository: 'owner/repo', token: 'project-token' },
-      session,
-    );
-    expect(rejected.status).toBe(502);
-    const rejection = await rejected.json();
-    expect(rejection).toMatchObject({
-      error: expect.stringContaining('403'),
-      github: {
-        status: 403,
-        operation: 'stargazers',
-        reason: 'permission',
-        message: 'Resource not accessible by personal access token',
-        requestId: 'ABCD:1234:0001',
-      },
-    });
-    expect(JSON.stringify(rejection)).not.toContain('project-token');
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM repositories').first('count')).toBe(
-      0,
-    );
-    await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    await collectStars(env);
-    expect(
-      await env.DB.prepare('SELECT status FROM snapshots WHERE id = ?').bind(id).first('status'),
-    ).toBe('failed');
-  });
-
-  it('migrates existing data and removes the obsolete global-token advice from persisted errors', async () => {
-    const legacy = (bindings as unknown as { LEGACY_DB: D1Database }).LEGACY_DB;
-    await legacy.batch([
-      ...migrations[0].map((sql) => legacy.prepare(sql)),
-      legacy.prepare('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)'),
-      legacy.prepare('INSERT INTO schema_migrations(version) VALUES (1)'),
-      legacy.prepare(
-        "INSERT INTO repositories(id,github_id,full_name,description,created_at) VALUES ('old',100,'owner/old','',1)",
-      ),
-      legacy
-        .prepare(
-          "INSERT INTO snapshots(id,repo_id,kind,day,started_at,error) VALUES ('old-snapshot','old','baseline','2026-11-01',1,?)",
-        )
-        .bind('GitHub API 额度受限，等待额度恢复后继续。可配置 GITHUB_TOKEN 提高额度。'),
-    ]);
-    await initDB(legacy);
-    expect(await legacy.prepare('SELECT COUNT(*) AS count FROM repositories').first('count')).toBe(
-      1,
-    );
-    expect(await legacy.prepare('SELECT error FROM snapshots').first('error')).toBe(
-      'GitHub 暂时限制请求，稍后自动重试。',
-    );
-    expect(
-      await legacy.prepare('SELECT COUNT(*) AS count FROM repository_tokens').first('count'),
-    ).toBe(0);
-  });
-});
-
-describe('complete, resumable Star snapshots', () => {
-  it('finishes a 519-star collection through bounded HTTP continuations', async () => {
-    const list = users(...Array.from({ length: 519 }, (_, i) => i + 1));
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = new URL(String(input));
-      if (!url.pathname.endsWith('/stargazers'))
-        return Response.json({
-          id: 100,
-          full_name: 'owner/repo',
-          description: '',
-          language: null,
-          stargazers_count: 519,
-        });
-      const page = Number(url.searchParams.get('page') ?? 1);
-      return Response.json(
-        list.slice((page - 1) * 100, page * 100).map((user) => ({
-          starred_at: user.starred_at,
-          user: { id: user.id, login: user.login },
-        })),
-        {
-          headers:
-            page < 6
-              ? {
-                  Link: `<https://api.github.com/repos/owner/repo/stargazers?page=${page + 1}>; rel="next"`,
-                }
-              : {},
-        },
-      );
-    });
-    const session = await setup();
-    const created = await request(
-      '/repositories',
-      'POST',
-      { repository: 'owner/repo', token: 'project-token' },
-      session,
-    );
-    expect(created.status).toBe(201);
-    let data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(data.repositories[0].active?.total).toBe(100);
-    const id = data.repositories[0].active!.id;
-    for (let page = 2; page <= 6; page++) {
-      const response = await request(`/snapshots/${id}/continue`, 'POST', {}, session);
-      expect(response.status).toBe(200);
-    }
-    data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(data.repositories[0].active).toBeNull();
-    expect(data.repositories[0].latest).toMatchObject({
-      status: 'complete',
-      total: 519,
-      added: 0,
-      removed: 0,
-    });
-    expect(
-      await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshot_members WHERE snapshot_id = ?')
-        .bind(id)
-        .first('count'),
-    ).toBe(519);
-  });
-
-  it('respects live leases and retry time when continuing a snapshot', async () => {
-    await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    const source = provider(users(1));
-    await env.DB.prepare('UPDATE snapshots SET lease_until=? WHERE id=?')
-      .bind(nowSeconds() + 180, id)
-      .run();
-    await expect(continueSnapshot(env, id!, source)).rejects.toMatchObject({ status: 409 });
-    await env.DB.prepare('UPDATE snapshots SET lease_until=0,retry_at=? WHERE id=?')
-      .bind(nowSeconds() + 180, id)
-      .run();
-    await expect(continueSnapshot(env, id!, source)).rejects.toMatchObject({ status: 429 });
-    expect(source.repository).not.toHaveBeenCalled();
-    await env.DB.prepare('UPDATE snapshots SET retry_at=0 WHERE id=?').bind(id).run();
-    expect(await continueSnapshot(env, id!, source)).toMatchObject({
-      status: 'complete',
-      total: 1,
-    });
-  });
-
-  it('runs scheduled collection with the saved project token and records the trigger time', async () => {
-    await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
-      expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
-      return String(input).includes('/stargazers?')
-        ? Response.json([
-            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'first-user' } },
-          ])
-        : Response.json({
-            id: 100,
-            full_name: 'owner/repo',
-            description: '',
-            language: null,
-            stargazers_count: 1,
-          });
-    });
-    const before = nowSeconds();
-    const ctx = createExecutionContext();
-    await worker.scheduled({} as ScheduledController, env, ctx);
-    await waitOnExecutionContext(ctx);
-    expect(
-      await env.DB.prepare('SELECT status,total FROM snapshots WHERE id = ?').bind(id).first(),
-    ).toEqual({ status: 'complete', total: 1 });
-    expect(
-      Number(
-        await env.DB.prepare("SELECT value FROM monitor_settings WHERE key='last_cron_at'").first(
-          'value',
-        ),
-      ),
-    ).toBeGreaterThanOrEqual(before);
-  });
-
-  it('builds a baseline then records added/removed IDs while ignoring username changes', async () => {
-    await addRepo();
-    const baseline = await snapshot(users(1, 2));
-    expect([baseline.added, baseline.removed, baseline.comparison_id]).toEqual([0, 0, null]);
-    const daily = await snapshot([{ ...users(1)[0], login: 'renamed-user' }, ...users(3)], 'daily');
-    expect([daily.total, daily.added, daily.removed, daily.comparison_id]).toEqual([
-      2,
-      1,
-      1,
-      baseline.id,
-    ]);
-    const diff = await env.DB.prepare(
-      'SELECT user_id,kind FROM star_changes WHERE snapshot_id = ? ORDER BY user_id',
-    )
-      .bind(daily.id)
-      .all();
-    expect(diff.results).toEqual([
-      { user_id: 2, kind: 'removed' },
-      { user_id: 3, kind: 'added' },
-    ]);
-  });
-
-  it('keeps the nightly comparison independent of manual refreshes', async () => {
-    await addRepo();
-    const baseline = await snapshot(users(1, 2), 'baseline', '2026-10-28', nowSeconds() - 100);
-    await snapshot(users(1, 2, 3), 'manual', '2026-10-29', nowSeconds() - 50);
-    const daily = await snapshot(users(1, 3), 'daily', '2026-10-30');
-    expect(daily.comparison_id).toBe(baseline.id);
-    expect([daily.added, daily.removed]).toEqual([1, 1]);
-    const next = await snapshot(users(1, 4), 'daily', '2026-10-31', nowSeconds() + 1);
-    expect(next.comparison_id).toBe(daily.id);
-    expect([next.added, next.removed]).toEqual([1, 1]);
-  });
-
-  it('checkpoints pagination, retries transient failures, and publishes only a complete set', async () => {
-    await addRepo();
-    const list = users(...Array.from({ length: 135 }, (_, i) => i + 1));
-    const source = provider(list);
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    await collectStars(env, source, 1);
-    let row = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?')
-      .bind(id)
-      .first<Snapshot>();
-    expect([row?.status, row?.page, row?.total]).toEqual(['collecting', 2, 100]);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM star_changes').first('count')).toBe(
-      0,
-    );
-    const failing: StarProvider = {
-      ...source,
-      stargazers: vi.fn(async () => {
-        throw new GitHubError('temporary', 0, true);
-      }),
-    };
-    await collectStars(env, failing);
-    row = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?').bind(id).first<Snapshot>();
-    expect(row?.status).toBe('collecting');
-    expect(row?.page).toBe(2);
-    await env.DB.prepare('UPDATE snapshots SET retry_at = 0 WHERE id = ?').bind(id).run();
-    await collectStars(env, source);
-    row = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?').bind(id).first<Snapshot>();
-    expect([row?.status, row?.total]).toEqual(['complete', 135]);
-    expect(source.stargazers).toHaveBeenLastCalledWith('owner/repo', 2);
-  });
-
-  it('retains the last complete snapshot when GitHub truncates or rejects a new collection', async () => {
-    await addRepo();
-    const baseline = await snapshot(users(1, 2));
-    const id = await enqueueSnapshot(env.DB, 'repo', 'manual');
-    const truncated = provider(users(1, 2));
-    truncated.stargazers = async () => ({ users: users(1), hasNext: false });
-    await collectStars(env, truncated);
-    const failed = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?')
-      .bind(id)
-      .first<Snapshot>();
-    expect(failed?.status).toBe('failed');
-    expect(
-      await env.DB.prepare('SELECT COUNT(*) AS count FROM star_changes WHERE snapshot_id = ?')
-        .bind(id)
-        .first('count'),
-    ).toBe(0);
-    const session = await setup();
-    const d = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
-    expect(d.repositories[0].latest?.id).toBe(baseline.id);
-    expect(d.repositories[0].lastError).toContain('完整性检查');
-    await retrySnapshot(env.DB, id!);
-    await collectStars(env, provider(users(1, 3)));
-    const completed = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?')
-      .bind(id)
-      .first<Snapshot>();
-    expect([completed?.status, completed?.added, completed?.removed]).toEqual(['complete', 1, 1]);
-  });
-
-  it('uses a database lease so overlapping invocations do not duplicate a collection', async () => {
-    await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    expect(await enqueueSnapshot(env.DB, 'repo', 'manual')).toBe(id);
-    const source = provider(users(1));
-    await Promise.all([collectStars(env, source), collectStars(env, source)]);
-    expect(source.stargazers).toHaveBeenCalledTimes(1);
-    expect(
-      await env.DB.prepare(
-        "SELECT COUNT(*) AS count FROM snapshots WHERE status = 'complete'",
-      ).first('count'),
-    ).toBe(1);
-  });
-
-  it('supports empty repositories and does not treat their first snapshot as cancellations', async () => {
-    await addRepo();
-    const row = await snapshot([]);
-    expect([row.total, row.added, row.removed]).toEqual([0, 0, 0]);
-    const daily = await snapshot(users(2), 'daily');
-    expect([daily.total, daily.added, daily.removed]).toEqual([1, 1, 0]);
-  });
-
-  it('never backdates a historical failed snapshot when the administrator retries it', async () => {
-    await addRepo();
-    await snapshot(users(1), 'baseline', '2020-01-01', nowSeconds() - 100);
-    const old = await enqueueSnapshot(env.DB, 'repo', 'daily', '2020-01-02', nowSeconds() - 50);
-    await env.DB.prepare(
-      "UPDATE snapshots SET status = 'failed',error = 'upstream unavailable' WHERE id = ?",
-    )
-      .bind(old)
-      .run();
-    const retry = await retrySnapshot(env.DB, old!);
-    expect(retry).not.toBe(old);
-    await collectStars(env, provider(users(1, 2)));
-    const fresh = await env.DB.prepare('SELECT * FROM snapshots WHERE id = ?')
-      .bind(retry)
-      .first<Snapshot>();
-    expect([fresh?.kind, fresh?.day, fresh?.status]).toEqual([
-      'manual',
-      localDay(nowSeconds()),
-      'complete',
-    ]);
-    expect(
-      await env.DB.prepare('SELECT status FROM snapshots WHERE id = ?').bind(old).first('status'),
-    ).toBe('failed');
-  });
-});
-
-describe('scheduling, charts and upstream behavior', () => {
-  it('enqueues one nightly snapshot after the local scheduled hour, with no fictional backfill', async () => {
-    const before = Date.parse('2026-10-31T22:59:00+08:00') / 1000;
-    const after = Date.parse('2026-10-31T23:00:00+08:00') / 1000;
-    expect(latestDue(before, 23).day).toBe('2026-10-30');
-    expect(latestDue(after, 23).day).toBe('2026-10-31');
-    await addRepo('repo', before - 60);
-    await enqueueDue(env.DB, before);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(0);
-    await enqueueDue(env.DB, after);
-    await enqueueDue(env.DB, after + 60);
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(1);
-    expect(await env.DB.prepare('SELECT day FROM snapshots').first('day')).toBe('2026-10-31');
-  });
-
-  it('paginates/filter changes, selects historical snapshots, and carries chart totals over gaps', async () => {
-    await addRepo();
-    const yesterday = localDay(nowSeconds() - 86400);
-    const baseline = await snapshot(users(1), 'baseline', yesterday, nowSeconds() - 100);
-    const latest = await snapshot(users(...Array.from({ length: 36 }, (_, i) => i + 1)), 'daily');
-    const cookie = await setup();
-    const first = await (await request('/dashboard', 'GET', undefined, cookie)).json<Dashboard>();
-    expect(first.changeTotal).toBe(35);
-    expect(first.changes).toHaveLength(30);
-    expect(first.history.at(-1)?.total).toBe(36);
-    expect(first.history.at(-2)?.total).toBe(1);
-    const next = await (
-      await request('/dashboard?page=2&kind=added', 'GET', undefined, cookie)
-    ).json<Dashboard>();
-    expect(next.changes).toHaveLength(5);
-    const old = await (
-      await request(`/dashboard?snapshot=${baseline.id}`, 'GET', undefined, cookie)
-    ).json<Dashboard>();
-    expect(old.changeTotal).toBe(0);
-    expect(first.repositories[0].latest?.id).toBe(latest.id);
-    expect((await request('/dashboard?days=999', 'GET', undefined, cookie)).status).toBe(400);
-  });
-
-  it('accepts GitHub repository formats and rejects arbitrary URLs / path injection', () => {
-    expect(parseRepository('https://github.com/shihuili1218/repotrace.git')).toBe(
-      'shihuili1218/repotrace',
-    );
+  it('accepts only GitHub repo formats', () => {
+    expect(parseRepository(' https://github.com/owner/repo.git/ ')).toBe('owner/repo');
     for (const input of [
-      'https://evil.test/a/b',
-      'owner/../',
-      'a/b/issues',
-      'a/b?token=test',
-      'a/..',
+      'https://evil.test/o/r',
+      'o/r/../../x',
+      'o/..',
+      'o/r?x',
+      'o/r#x',
+      'git@github.com:o/r',
+      null,
     ])
       expect(() => parseRepository(input)).toThrow();
   });
-
-  it('maps GitHub rate limits to deferred retries and preserves token confidentiality', async () => {
-    const mock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{}', {
-        status: 403,
-        headers: {
-          'X-RateLimit-Remaining': '0',
-          'X-RateLimit-Reset': String(nowSeconds() + 600),
-        },
-      }),
-    );
-    await expect(github('test-token').repository('owner/repo')).rejects.toMatchObject({
-      transient: true,
-    });
-    const [, options] = mock.mock.calls[0];
-    expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
-    mock.mockResolvedValue(
-      Response.json(
-        [{ starred_at: '2026-10-31T00:00:00Z', user: { id: 1, login: 'star-bot[bot]' } }],
-        {
-          headers: {
-            Link: '<https://api.github.com/repos/owner/repo/stargazers?page=2>; rel="next"',
-          },
-        },
-      ),
-    );
-    const page = await github('test-token').stargazers('owner/repo', 1);
-    expect(page.hasNext).toBe(true);
-    expect(page.users[0].id).toBe(1);
-    expect(page.users[0].login).toBe('star-bot[bot]');
+  it('encrypts each project with project-bound associated data', async () => {
+    const session = await setup();
+    const [a, b] = await Promise.all([add(session), add(session, 'other/project')]);
+    expect((await getWebhookCredentials(env, a.id))?.secret).toBe(a.secret);
+    expect((await getWebhookCredentials(env, b.id))?.secret).toBe(b.secret);
+    await env.DB.prepare(
+      'UPDATE webhook_connections SET ciphertext=(SELECT ciphertext FROM webhook_connections WHERE project_id=?) WHERE project_id=?',
+    )
+      .bind(a.id, b.id)
+      .run();
+    await expect(getWebhookCredentials(env, b.id)).rejects.toThrow('无法解密');
   });
+  it('removes the retired polling and credential endpoints', async () => {
+    const session = await setup();
+    const config = await add(session);
+    for (const [path, method] of [
+      [`/repositories/${config.id}/token`, 'PUT'],
+      [`/repositories/${config.id}/sync`, 'POST'],
+      ['/snapshots/old/continue', 'POST'],
+      ['/snapshots/old/retry', 'POST'],
+    ])
+      expect((await request(path, method, {}, session)).status).toBe(404);
+  });
+});
+
+describe('signed GitHub deliveries', () => {
+  it('accepts public signed ping, binds repo identity and preserves a zero count', async () => {
+    const session = await setup();
+    const config = await add(session);
+    expect(
+      (
+        await signed(config, 'ping', {
+          repository: { id: 100, full_name: 'owner/repo', stargazers_count: 0 },
+        })
+      ).status,
+    ).toBe(200);
+    const data = await dashboard(session);
+    expect(data.repositories[0]).toMatchObject({ github_id: 100, current_total: 0 });
+    expect(data.repositories[0].last_received_at).toBeTypeOf('number');
+    expect(data.summaries[0]).toMatchObject({ kind: 'baseline', total: 0, added: 0, removed: 0 });
+  });
+  it('rejects missing/wrong signatures and changes to the signed bytes without writing data', async () => {
+    const config = await add(await setup());
+    expect((await send(new Request(config.url, { method: 'POST', body: '{}' }))).status).toBe(401);
+    expect((await signed({ ...config, secret: 'wrong' })).status).toBe(401);
+    expect((await send(new Request(config.url, { method: 'GET' }))).status).toBe(405);
+    expect(await scalar('SELECT COUNT(*) AS count FROM webhook_deliveries')).toBe(0);
+    expect((await env.DB.prepare('SELECT github_id FROM projects').first())?.github_id).toBeNull();
+  });
+  it('records created and deleted users and uses the latest reported repository total', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config);
+    await signed(config, 'star');
+    await signed(config, 'star', {
+      action: 'deleted',
+      sender: { id: 2, login: 'second-user' },
+      starred_at: null,
+      repository: { id: 100, full_name: 'owner/repo', stargazers_count: 9 },
+    });
+    const data = await dashboard(session);
+    expect(data.eventCounts).toEqual({ added: 1, removed: 1 });
+    expect(data.changes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ user_id: 1, kind: 'added' }),
+        expect.objectContaining({ user_id: 2, kind: 'removed', starred_at: null }),
+      ]),
+    );
+    expect(data.repositories[0].current_total).toBe(9);
+  });
+  it('deduplicates concurrent redeliveries atomically and never rewinds a newer total', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const delivery = crypto.randomUUID();
+    await Promise.all(Array.from({ length: 4 }, () => signed(config, 'star', {}, delivery)));
+    await signed(config, 'ping', {
+      repository: { id: 100, full_name: 'owner/repo', stargazers_count: 11 },
+    });
+    await signed(config, 'star', {}, delivery);
+    const data = await dashboard(session);
+    expect(data.changeTotal).toBe(1);
+    expect(data.repositories[0].current_total).toBe(11);
+    expect(await scalar('SELECT COUNT(*) AS count FROM webhook_deliveries')).toBe(2);
+  });
+  it('ignores signed unsupported events, rejects malformed stars and unbound repository mismatches', async () => {
+    const config = await add(await setup());
+    expect((await signed(config, 'push')).status).toBe(200);
+    expect((await signed(config, 'star', { action: 'edited' })).status).toBe(400);
+    expect((await signed(config, 'star', { sender: { id: 1, login: '../evil' } })).status).toBe(
+      400,
+    );
+    expect(
+      (
+        await signed(config, 'ping', {
+          repository: { id: 101, full_name: 'other/repo', stargazers_count: 1 },
+        })
+      ).status,
+    ).toBe(409);
+    expect(await scalar('SELECT COUNT(*) AS count FROM webhook_deliveries')).toBe(0);
+  });
+  it('accepts renames only for the bound GitHub repository ID', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config);
+    expect(
+      (
+        await signed(config, 'ping', {
+          repository: { id: 101, full_name: 'owner/repo', stargazers_count: 1 },
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await signed(config, 'ping', {
+          repository: { id: 100, full_name: 'owner/renamed', stargazers_count: 12 },
+        })
+      ).status,
+    ).toBe(200);
+    expect((await dashboard(session)).repositories[0].full_name).toBe('owner/renamed');
+  });
+  it('acknowledges paused deliveries without recording changes or updating total, then resumes', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config);
+    await request(`/repositories/${config.id}`, 'PATCH', { enabled: false }, session);
+    const response = await signed(config, 'star', {
+      repository: { id: 100, full_name: 'owner/repo', stargazers_count: 999 },
+    });
+    expect(await response.json()).toMatchObject({ ok: true, paused: true });
+    expect((await dashboard(session)).repositories[0].current_total).toBe(10);
+    expect(await scalar('SELECT COUNT(*) AS count FROM star_events')).toBe(0);
+    await request(`/repositories/${config.id}`, 'PATCH', { enabled: true }, session);
+    await signed(config, 'star');
+    expect(await scalar('SELECT COUNT(*) AS count FROM star_events')).toBe(1);
+  });
+  it('rotates secrets, resets connection status and rejects the old signature', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const delivery = crypto.randomUUID();
+    await signed(config, 'ping', {}, delivery);
+    const replacement = await (
+      await request(`/repositories/${config.id}/webhook`, 'POST', {}, session)
+    ).json<WebhookConfig>();
+    expect(replacement.secret).not.toBe(config.secret);
+    expect((await dashboard(session)).repositories[0].last_received_at).toBeNull();
+    expect((await signed(config)).status).toBe(401);
+    expect((await signed(replacement, 'ping', {}, delivery)).status).toBe(200);
+    expect((await dashboard(session)).repositories[0].last_received_at).not.toBeNull();
+  });
+  it('deletes the project, its ciphertext, events and summaries with no orphan records', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'star');
+    expect((await request(`/repositories/${config.id}`, 'DELETE', {}, session)).status).toBe(200);
+    for (const table of [
+      'projects',
+      'webhook_connections',
+      'webhook_deliveries',
+      'star_events',
+      'summaries',
+      'summary_changes',
+    ])
+      expect(await scalar(`SELECT COUNT(*) AS count FROM ${table}`)).toBe(0);
+    expect((await signed(config)).status).toBe(401);
+  });
+});
+
+describe('nightly summaries and charts', () => {
+  const end = latestDue(nowSeconds(), 23);
+  const at = end - 3600; // 22:00 Shanghai, immediately before the last daily cutoff
+  it('computes net users by stable ID, cancels opposite actions and keeps latest usernames', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'ping', {}, crypto.randomUUID(), at);
+    for (const [offset, id, login, action] of [
+      [1, 1, 'original', 'created'],
+      [2, 1, 'renamed', 'deleted'],
+      [3, 2, 'second', 'deleted'],
+      [4, 2, 'second', 'created'],
+      [5, 3, 'third-old', 'created'],
+      [6, 3, 'third-new', 'created'],
+      [7, 4, 'fourth', 'deleted'],
+    ] as const)
+      await signed(
+        config,
+        'star',
+        { action, sender: { id, login } },
+        crypto.randomUUID(),
+        at + offset,
+      );
+    await summarizeDue(env.DB, end - 1);
+    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(0);
+    await summarizeDue(env.DB, end);
+    await summarizeDue(env.DB, end + 60);
+    const summary = await env.DB.prepare("SELECT * FROM summaries WHERE kind='daily'").first<{
+      id: string;
+      added: number;
+      removed: number;
+      event_count: number;
+      period_start: number;
+      period_end: number;
+    }>();
+    expect(summary).toMatchObject({
+      added: 1,
+      removed: 1,
+      event_count: 7,
+      period_start: at,
+      period_end: end,
+    });
+    const changes = await env.DB.prepare('SELECT * FROM summary_changes WHERE summary_id=?')
+      .bind(summary!.id)
+      .all();
+    expect(changes.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ user_id: 3, login: 'third-new', kind: 'added' }),
+        expect.objectContaining({ user_id: 4, kind: 'removed' }),
+      ]),
+    );
+    expect(changes.results).toHaveLength(2);
+    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
+  });
+  it('uses half-open windows, catches up quiet days and carries forward the last reported total', async () => {
+    const config = await add(await setup());
+    await signed(config, 'ping', {}, crypto.randomUUID(), at);
+    await signed(config, 'star', {}, crypto.randomUUID(), end);
+    await summarizeDue(env.DB, end + 86400 * 2);
+    const list = await env.DB.prepare(
+      "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
+    ).all();
+    expect(list.results).toHaveLength(3);
+    expect(list.results.map((s) => s.event_count)).toEqual([0, 1, 0]);
+    expect(list.results.map((s) => s.total)).toEqual([10, 10, 10]);
+    expect(list.results.map((s) => s.added)).toEqual([0, 1, 0]);
+  });
+  it('recomputes a boundary window when a received event commits after its first summary', async () => {
+    const config = await add(await setup());
+    await signed(config, 'ping', {}, crypto.randomUUID(), at);
+    await summarizeDue(env.DB, end);
+    await signed(config, 'star', {}, crypto.randomUUID(), end - 1);
+    await summarizeDue(env.DB, end + 60);
+    expect(
+      (await env.DB.prepare("SELECT added FROM summaries WHERE kind='daily'").first())?.added,
+    ).toBe(1);
+  });
+  it('preserves continuous windows when the schedule moves and does not summarize before connection', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await summarizeDue(env.DB, end + 86400);
+    expect(await scalar('SELECT COUNT(*) AS count FROM summaries')).toBe(0);
+    await signed(config, 'ping', {}, crypto.randomUUID(), at);
+    await summarizeDue(env.DB, end);
+    expect((await request('/settings', 'PATCH', { dailyHour: 22 }, session)).status).toBe(200);
+    await signed(config, 'star', {}, crypto.randomUUID(), end + 100);
+    await summarizeDue(env.DB, end + 23 * 3600);
+    const list = await env.DB.prepare(
+      "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
+    ).all();
+    expect(list.results).toHaveLength(2);
+    expect(list.results[1]).toMatchObject({
+      period_start: end,
+      period_end: end + 23 * 3600,
+      added: 1,
+    });
+  });
+  it('uses Beijing cutoff boundaries across midnight and validates settings', async () => {
+    expect(localDay(Date.parse('2026-10-30T16:00:00Z') / 1000)).toBe('2026-10-31');
+    expect(latestDue(end - 1, 23)).toBe(end - 86400);
+    expect(latestDue(end, 23)).toBe(end);
+    const session = await setup();
+    for (const hour of [-1, 24, 3.5, '22'])
+      expect((await request('/settings', 'PATCH', { dailyHour: hour }, session)).status).toBe(400);
+  });
+  it('paginates and filters live events and summary users without leaking secret data', async () => {
+    const session = await setup();
+    const config = await add(session);
+    for (let id = 1; id <= 33; id++)
+      await signed(config, 'star', {
+        action: id === 33 ? 'deleted' : 'created',
+        sender: { id, login: `user-${id}` },
+      });
+    const first = await dashboard(session);
+    expect(first.changes).toHaveLength(30);
+    expect(first.changeTotal).toBe(33);
+    expect((await dashboard(session, '?page=2')).changes).toHaveLength(3);
+    expect((await dashboard(session, '?kind=removed')).changeTotal).toBe(1);
+    await summarizePeriod(env.DB, config.id, nowSeconds() - 10, nowSeconds() + 10);
+    const daily = await env.DB.prepare("SELECT id FROM summaries WHERE kind='daily'").first<{
+      id: string;
+    }>();
+    expect((await dashboard(session, `?summary=${daily!.id}&kind=added`)).changeTotal).toBe(32);
+    expect((await request('/dashboard?repo=missing', 'GET', undefined, session)).status).toBe(404);
+    expect((await request('/dashboard?days=99', 'GET', undefined, session)).status).toBe(400);
+  });
+  it('runs scheduled summaries with no GitHub calls and reports the cron heartbeat', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'ping', {}, crypto.randomUUID(), at);
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('unexpected network'));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(end * 1000);
+    await worker.scheduled({} as ScheduledController, env, createExecutionContext());
+    clock.mockRestore();
+    expect(outgoing).not.toHaveBeenCalled();
+    expect(
+      (await env.DB.prepare("SELECT value FROM monitor_settings WHERE key='last_cron_at'").first())
+        ?.value,
+    ).toBe(String(end));
+    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
+    const chart = await dashboard(session);
+    expect(chart.history.find((row) => row.day === localDay(end))?.total).toBe(10);
+  });
+});
+
+it('migrates legacy history and admin data, deleting all saved PATs and pending polling jobs', async () => {
+  const legacy = (bindings as unknown as { LEGACY_DB: D1Database }).LEGACY_DB;
+  await legacy.batch([
+    legacy.prepare('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)'),
+    ...migrations[0].map((sql) => legacy.prepare(sql)),
+    legacy.prepare('INSERT INTO schema_migrations VALUES (1),(2)'),
+  ]);
+  await legacy.batch([
+    legacy.prepare("INSERT INTO admin VALUES (1,'hash','salt',100000)"),
+    legacy.prepare(
+      "INSERT INTO repositories VALUES ('old',100,'owner/repo','Legacy','TypeScript',1,100)",
+    ),
+    legacy.prepare(
+      'CREATE TABLE repository_tokens(repo_id TEXT PRIMARY KEY,key_id TEXT,ciphertext TEXT,updated_at INTEGER)',
+    ),
+    legacy.prepare("INSERT INTO repository_tokens VALUES ('old','old-key','old-ciphertext',100)"),
+    legacy.prepare("INSERT INTO monitor_settings VALUES ('token_vault_key','old-key')"),
+    legacy.prepare(
+      "INSERT INTO snapshots(id,repo_id,kind,day,status,total,added,started_at,completed_at) VALUES ('done','old','daily','2026-10-29','complete',12,1,100,200),('pending','old','manual','2026-10-30','collecting',0,0,300,NULL)",
+    ),
+    legacy.prepare("INSERT INTO star_changes VALUES ('done',1,'octocat','added',NULL)"),
+  ]);
+  await initDB(legacy);
+  await initDB(legacy);
+  expect(await legacy.prepare('SELECT hash FROM admin').first('hash')).toBe('hash');
+  expect(await legacy.prepare('SELECT COUNT(*) AS count FROM projects').first('count')).toBe(1);
+  expect(await legacy.prepare('SELECT * FROM summaries').first()).toMatchObject({
+    id: 'done',
+    source: 'legacy',
+    total: 12,
+  });
+  expect(await legacy.prepare('SELECT * FROM summary_changes').first()).toMatchObject({
+    login: 'octocat',
+  });
+  const tables = await legacy
+    .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+    .all<{ name: string }>();
+  for (const obsolete of [
+    'repository_tokens',
+    'snapshots',
+    'snapshot_members',
+    'star_changes',
+    'repositories',
+  ])
+    expect(tables.results.map((t) => t.name)).not.toContain(obsolete);
+  expect(
+    await legacy.prepare("SELECT value FROM monitor_settings WHERE key='token_vault_key'").first(),
+  ).toBeNull();
+});
+
+it('verifies the exact raw bytes and bounds oversized bodies even without a Content-Length', async () => {
+  const config = await add(await setup());
+  const raw = '{"repository":{"id":100,"full_name":"owner/repo","stargazers_count":1}}';
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(config.secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = [
+    ...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(raw))),
+  ]
+    .map((n) => n.toString(16).padStart(2, '0'))
+    .join('');
+  const headers = {
+    'X-Hub-Signature-256': `sha256=${signature}`,
+    'X-GitHub-Event': 'ping',
+    'X-GitHub-Delivery': crypto.randomUUID(),
+  };
+  // Same parsed JSON, different raw bytes: verification must fail.
+  expect(
+    (await send(new Request(config.url, { method: 'POST', headers, body: raw + ' ' }))).status,
+  ).toBe(401);
+  expect(
+    (
+      await send(
+        new Request(config.url, { method: 'POST', headers, body: 'x'.repeat(1024 * 1024 + 1) }),
+      )
+    ).status,
+  ).toBe(413);
+  expect(await scalar('SELECT COUNT(*) AS count FROM webhook_deliveries')).toBe(0);
+});
+
+it('rolls back the delivery marker if recording an event fails so the same delivery can be retried', async () => {
+  const config = await add(await setup());
+  const delivery = crypto.randomUUID();
+  await env.DB.prepare(
+    "CREATE TRIGGER fail_event BEFORE INSERT ON star_events BEGIN SELECT RAISE(ABORT,'test failure'); END",
+  ).run();
+  try {
+    expect((await signed(config, 'star', {}, delivery)).status).toBe(500);
+    expect(await scalar('SELECT COUNT(*) AS count FROM webhook_deliveries')).toBe(0);
+  } finally {
+    await env.DB.prepare('DROP TRIGGER fail_event').run();
+  }
+  expect((await signed(config, 'star', {}, delivery)).status).toBe(200);
+  expect(await scalar('SELECT COUNT(*) AS count FROM star_events')).toBe(1);
+});
+
+it('moving the cutoff later keeps one immutable summary per day and a continuous next window', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const end = latestDue(nowSeconds(), 22);
+  const start = end - 3600;
+  await request('/settings', 'PATCH', { dailyHour: 22 }, session);
+  await signed(config, 'ping', {}, crypto.randomUUID(), start);
+  await summarizeDue(env.DB, end);
+  await request('/settings', 'PATCH', { dailyHour: 23 }, session);
+  await signed(config, 'star', {}, crypto.randomUUID(), end + 1800);
+  await summarizeDue(env.DB, end + 3600);
+  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
+  await summarizeDue(env.DB, end + 86400 + 3600);
+  const list = await env.DB.prepare(
+    "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
+  ).all();
+  expect(list.results).toHaveLength(2);
+  expect(list.results[0]).toMatchObject({ period_start: start, period_end: end, added: 0 });
+  expect(list.results[1]).toMatchObject({
+    period_start: end,
+    period_end: end + 25 * 3600,
+    added: 1,
+  });
+  // A stale invocation cannot change the first day's stored bounds or its members.
+  await summarizePeriod(env.DB, config.id, start, end + 3600);
+  expect(
+    await env.DB.prepare('SELECT * FROM summaries WHERE period_end=?').bind(end).first(),
+  ).toMatchObject({ period_start: start, added: 0, event_count: 0 });
+});
+
+it('bounds cron work across multiple projects and advances waiting projects on later invocations', async () => {
+  const session = await setup();
+  const end = latestDue(nowSeconds(), 23);
+  for (let i = 0; i < 7; i++) {
+    const config = await add(session, `owner/repo${i}`);
+    await signed(
+      config,
+      'ping',
+      { repository: { id: 100 + i, full_name: `owner/repo${i}`, stargazers_count: i } },
+      crypto.randomUUID(),
+      end - 3600,
+    );
+  }
+  await summarizeDue(env.DB, end);
+  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(6);
+  await summarizeDue(env.DB, end + 60);
+  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(7);
+});
+
+it('does not rewrite a completed summary when no new delivery can affect it', async () => {
+  const config = await add(await setup());
+  const end = latestDue(nowSeconds(), 23);
+  await signed(config, 'ping', {}, crypto.randomUUID(), end - 3600);
+  await summarizeDue(env.DB, end);
+  await env.DB.prepare("UPDATE summaries SET computed_at=1 WHERE kind='daily'").run();
+  await summarizeDue(env.DB, end + 60);
+  expect(
+    (await env.DB.prepare("SELECT computed_at FROM summaries WHERE kind='daily'").first())
+      ?.computed_at,
+  ).toBe(1);
+  // A later-window event must not dirty this window either.
+  await signed(config, 'star', {}, crypto.randomUUID(), end + 10);
+  await summarizeDue(env.DB, end + 120);
+  expect(
+    (await env.DB.prepare("SELECT computed_at FROM summaries WHERE kind='daily'").first())
+      ?.computed_at,
+  ).toBe(1);
 });

@@ -1,7 +1,6 @@
 import { AppError, type Env, nowSeconds } from './types';
-import { validateGitHubToken } from './github';
 
-interface SealedToken {
+interface SealedSecret {
   keyId: string;
   ciphertext: string;
 }
@@ -9,9 +8,9 @@ const encoder = new TextEncoder();
 const keyCache = new Map<string, Promise<CryptoKey>>();
 
 function storage(env: Env) {
-  if (!env.TOKEN_KEYS)
-    throw new AppError(503, '项目 Token 安全存储未就绪，请确认部署已创建 TOKEN_KEYS 绑定。');
-  return env.TOKEN_KEYS;
+  if (!env.WEBHOOK_KEYS)
+    throw new AppError(503, 'Webhook Secret 安全存储未就绪，请确认部署已创建 WEBHOOK_KEYS 绑定。');
+  return env.WEBHOOK_KEYS;
 }
 
 async function loadKey(env: Env, id: string) {
@@ -22,7 +21,7 @@ async function loadKey(env: Env, id: string) {
       if (!raw)
         throw new AppError(
           503,
-          '项目 Token 的加密密钥无法读取，请检查 TOKEN_KEYS 是否仍绑定原有的 KV 命名空间。',
+          'Webhook Secret 的加密密钥无法读取，请检查 WEBHOOK_KEYS 是否仍绑定原有的 KV 命名空间。',
         );
       return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
     })();
@@ -36,7 +35,7 @@ async function loadKey(env: Env, id: string) {
 
 async function writeKey(env: Env) {
   const existing = await env.DB.prepare(
-    "SELECT value FROM monitor_settings WHERE key = 'token_vault_key'",
+    "SELECT value FROM monitor_settings WHERE key = 'webhook_vault_key'",
   ).first<{ value: string }>();
   if (existing) return { id: existing.value, key: await loadKey(env, existing.value) };
   const id = crypto.randomUUID();
@@ -45,14 +44,14 @@ async function writeKey(env: Env) {
   // D1 chooses one immutable root key atomically. Candidates have distinct KV names,
   // so concurrent first writes cannot overwrite a key already used by another project.
   await env.DB.prepare(
-    "INSERT OR IGNORE INTO monitor_settings(key,value) VALUES ('token_vault_key',?)",
+    "INSERT OR IGNORE INTO monitor_settings(key,value) VALUES ('webhook_vault_key',?)",
   )
     .bind(id)
     .run();
   const chosen = await env.DB.prepare(
-    "SELECT value FROM monitor_settings WHERE key = 'token_vault_key'",
+    "SELECT value FROM monitor_settings WHERE key = 'webhook_vault_key'",
   ).first<{ value: string }>();
-  if (!chosen) throw new AppError(503, '项目 Token 安全存储初始化失败，请稍后重试。');
+  if (!chosen) throw new AppError(503, 'Webhook Secret 安全存储初始化失败，请稍后重试。');
   if (chosen.value !== id) await storage(env).delete(`vault/${id}`);
   else {
     // Use the new material locally while its KV entry propagates to other locations.
@@ -64,38 +63,36 @@ async function writeKey(env: Env) {
 const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const fromBase64 = (text: string) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
 
-export async function sealRepositoryToken(
+export async function sealWebhookSecret(
   env: Env,
   repoId: string,
-  input: unknown,
-): Promise<SealedToken> {
-  const token = validateGitHubToken(input);
+  secret: string,
+): Promise<SealedSecret> {
   const { id, key } = await writeKey(env);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: encoder.encode(repoId) },
     key,
-    encoder.encode(token),
+    encoder.encode(secret),
   );
   return { keyId: id, ciphertext: `v1.${base64(iv)}.${base64(new Uint8Array(ciphertext))}` };
 }
 
-export function tokenStatement(db: D1Database, repoId: string, token: SealedToken) {
+export function secretStatement(db: D1Database, repoId: string, sealed: SealedSecret) {
   return db
     .prepare(
-      `INSERT INTO repository_tokens(repo_id,key_id,ciphertext,updated_at) VALUES (?,?,?,?)
-    ON CONFLICT(repo_id) DO UPDATE SET key_id=excluded.key_id,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`,
+      `INSERT INTO webhook_connections(project_id,key_id,ciphertext,configured_at) VALUES (?,?,?,?)
+    ON CONFLICT(project_id) DO UPDATE SET key_id=excluded.key_id,ciphertext=excluded.ciphertext,configured_at=excluded.configured_at,last_received_at=NULL`,
     )
-    .bind(repoId, token.keyId, token.ciphertext, nowSeconds());
+    .bind(repoId, sealed.keyId, sealed.ciphertext, nowSeconds());
 }
 
-export async function saveRepositoryToken(env: Env, repoId: string, token: string) {
-  await tokenStatement(env.DB, repoId, await sealRepositoryToken(env, repoId, token)).run();
-}
-
-export async function getRepositoryToken(env: Env, repoId: string): Promise<string | null> {
+export async function getWebhookCredentials(
+  env: Env,
+  repoId: string,
+): Promise<{ secret: string; version: string } | null> {
   const record = await env.DB.prepare(
-    'SELECT key_id,ciphertext FROM repository_tokens WHERE repo_id = ?',
+    'SELECT key_id,ciphertext FROM webhook_connections WHERE project_id = ?',
   )
     .bind(repoId)
     .first<{ key_id: string; ciphertext: string }>();
@@ -109,14 +106,8 @@ export async function getRepositoryToken(env: Env, repoId: string): Promise<stri
       key,
       fromBase64(ciphertext),
     );
-    return validateGitHubToken(new TextDecoder().decode(plaintext));
+    return { secret: new TextDecoder().decode(plaintext), version: record.ciphertext };
   } catch {
-    throw new AppError(503, '此项目 Token 无法解密，请在监控项目中重新设置 Token。');
+    throw new AppError(503, '此 Webhook Secret 无法解密，请在监控项目中重新生成签名密钥。');
   }
-}
-
-export async function requireRepositoryToken(env: Env, repoId: string) {
-  const token = await getRepositoryToken(env, repoId);
-  if (!token) throw new AppError(409, '请先为此项目设置 GitHub Token。');
-  return token;
 }

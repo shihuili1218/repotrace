@@ -10,7 +10,7 @@
     "run_worker_first": true,
   },
   "d1_databases": [{ "binding": "DB", "database_name": "repotrace-db" }],
-  "kv_namespaces": [{ "binding": "TOKEN_KEYS" }],
+  "kv_namespaces": [{ "binding": "WEBHOOK_KEYS" }],
   "triggers": { "crons": ["* * * * *"] },
   "build": { "command": "npm run build" },
   "observability": { "enabled": true },

@@ -10,7 +10,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Clock3,
   ExternalLink,
   Eye,
   EyeOff,
@@ -28,7 +27,6 @@ import {
   Play,
   Plus,
   RefreshCw,
-  Search,
   Settings2,
   ShieldCheck,
   Sparkles,
@@ -36,8 +34,8 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { Dashboard, RepoSummary, Snapshot } from '../shared/types';
-import { api, ApiError } from './api';
+import type { Dashboard, RepoSummary, WebhookConfig } from '../shared/types';
+import { api } from './api';
 import { ChangesChart, TrendChart } from './Charts';
 
 type AuthStatus = { initialized: boolean; authenticated: boolean; setupProtected: boolean };
@@ -54,9 +52,7 @@ const time = (seconds: number | null, full = false) =>
         minute: '2-digit',
         ...(full ? { year: 'numeric' } : {}),
       }).format(new Date(seconds * 1000))
-    : '尚未采集';
-const kindLabel = (kind: Snapshot['kind']) =>
-  ({ baseline: '初始基线', daily: '每日快照', manual: '手动快照' })[kind];
+    : '尚未收到';
 const errorText = (e: unknown) => (e instanceof Error ? e.message : '操作失败，请重试。');
 
 function Logo({ large = false }: { large?: boolean }) {
@@ -320,106 +316,53 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [data, setData] = useState<Dashboard | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [repo, setRepo] = useState('');
-  const [snapshot, setSnapshot] = useState('');
+  const [summary, setSummary] = useState('');
   const [days, setDays] = useState(30);
-  const [changeKind, setChangeKind] = useState('all');
+  const [kind, setKind] = useState('all');
   const [page, setPage] = useState(1);
-  const [search, setSearch] = useState('');
-  const [modal, setModal] = useState<'add' | RepoSummary | null>(null);
-  const [tokenRepo, setTokenRepo] = useState<RepoSummary | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [hook, setHook] = useState<WebhookConfig | null>(null);
+  const [deleting, setDeleting] = useState<RepoSummary | null>(null);
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const requestId = useRef(0);
-  const continuing = useRef(false);
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
   const refresh = useCallback(async () => {
     const id = ++requestId.current;
-    setLoading(true);
     try {
-      const [d, s] = await Promise.all([
+      const [next, config] = await Promise.all([
         api<Dashboard>(
-          `/dashboard?${new URLSearchParams({ repo, snapshot, days: String(days), kind: changeKind, page: String(page) })}`,
+          `/dashboard?${new URLSearchParams({ repo, summary, days: String(days), kind, page: String(page) })}`,
         ),
         api<Settings>('/settings'),
       ]);
       if (id === requestId.current) {
-        setData(d);
-        setSettings(s);
+        setData(next);
+        setSettings(config);
         setError('');
       }
     } catch (e) {
       if (id === requestId.current) setError(errorText(e));
-    } finally {
-      if (id === requestId.current) setLoading(false);
     }
-  }, [repo, snapshot, days, changeKind, page]);
-  const latestRefresh = useRef(refresh);
-  latestRefresh.current = refresh;
+  }, [repo, summary, days, kind, page]);
   useEffect(() => {
     void refresh();
-  }, [refresh]);
-  const hasActive = data?.repositories.some((r) => r.active);
+    const interval = window.setInterval(() => void refresh(), hook ? 5000 : 15000);
+    return () => {
+      window.clearInterval(interval);
+      requestId.current++;
+    };
+  }, [refresh, !!hook]);
   useEffect(() => {
-    const now = Date.now() / 1000;
-    const pending = data?.repositories
-      .filter(
-        (r) =>
-          r.enabled &&
-          r.tokenConfigured &&
-          r.active &&
-          r.active.retry_at <= now &&
-          r.active.lease_until <= now,
-      )
-      .sort((a, b) => a.active!.page - b.active!.page)[0];
-    if (!pending?.active || busy) return;
-    const id = pending.active.id;
-    const timer = window.setTimeout(async () => {
-      if (document.hidden || continuing.current) return;
-      continuing.current = true;
-      try {
-        await api(`/snapshots/${id}/continue`, { method: 'POST' });
-      } catch (error) {
-        if (alive.current && (!(error instanceof ApiError) || ![409, 429].includes(error.status)))
-          setError(errorText(error));
-      } finally {
-        continuing.current = false;
-        if (alive.current) void latestRefresh.current();
-      }
-    }, 1200);
-    return () => clearTimeout(timer);
-  }, [data, busy]);
-  useEffect(() => {
-    const timer = window.setInterval(
-      () => {
-        if (!document.hidden) void refresh();
-      },
-      hasActive ? 5000 : 60000,
-    );
-    return () => clearInterval(timer);
-  }, [refresh, hasActive]);
-  useEffect(() => {
-    if (toast) {
-      const timer = window.setTimeout(() => setToast(''), 6000);
-      return () => clearTimeout(timer);
-    }
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(''), 5000);
+    return () => window.clearTimeout(timer);
   }, [toast]);
-  function chooseRepo(value: string) {
-    setRepo(value);
-    setSnapshot('');
-    setPage(1);
-  }
-  async function action(path: string, method: string, body?: unknown, message = '已保存') {
+  async function action(fn: () => Promise<unknown>, message: string) {
     setBusy(true);
+    setError('');
     try {
-      await api(path, { method, body });
+      await fn();
       setToast(message);
       await refresh();
     } catch (e) {
@@ -428,18 +371,23 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       setBusy(false);
     }
   }
+  async function configure(project: RepoSummary) {
+    try {
+      setHook(await api<WebhookConfig>(`/repositories/${project.id}/webhook`));
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }
   const repositories = data?.repositories ?? [];
-  const missingTokens = repositories.filter((r) => !r.tokenConfigured).length;
   const shown = repositories.filter((r) => !repo || r.id === repo);
-  const total = shown.reduce((sum, r) => sum + (r.latest?.total ?? 0), 0);
-  const added = shown.reduce((sum, r) => sum + (r.latest?.added ?? 0), 0);
-  const removed = shown.reduce((sum, r) => sum + (r.latest?.removed ?? 0), 0);
-  const complete = shown.filter((r) => r.latest).length;
-  const navs: { view: View; label: string; icon: ReactNode }[] = [
-    { view: 'overview', label: '总览', icon: <LayoutDashboard size={19} /> },
-    { view: 'activity', label: 'Star 动态', icon: <Activity size={19} /> },
-    { view: 'repositories', label: '监控项目', icon: <FolderGit2 size={19} /> },
-    { view: 'settings', label: '设置', icon: <Settings2 size={19} /> },
+  const known = shown.filter((r) => r.current_total !== null);
+  const total = known.reduce((n, r) => n + r.current_total!, 0);
+  const pending = repositories.filter((r) => !r.webhookConfigured || !r.last_received_at).length;
+  const navs = [
+    { view: 'overview' as const, label: '项目总览', icon: <LayoutDashboard size={19} /> },
+    { view: 'activity' as const, label: 'Star 动态', icon: <Activity size={19} /> },
+    { view: 'repositories' as const, label: '监控项目', icon: <FolderGit2 size={19} /> },
+    { view: 'settings' as const, label: '设置', icon: <Settings2 size={19} /> },
   ];
   return (
     <div className="workspace">
@@ -453,7 +401,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
         <Logo />
         <div className="workspace-badge">
-          <span className="workspace-avatar">S</span>
+          <span className="workspace-avatar">R</span>
           <span>
             <strong>我的观测站</strong>
             <small>Personal workspace</small>
@@ -465,6 +413,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           {navs.map((item) => (
             <button
               key={item.view}
+              aria-label={item.label}
               className={`nav-item ${view === item.view ? 'active' : ''}`}
               aria-current={view === item.view ? 'page' : undefined}
               onClick={() => {
@@ -487,12 +436,12 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
             </span>
             <strong>把记录交给夜晚</strong>
             <p>
-              每日 {String(settings?.dailyHour ?? 23).padStart(2, '0')}:00 自动采集
+              每日 {String(settings?.dailyHour ?? 23).padStart(2, '0')}:00 自动汇总
               <br />
               Asia/Shanghai · UTC+8
             </p>
             <button onClick={() => setView('settings')}>
-              管理采集计划 <ArrowUpRight size={14} />
+              管理汇总计划 <ArrowUpRight size={14} />
             </button>
           </div>
           <a
@@ -512,18 +461,13 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
             <button
               className="icon-button"
               aria-label="退出登录"
-              title="退出登录"
               disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
+              onClick={() =>
+                void action(async () => {
                   await api('/auth/logout', { method: 'POST' });
                   onLogout();
-                } catch (e) {
-                  setError(errorText(e));
-                  setBusy(false);
-                }
-              }}
+                }, '已退出')
+              }
             >
               <LogOut size={17} />
             </button>
@@ -545,34 +489,14 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               <strong>{navs.find((n) => n.view === view)?.label}</strong>
             </span>
           </div>
-          <div className="topbar-right">
-            <span className="private-badge">
-              <ShieldCheck size={14} /> 私有观测站
-            </span>
-            <span className="topbar-divider" />
-            <span className="topbar-date">
-              {new Intl.DateTimeFormat('zh-CN', {
-                timeZone: 'Asia/Shanghai',
-                month: 'long',
-                day: 'numeric',
-                weekday: 'short',
-              }).format(new Date())}
-            </span>
-          </div>
+          <span className="private-badge">
+            <ShieldCheck size={14} /> 私有观测站
+          </span>
         </header>
         <main className="main-content">
           <div className="page-heading">
             <div>
-              <span className="eyebrow">
-                {
-                  {
-                    overview: 'THE BIG PICTURE',
-                    activity: 'PEOPLE BEHIND THE STARS',
-                    repositories: 'YOUR OPEN SOURCE UNIVERSE',
-                    settings: 'MAKE IT YOURS',
-                  }[view]
-                }
-              </span>
+              <span className="eyebrow">YOUR PROJECTS, IN PERSPECTIVE</span>
               <h1>
                 {
                   {
@@ -587,16 +511,16 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               <p>
                 {
                   {
-                    overview: '一点一滴的星光，汇成项目成长的轨迹。',
-                    activity: '了解谁新关注了你的项目，谁悄悄离开了。',
-                    repositories: '把你在意的项目放在一起，让成长一目了然。',
-                    settings: '安排好采集节奏，然后专注创造。',
+                    overview: '让每一次关注，汇成项目成长的轨迹。',
+                    activity: '查看送达的 Star 事件与每晚的用户净变化。',
+                    repositories: '连接 GitHub Webhook，开始记录你的项目。',
+                    settings: '安排汇总时间，然后专注创造。',
                   }[view]
                 }
               </p>
             </div>
             {view !== 'settings' && (
-              <button className="button primary" onClick={() => setModal('add')}>
+              <button className="button primary" onClick={() => setAdding(true)}>
                 <Plus size={17} />
                 添加项目
               </button>
@@ -615,12 +539,12 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </button>
             </div>
           )}
-          {missingTokens > 0 && view !== 'repositories' && (
-            <div className="info-note token-banner" role="status">
+          {!!pending && view !== 'settings' && (
+            <div className="info-note webhook-banner" role="status">
               <Github size={21} />
               <span>
-                <strong>{missingTokens} 个项目需要设置 GitHub Token</strong>
-                <small>请为每个项目填写自己的 Token，已有数据会保留。</small>
+                <strong>{pending} 个项目等待连接 Webhook</strong>
+                <small>配置后 GitHub 会发送 Ping；收到签名事件后显示连接成功。</small>
               </span>
               <button className="button secondary" onClick={() => setView('repositories')}>
                 管理项目 <ArrowRight size={15} />
@@ -634,7 +558,11 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <select
                   aria-label="选择项目"
                   value={repo}
-                  onChange={(e) => chooseRepo(e.target.value)}
+                  onChange={(e) => {
+                    setRepo(e.target.value);
+                    setSummary('');
+                    setPage(1);
+                  }}
                 >
                   <option value="">全部项目</option>
                   {repositories.map((r) => (
@@ -646,24 +574,21 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <ChevronDown size={14} />
               </div>
               <span className="filterbar-status">
-                <span className={`status-dot ${hasActive ? 'pulse' : ''}`} />
-                {hasActive ? '快照采集中 · 自动更新' : '每日自动记录'}
+                Webhook 实时记录
                 <button
                   className="icon-button"
                   aria-label="刷新页面数据"
-                  title="刷新页面数据"
-                  disabled={loading}
                   onClick={() => void refresh()}
                 >
-                  <RefreshCw size={15} className={loading ? 'spin' : ''} />
+                  <RefreshCw size={15} />
                 </button>
               </span>
             </div>
           )}
-          {!data && loading ? (
+          {!data ? (
             <div className="panel loading-panel">
               <Spinner />
-              <span>正在读取项目数据…</span>
+              正在读取项目数据…
             </div>
           ) : (
             <>
@@ -671,438 +596,769 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <>
                   <section className="stats-grid" aria-label="监控统计">
                     <Stat
-                      title="累计 Stars"
-                      value={complete ? number(total) : '—'}
+                      title="最近上报 Stars"
+                      value={known.length ? number(total) : '—'}
                       icon={<Star size={20} />}
-                      note={`${complete} / ${shown.length} 个项目已有完整快照`}
+                      note={`${known.length} / ${shown.length} 个项目已有 Webhook 总量`}
                       tone="purple"
                     />
                     <Stat
-                      title="最近快照新增"
-                      value={complete ? `+${number(added)}` : '—'}
+                      title={`近 ${days} 天新增事件`}
+                      value={`+${number(data.eventCounts.added)}`}
                       icon={<ArrowUpRight size={20} />}
-                      note="与上一份有效快照相比"
+                      note="按收到的 Star 事件计数"
                       tone="green"
                     />
                     <Stat
-                      title="最近快照取消"
-                      value={complete ? `−${number(removed)}` : '—'}
+                      title={`近 ${days} 天取消事件`}
+                      value={`−${number(data.eventCounts.removed)}`}
                       icon={<ArrowDownRight size={20} />}
-                      note="取消关注也值得被看见"
+                      note="每日净变化可在汇总中查看"
                       tone="red"
                     />
                     <Stat
-                      title="监控中的项目"
-                      value={number(shown.filter((r) => r.enabled).length)}
+                      title="已连接项目"
+                      value={`${shown.filter((r) => r.enabled && r.last_received_at).length} / ${shown.length}`}
                       icon={<FolderGit2 size={20} />}
-                      note={`${shown.filter((r) => r.active).length} 个正在采集 · ${shown.filter((r) => !r.enabled).length} 个已暂停`}
+                      note="已启用且收到过签名事件"
                       tone="blue"
                     />
                   </section>
                   <div className="chart-grid">
-                    <section className="panel trend-panel">
+                    <section className="panel">
                       <div className="panel-header">
                         <div>
-                          <h2>
-                            Star 趋势 <span className="label-tag">每日</span>
-                          </h2>
-                          <p>每一份关注，都在这里留下痕迹</p>
+                          <h2>Star 总量趋势</h2>
+                          <p>初始基线与每日汇总 · 最近上报值延续至次日</p>
                         </div>
                         <div className="range-switch">
-                          {[7, 30, 90].map((d) => (
+                          {[7, 30, 90].map((n) => (
                             <button
-                              key={d}
-                              className={days === d ? 'selected' : ''}
-                              aria-pressed={days === d}
-                              onClick={() => setDays(d)}
+                              key={n}
+                              className={days === n ? 'active' : ''}
+                              onClick={() => {
+                                setDays(n);
+                                setPage(1);
+                              }}
                             >
-                              {d} 天
+                              {n} 天
                             </button>
                           ))}
                         </div>
                       </div>
-                      <div className="chart-legend">
-                        <span className="legend-dot blue" />
-                        累计 Stars<span className="chart-hint">悬停数据点查看详情</span>
-                      </div>
-                      <TrendChart history={data?.history ?? []} />
+                      <TrendChart history={data.history} />
                     </section>
                     <section className="panel">
                       <div className="panel-header">
                         <div>
-                          <h2>星光的来与往</h2>
-                          <p>近 14 天 · 每日快照对比</p>
+                          <h2>每日净变化</h2>
+                          <p>近 14 天 · 同一用户反向操作相互抵消</p>
                         </div>
-                        <Activity size={18} className="muted" />
                       </div>
+                      <ChangesChart history={data.history} />
                       <div className="chart-legend">
-                        <span className="legend-dot green" />
-                        新增
-                        <span className="legend-dot red" />
-                        取消
+                        <span>
+                          <i className="legend-dot green" />
+                          新增
+                        </span>
+                        <span>
+                          <i className="legend-dot red" />
+                          取消
+                        </span>
                       </div>
-                      <ChangesChart history={data?.history ?? []} />
                     </section>
                   </div>
-                  <div className="section-title">
-                    <h2>
-                      关注的项目 <span>{shown.length}</span>
-                    </h2>
-                    <button className="text-button" onClick={() => setView('repositories')}>
-                      管理项目 <ArrowRight size={15} />
-                    </button>
-                  </div>
-                  {shown.length ? (
-                    <div className="repo-grid">
+                  {!repositories.length ? (
+                    <EmptyProjects onAdd={() => setAdding(true)} />
+                  ) : (
+                    <>
+                      <div className="section-heading">
+                        <h2>监控项目</h2>
+                        <button className="text-button" onClick={() => setView('repositories')}>
+                          管理项目 <ArrowRight size={15} />
+                        </button>
+                      </div>
+                      <div className="repo-grid">
+                        {shown.map((r) => (
+                          <RepoCard key={r.id} project={r} onConfigure={() => void configure(r)} />
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+              {view === 'repositories' &&
+                (!repositories.length ? (
+                  <EmptyProjects onAdd={() => setAdding(true)} />
+                ) : (
+                  <>
+                    <div className="repo-management">
                       {shown.map((r) => (
-                        <RepoCard
-                          key={r.id}
-                          repository={r}
-                          onToken={() => setTokenRepo(r)}
-                          lastScheduledAt={settings?.lastScheduledAt ?? null}
-                          onContinue={() =>
-                            void action(
-                              `/snapshots/${r.active?.id}/continue`,
-                              'POST',
-                              {},
-                              '已执行一轮续采。',
-                            )
-                          }
-                          busy={busy}
-                          onSelect={() => {
-                            chooseRepo(r.id);
-                            setView('activity');
-                          }}
-                          onSync={() =>
-                            void action(
-                              `/repositories/${r.id}/sync`,
-                              'POST',
-                              {},
-                              '已加入采集队列，完成后数据会自动更新。',
-                            )
-                          }
-                        />
+                        <div className="panel" key={r.id}>
+                          <RepoCard project={r} onConfigure={() => void configure(r)} />
+                          <div className="repo-actions">
+                            <button
+                              className="text-button"
+                              disabled={busy}
+                              onClick={() =>
+                                void action(
+                                  () =>
+                                    api(`/repositories/${r.id}`, {
+                                      method: 'PATCH',
+                                      body: { enabled: !r.enabled },
+                                    }),
+                                  r.enabled ? '已暂停记录' : '已恢复记录',
+                                )
+                              }
+                            >
+                              {r.enabled ? <Pause size={14} /> : <Play size={14} />}
+                              {r.enabled ? '暂停记录' : '恢复记录'}
+                            </button>
+                            <button className="text-button danger" onClick={() => setDeleting(r)}>
+                              <Trash2 size={14} />
+                              移除项目
+                            </button>
+                          </div>
+                        </div>
                       ))}
                     </div>
-                  ) : (
-                    <EmptyProjects onAdd={() => setModal('add')} />
-                  )}
-                  <Changes
-                    data={data}
-                    repo={repo}
-                    snapshot={snapshot}
-                    kind={changeKind}
-                    page={page}
-                    onSnapshot={(value) => {
-                      setSnapshot(value);
-                      setPage(1);
-                    }}
-                    onKind={(value) => {
-                      setChangeKind(value);
-                      setPage(1);
-                    }}
-                    onPage={setPage}
-                  />
-                </>
+                    <p className="info-note">
+                      <HelpCircle size={16} />
+                      暂停期间收到的 Star 事件会忽略，恢复后只记录之后送达的变化。无法补回历史 Star
+                      名单。
+                    </p>
+                  </>
+                ))}
+              {(view === 'activity' || view === 'overview') && (
+                <Changes
+                  data={data}
+                  summary={summary}
+                  onSummary={(id) => {
+                    setSummary(id);
+                    setPage(1);
+                  }}
+                  kind={kind}
+                  onKind={(value) => {
+                    setKind(value);
+                    setPage(1);
+                  }}
+                  onPage={setPage}
+                  days={days}
+                />
               )}
               {view === 'activity' && (
-                <>
-                  <Changes
-                    data={data}
-                    repo={repo}
-                    snapshot={snapshot}
-                    kind={changeKind}
-                    page={page}
-                    onSnapshot={(value) => {
-                      setSnapshot(value);
-                      setPage(1);
-                    }}
-                    onKind={(value) => {
-                      setChangeKind(value);
-                      setPage(1);
-                    }}
-                    onPage={setPage}
-                  />
-                  <section className="panel snapshot-panel">
-                    <div className="panel-header">
-                      <div>
-                        <h2>采集记录</h2>
-                        <p>完整快照才参与比对，失败的数据不会影响统计。</p>
-                      </div>
-                      <Clock3 size={19} className="muted" />
+                <section className="panel snapshot-panel">
+                  <div className="panel-header">
+                    <div>
+                      <h2>每日汇总与历史</h2>
+                      <p>北京时间 · 最近 100 份记录</p>
                     </div>
-                    {!data?.snapshots.length ? (
-                      <div className="small-empty">添加项目后，这里会记录每次采集。</div>
-                    ) : (
-                      <div className="table-scroll">
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>项目 / 快照</th>
-                              <th>采集时间</th>
-                              <th>Star 数</th>
-                              <th>状态</th>
-                              <th>操作</th>
+                  </div>
+                  {data.summaries.length ? (
+                    <div className="table-scroll">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>日期 / 项目</th>
+                            <th>来源</th>
+                            <th>最近上报总量</th>
+                            <th>新增 / 取消</th>
+                            <th>名单</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.summaries.map((s) => (
+                            <tr key={s.id}>
+                              <td>
+                                {s.day}
+                                <small className="cell-subtitle">{s.full_name}</small>
+                              </td>
+                              <td>
+                                {s.source === 'legacy'
+                                  ? '历史快照'
+                                  : s.kind === 'baseline'
+                                    ? '连接基线'
+                                    : '每日汇总'}
+                              </td>
+                              <td>{s.total === null ? '—' : number(s.total)}</td>
+                              <td>
+                                <span className="text-green">+{s.added}</span> /{' '}
+                                <span className="text-red">−{s.removed}</span>
+                              </td>
+                              <td>
+                                <button
+                                  className="text-button"
+                                  onClick={() => {
+                                    setSummary(s.id);
+                                    setPage(1);
+                                  }}
+                                >
+                                  查看名单
+                                </button>
+                              </td>
                             </tr>
-                          </thead>
-                          <tbody>
-                            {data.snapshots.slice(0, 30).map((s) => (
-                              <tr key={s.id}>
-                                <td>
-                                  <strong>{s.full_name}</strong>
-                                  <small>
-                                    {s.day} · {kindLabel(s.kind)}
-                                  </small>
-                                </td>
-                                <td>
-                                  {time(s.started_at)}
-                                  {s.comparison_day && <small>对比 {s.comparison_day}</small>}
-                                </td>
-                                <td>{number(s.total)}</td>
-                                <td>
-                                  <span
-                                    className={`pill ${s.status === 'complete' ? 'green' : s.status === 'failed' ? 'red' : 'blue'}`}
-                                  >
-                                    {s.status === 'complete'
-                                      ? '已完成'
-                                      : s.status === 'failed'
-                                        ? '采集失败'
-                                        : s.retry_at > Date.now() / 1000
-                                          ? '等待重试'
-                                          : '采集中'}
-                                  </span>
-                                  {s.error && <small className="snapshot-error">{s.error}</small>}
-                                </td>
-                                <td>
-                                  {s.status === 'failed' ? (
-                                    <button
-                                      className="text-button"
-                                      disabled={
-                                        busy ||
-                                        !repositories.find((r) => r.id === s.repo_id)
-                                          ?.tokenConfigured
-                                      }
-                                      onClick={() =>
-                                        void action(
-                                          `/snapshots/${s.id}/retry`,
-                                          'POST',
-                                          {},
-                                          '已重新开始采集。',
-                                        )
-                                      }
-                                    >
-                                      重试
-                                    </button>
-                                  ) : (
-                                    s.status === 'complete' && (
-                                      <button
-                                        className="text-button"
-                                        onClick={() => {
-                                          setSnapshot(s.id);
-                                          setPage(1);
-                                        }}
-                                      >
-                                        查看变化
-                                      </button>
-                                    )
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </section>
-                </>
-              )}
-              {view === 'repositories' && (
-                <>
-                  <div className="search-box">
-                    <Search size={17} />
-                    <input
-                      aria-label="搜索项目"
-                      placeholder="搜索仓库名称…"
-                      value={search}
-                      onChange={(e) => setSearch(e.target.value)}
-                    />
-                    <span>{repositories.length} / 20 个项目</span>
-                  </div>
-                  {shown.filter((r) => r.full_name.toLowerCase().includes(search.toLowerCase()))
-                    .length ? (
-                    <div className="repo-management">
-                      {shown
-                        .filter((r) => r.full_name.toLowerCase().includes(search.toLowerCase()))
-                        .map((r) => (
-                          <section key={r.id} className="panel managed-repo">
-                            <RepoCard
-                              repository={r}
-                              onToken={() => setTokenRepo(r)}
-                              lastScheduledAt={settings?.lastScheduledAt ?? null}
-                              onContinue={() =>
-                                void action(
-                                  `/snapshots/${r.active?.id}/continue`,
-                                  'POST',
-                                  {},
-                                  '已执行一轮续采。',
-                                )
-                              }
-                              busy={busy}
-                              onSelect={() => {
-                                chooseRepo(r.id);
-                                setView('activity');
-                              }}
-                              onSync={() =>
-                                void action(
-                                  `/repositories/${r.id}/sync`,
-                                  'POST',
-                                  {},
-                                  '已开始采集。',
-                                )
-                              }
-                              embedded
-                            />
-                            <div className="repo-actions">
-                              <span className="muted">添加于 {time(r.created_at)}</span>
-                              <button
-                                className="text-button"
-                                disabled={busy || (!r.enabled && !r.tokenConfigured)}
-                                onClick={() =>
-                                  void action(
-                                    `/repositories/${r.id}`,
-                                    'PATCH',
-                                    { enabled: !r.enabled },
-                                    r.enabled ? '已暂停监控。' : '已恢复监控。',
-                                  )
-                                }
-                              >
-                                {r.enabled ? <Pause size={14} /> : <Play size={14} />}
-                                {r.enabled ? '暂停监控' : '恢复监控'}
-                              </button>
-                              <button className="text-button danger" onClick={() => setModal(r)}>
-                                <Trash2 size={14} />
-                                移除
-                              </button>
-                            </div>
-                          </section>
-                        ))}
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
-                  ) : search ? (
-                    <div className="panel small-empty">没有找到匹配的项目。</div>
                   ) : (
-                    <EmptyProjects onAdd={() => setModal('add')} />
+                    <p className="small-empty">连接 Webhook 后生成初始基线，每晚自动汇总。</p>
                   )}
-                  <div className="info-note">
-                    <HelpCircle size={17} />
-                    <span>
-                      添加项目后自动建立初始基线。此后的每日快照会记录新增和取消；暂停期间不采集，恢复后与上次有效快照对比。
-                    </span>
-                  </div>
-                </>
+                </section>
               )}
               {view === 'settings' && settings && (
                 <SettingsView
                   settings={settings}
-                  onManageProjects={() => setView('repositories')}
                   busy={busy}
-                  onSave={(hour) =>
-                    action(
-                      '/settings',
-                      'PATCH',
-                      { dailyHour: hour },
-                      '采集时间已更新，按北京时间执行。',
-                    )
-                  }
+                  onManageProjects={() => setView('repositories')}
+                  onSave={async (hour) => {
+                    await action(
+                      () => api('/settings', { method: 'PATCH', body: { dailyHour: hour } }),
+                      '汇总计划已保存',
+                    );
+                  }}
                   onPassword={async (currentPassword, password) => {
                     await api('/auth/password', {
                       method: 'POST',
                       body: { currentPassword, password },
                     });
-                    setToast('密码已更新，其他设备的会话已失效。');
+                    setToast('管理员密码已更新');
                   }}
                 />
               )}
             </>
           )}
           <footer className="page-footer">
-            <span>
-              <span className="tiny-star">✦</span> 每一个小项目，都有自己的星空。
-            </span>
-            <span>
-              RepoTrace v1.0 <span className="footer-separator">/</span> Made for your next big
-              thing.
-            </span>
+            <span>RepoTrace · 每一份关注都有迹可循</span>
+            <span>Powered by Cloudflare · Webhooks</span>
           </footer>
         </main>
       </div>
-      {toast && (
-        <div className="toast" role="status">
-          <CheckCircle2 size={19} />
-          {toast}
-          <button className="icon-button" aria-label="关闭提示" onClick={() => setToast('')}>
-            <X size={15} />
-          </button>
-        </div>
-      )}
-      {modal === 'add' && (
+      {adding && (
         <AddRepository
-          onClose={() => setModal(null)}
-          onAdded={async () => {
-            setModal(null);
-            setToast('项目已添加，正在建立第一份 Star 基线。');
+          onClose={() => setAdding(false)}
+          onAdded={async (config) => {
+            setAdding(false);
+            setHook(config);
             await refresh();
           }}
         />
       )}
-      {tokenRepo && (
-        <EditRepositoryToken
-          repository={tokenRepo}
-          onClose={() => setTokenRepo(null)}
-          onSaved={async () => {
-            setTokenRepo(null);
-            setToast('项目 Token 已更新。');
-            await refresh();
-          }}
+      {hook && (
+        <WebhookDialog
+          config={hook}
+          project={repositories.find((r) => r.id === hook.id)}
+          onClose={() => setHook(null)}
+          onChange={setHook}
+          onRefresh={refresh}
         />
       )}
-      {modal && modal !== 'add' && (
+      {deleting && (
         <Dialog
-          title="移除这个项目？"
-          subtitle={`${modal.full_name} 的全部快照和变化记录也会被删除。此操作无法撤销。`}
-          onClose={() => setModal(null)}
+          title="移除项目？"
+          subtitle={`将删除 ${deleting.full_name} 的全部记录；请同时在 GitHub 移除对应 Webhook。`}
+          onClose={() => setDeleting(null)}
         >
           <div className="dialog-actions">
-            <button className="button secondary" onClick={() => setModal(null)}>
-              保留项目
+            <button className="button secondary" onClick={() => setDeleting(null)}>
+              取消
             </button>
             <button
-              className="button destructive"
+              className="button danger"
               disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  await api(`/repositories/${modal.id}`, { method: 'DELETE' });
-                  if (repo === modal.id) chooseRepo('');
-                  setModal(null);
-                  setToast('项目及其历史数据已移除。');
-                  if (repo !== modal.id) await refresh();
-                } catch (e) {
-                  setError(errorText(e));
-                  setModal(null);
-                } finally {
-                  setBusy(false);
-                }
-              }}
+              onClick={() =>
+                void action(async () => {
+                  await api(`/repositories/${deleting.id}`, { method: 'DELETE' });
+                  if (repo === deleting.id) setRepo('');
+                  setSummary('');
+                  setPage(1);
+                  setDeleting(null);
+                }, '项目已移除')
+              }
             >
               确认移除
             </button>
           </div>
         </Dialog>
       )}
+      {toast && (
+        <div className="toast" role="status">
+          <CheckCircle2 size={18} />
+          {toast}
+          <button className="icon-button" aria-label="关闭通知" onClick={() => setToast('')}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
+function EmptyProjects({ onAdd }: { onAdd: () => void }) {
+  return (
+    <section className="panel empty-projects">
+      <div className="empty-illustration">
+        <FolderGit2 size={32} />
+        <span>✦</span>
+      </div>
+      <h2>从第一个项目开始</h2>
+      <p>
+        添加仓库并连接 Star Webhook，
+        <br />
+        为每一份关注留下记录。
+      </p>
+      <button className="button primary" onClick={onAdd}>
+        <Plus size={17} />
+        添加第一个项目
+      </button>
+      <small>需要仓库管理员权限 · 支持公开与私有仓库</small>
+    </section>
+  );
+}
+function AddRepository({
+  onClose,
+  onAdded,
+}: {
+  onClose: () => void;
+  onAdded: (config: WebhookConfig) => Promise<void>;
+}) {
+  const [repository, setRepository] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  return (
+    <Dialog
+      title="添加监控项目"
+      subtitle="填写仓库，下一步连接 GitHub Star Webhook。"
+      onClose={onClose}
+    >
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError('');
+          try {
+            const config = await api<WebhookConfig>('/repositories', {
+              method: 'POST',
+              body: { repository },
+            });
+            await onAdded(config);
+          } catch (e) {
+            setError(errorText(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <label htmlFor="repository">GitHub 仓库</label>
+        <input
+          id="repository"
+          value={repository}
+          onChange={(e) => setRepository(e.target.value)}
+          required
+          placeholder="owner/repo 或 GitHub 仓库地址"
+          autoComplete="off"
+          maxLength={200}
+        />
+        <div className="dialog-tip">
+          <ShieldCheck size={17} />
+          <span>
+            请确认你有该仓库 Settings → Webhooks 的管理权限。仓库身份会在首次收到签名事件时确认。
+          </span>
+        </div>
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            取消
+          </button>
+          <button className="button primary" disabled={busy}>
+            {busy ? (
+              <Spinner />
+            ) : (
+              <>
+                生成 Webhook 配置 <ArrowRight size={16} />
+              </>
+            )}
+          </button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+function WebhookDialog({
+  config,
+  project,
+  onClose,
+  onChange,
+  onRefresh,
+}: {
+  config: WebhookConfig;
+  project?: RepoSummary;
+  onClose: () => void;
+  onChange: (config: WebhookConfig) => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [error, setError] = useState('');
+  const [copied, setCopied] = useState('');
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  async function copy(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+    } catch {
+      setError('复制未完成，请选中输入框内容手动复制。');
+    }
+  }
+  return (
+    <Dialog title="连接 GitHub Webhook" subtitle={config.full_name} onClose={onClose}>
+      <div
+        className={`connection-state ${project?.last_received_at ? 'connected' : ''}`}
+        role="status"
+      >
+        <span className="status-dot" />
+        <span>
+          {project?.last_received_at
+            ? `已收到签名事件 · ${time(project.last_received_at)}`
+            : '等待 GitHub 发送签名 Ping'}
+        </span>
+      </div>
+      <label htmlFor="hook-url">Payload URL</label>
+      <div className="copy-field">
+        <input id="hook-url" value={config.url} readOnly onFocus={(e) => e.target.select()} />
+        <button className="button secondary" onClick={() => void copy(config.url, 'URL')}>
+          {copied === 'URL' ? '已复制' : '复制'}
+        </button>
+      </div>
+      <label htmlFor="hook-secret">Secret（签名密钥）</label>
+      {config.secret ? (
+        <>
+          <div className="copy-field">
+            <input
+              id="hook-secret"
+              value={config.secret}
+              readOnly
+              onFocus={(e) => e.target.select()}
+              autoComplete="off"
+            />
+            <button
+              className="button secondary"
+              onClick={() => void copy(config.secret!, 'Secret')}
+            >
+              {copied === 'Secret' ? '已复制' : '复制'}
+            </button>
+          </div>
+          <p className="field-note secret-note">
+            此密钥仅本次显示。关闭后无法查看；忘记时可重新生成，并同步更新 GitHub 配置。
+          </p>
+        </>
+      ) : (
+        <p className="field-note">
+          已保存的密钥不会回显。
+          {project?.webhookConfigured
+            ? 'GitHub 中已配置的密钥可继续使用。'
+            : '首次连接请先生成签名密钥。'}
+        </p>
+      )}
+      <ol className="webhook-steps">
+        <li>
+          打开{' '}
+          <a href={config.settingsUrl} target="_blank" rel="noreferrer">
+            仓库 Settings → Webhooks <ExternalLink size={12} />
+          </a>
+          ，点击 <strong>Add webhook</strong>。
+        </li>
+        <li>
+          粘贴上方 <strong>Payload URL</strong> 与 <strong>Secret</strong>；Content type 选择{' '}
+          <strong>application/json</strong>，保持 <strong>Enable SSL verification</strong>。
+        </li>
+        <li>
+          选择 <strong>Let me select individual events</strong>，只勾选 <strong>Stars</strong>；勾选{' '}
+          <strong>Active</strong>，保存。
+        </li>
+        <li>
+          等待此处显示已收到签名事件。若未连接，查看 GitHub 的 <strong>Recent Deliveries</strong>
+          ；修改 Secret 后可重新投递 Ping。
+        </li>
+      </ol>
+      <div className="dialog-tip">
+        <HelpCircle size={16} />
+        <span>
+          记录从连接之后开始；不会读取历史 Star 名单。总量取最近收到的 Webhook
+          上报值。没有新事件时，上报时间不会更新。
+        </span>
+      </div>
+      {confirm ? (
+        <div className="rotate-confirm">
+          <p>重新生成后，旧密钥立即失效。请同步替换 GitHub Webhook 的 Secret，再重新投递 Ping。</p>
+          <button className="button secondary" onClick={() => setConfirm(false)}>
+            取消更换
+          </button>
+          <button
+            className="button danger"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              setError('');
+              try {
+                onChange(
+                  await api<WebhookConfig>(`/repositories/${config.id}/webhook`, {
+                    method: 'POST',
+                  }),
+                );
+                setConfirm(false);
+                setCopied('');
+                await onRefresh();
+              } catch (e) {
+                setError(errorText(e));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            确认生成新密钥
+          </button>
+        </div>
+      ) : (
+        <button className="text-button rotate-button" onClick={() => setConfirm(true)}>
+          {project?.webhookConfigured ? '重新生成 Secret' : '生成签名密钥'}
+        </button>
+      )}
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="dialog-actions">
+        <button className="button secondary" onClick={() => void onRefresh()}>
+          检查连接
+        </button>
+        <button className="button primary" onClick={onClose}>
+          完成
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+function RepoCard({ project: r, onConfigure }: { project: RepoSummary; onConfigure: () => void }) {
+  const state = !r.enabled ? '已暂停' : r.last_received_at ? '已连接' : '待连接';
+  return (
+    <article className="repo-card panel">
+      <div className="repo-card-heading">
+        <span className="repo-icon">
+          <FolderGit2 size={20} />
+        </span>
+        <span className={`pill ${!r.enabled ? 'neutral' : r.last_received_at ? 'green' : 'blue'}`}>
+          {state}
+        </span>
+      </div>
+      <h3>
+        <a href={`https://github.com/${r.full_name}`} target="_blank" rel="noreferrer">
+          {r.full_name}
+          <ArrowUpRight size={14} />
+        </a>
+      </h3>
+      <p className="repo-description">
+        {r.description || '连接 Webhook，开始记录项目的每一次关注。'}
+      </p>
+      <div className="repo-metrics">
+        <div>
+          <span>最近上报 Stars</span>
+          <strong>
+            <Star size={16} />
+            {r.current_total === null ? '—' : number(r.current_total)}
+          </strong>
+        </div>
+        <div>
+          <span>已记录事件</span>
+          <strong>{number(r.event_count)}</strong>
+        </div>
+      </div>
+      <p className="hook-timestamp">
+        总量上报：{time(r.total_reported_at)}
+        <br />
+        最近 Star 事件：{time(r.last_star_at)}
+      </p>
+      <div className="repo-card-footer">
+        <span>
+          <span className="status-dot" />
+          {r.webhookConfigured ? '签名密钥已生成' : '等待配置 Webhook'}
+        </span>
+        <button className="text-button" onClick={onConfigure}>
+          配置 Webhook <ArrowRight size={14} />
+        </button>
+      </div>
+    </article>
+  );
+}
+function Changes({
+  data,
+  summary,
+  onSummary,
+  kind,
+  onKind,
+  onPage,
+  days,
+}: {
+  data: Dashboard;
+  summary: string;
+  onSummary: (id: string) => void;
+  kind: string;
+  onKind: (kind: string) => void;
+  onPage: (page: number) => void;
+  days: number;
+}) {
+  return (
+    <section className="panel changes-panel">
+      <div className="panel-header">
+        <div>
+          <h2>{summary ? '汇总中的用户净变化' : 'Star 事件记录'}</h2>
+          <p>
+            {summary
+              ? '同一用户在汇总期间的反向操作相互抵消'
+              : `最近 ${days} 天收到的事件 · 同一用户可有多次操作`}
+          </p>
+        </div>
+        <div className="select-wrap snapshot-select">
+          <select aria-label="选择汇总" value={summary} onChange={(e) => onSummary(e.target.value)}>
+            <option value="">实时事件记录</option>
+            {data.summaries.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.day} · {s.full_name} ·{' '}
+                {s.source === 'legacy'
+                  ? '历史快照'
+                  : s.kind === 'baseline'
+                    ? '初始基线'
+                    : '每日汇总'}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="change-tabs">
+        {[
+          ['all', '全部变化'],
+          ['added', '新增 Star'],
+          ['removed', '取消 Star'],
+        ].map(([value, label]) => (
+          <button
+            key={value}
+            className={kind === value ? 'active' : ''}
+            onClick={() => onKind(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {data.changes.length ? (
+        <>
+          <div className="table-scroll">
+            <table className="changes-table">
+              <thead>
+                <tr>
+                  <th>GitHub 用户</th>
+                  <th>项目</th>
+                  <th>变化</th>
+                  <th>收到时间 · 北京时间</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {data.changes.map((c) => (
+                  <tr key={c.id}>
+                    <td>
+                      <a
+                        className="user-cell"
+                        href={`https://github.com/${c.login}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <img
+                          src={`https://avatars.githubusercontent.com/u/${c.user_id}?s=64`}
+                          alt=""
+                          width="30"
+                          height="30"
+                          loading="lazy"
+                        />
+                        <strong>{c.login}</strong>
+                      </a>
+                    </td>
+                    <td>{c.full_name}</td>
+                    <td>
+                      <span className={`pill ${c.kind === 'added' ? 'green' : 'red'}`}>
+                        {c.kind === 'added' ? (
+                          <ArrowUpRight size={13} />
+                        ) : (
+                          <ArrowDownRight size={13} />
+                        )}
+                        {c.kind === 'added' ? '新增 Star' : '取消 Star'}
+                      </span>
+                    </td>
+                    <td>{time(c.observed_at)}</td>
+                    <td>
+                      <a
+                        href={`https://github.com/${c.login}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        aria-label={`查看 ${c.login} 的 GitHub 主页`}
+                      >
+                        <ArrowUpRight size={15} />
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="pagination">
+            <span>
+              共 {number(data.changeTotal)} 条记录 · 第 {data.page} 页
+            </span>
+            <div>
+              <button
+                className="icon-button"
+                disabled={data.page <= 1}
+                onClick={() => onPage(data.page - 1)}
+                aria-label="上一页"
+              >
+                <ChevronLeft size={17} />
+              </button>
+              <button
+                className="icon-button"
+                disabled={data.page * 30 >= data.changeTotal}
+                onClick={() => onPage(data.page + 1)}
+                aria-label="下一页"
+              >
+                <ChevronRight size={17} />
+              </button>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="changes-empty">
+          <span className="empty-star">
+            <Star size={25} />
+          </span>
+          <h3>暂无变化记录</h3>
+          <p>
+            {summary
+              ? '这份汇总没有净变化。初始基线只保存总量。'
+              : '连接 Webhook 后，新增或取消 Star 的事件会出现在这里。'}
+          </p>
+        </div>
+      )}
+      <div className="table-note">
+        <HelpCircle size={14} />
+        <span>
+          时间按事件收到时记录。漏投递的事件需要在 GitHub 重新投递；重复 Delivery ID 只处理一次。
+        </span>
+      </div>
+    </section>
+  );
+}
 function Stat({
   title,
   value,
@@ -1127,524 +1383,6 @@ function Stat({
     </article>
   );
 }
-function EmptyProjects({ onAdd }: { onAdd: () => void }) {
-  return (
-    <section className="panel empty-projects">
-      <div className="empty-illustration">
-        <FolderGit2 size={32} />
-        <span>✦</span>
-      </div>
-      <h2>从第一个项目开始</h2>
-      <p>
-        添加一个 GitHub 仓库，
-        <br />
-        今晚开始，为每一份关注留下记录。
-      </p>
-      <button className="button primary" onClick={onAdd}>
-        <Plus size={17} />
-        添加第一个项目
-      </button>
-      <small>每个项目单独设置 Token · 支持公开与私有仓库</small>
-    </section>
-  );
-}
-function TokenField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
-  const [visible, setVisible] = useState(false);
-  return (
-    <>
-      <label htmlFor="project-token">GitHub Token</label>
-      <div className="password-input">
-        <input
-          id="project-token"
-          type={visible ? 'text' : 'password'}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          autoComplete="off"
-          placeholder="填写此项目的 Token"
-          required
-          maxLength={512}
-        />
-        <button
-          type="button"
-          aria-label={visible ? '隐藏 Token' : '显示 Token'}
-          onClick={() => setVisible(!visible)}
-        >
-          {visible ? <EyeOff size={18} /> : <Eye size={18} />}
-        </button>
-      </div>
-      <p className="field-note">
-        组织项目请选择组织作为 Resource owner，并保留 Metadata 只读权限。Token
-        加密保存，旧值不会回显。
-      </p>
-      <a
-        className="text-button"
-        href="https://github.com/settings/personal-access-tokens/new"
-        target="_blank"
-        rel="noreferrer"
-      >
-        创建 GitHub Token <ArrowUpRight size={14} />
-      </a>
-    </>
-  );
-}
-
-function EditRepositoryToken({
-  repository,
-  onClose,
-  onSaved,
-}: {
-  repository: RepoSummary;
-  onClose: () => void;
-  onSaved: () => Promise<void>;
-}) {
-  const [token, setToken] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  return (
-    <Dialog title="设置项目 Token" subtitle={repository.full_name} onClose={onClose}>
-      <form
-        onSubmit={async (e) => {
-          e.preventDefault();
-          setBusy(true);
-          setError('');
-          try {
-            await api(`/repositories/${repository.id}/token`, { method: 'PUT', body: { token } });
-            await onSaved();
-          } catch (e) {
-            setError(errorText(e));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <TokenField value={token} onChange={setToken} />
-        {error && (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        )}
-        <button className="button primary full" disabled={busy}>
-          {busy ? (
-            <Spinner />
-          ) : (
-            <>
-              <Check size={16} />
-              验证并保存
-            </>
-          )}
-        </button>
-      </form>
-    </Dialog>
-  );
-}
-
-function AddRepository({
-  onClose,
-  onAdded,
-}: {
-  onClose: () => void;
-  onAdded: () => Promise<void>;
-}) {
-  const [value, setValue] = useState('');
-  const [token, setToken] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  return (
-    <Dialog
-      title="让新项目加入观测"
-      subtitle="输入仓库地址和此项目的 GitHub Token，验证通过后开始监控。"
-      onClose={onClose}
-    >
-      <form
-        onSubmit={async (e) => {
-          e.preventDefault();
-          setBusy(true);
-          setError('');
-          try {
-            await api('/repositories', { method: 'POST', body: { repository: value, token } });
-            await onAdded();
-          } catch (e) {
-            setError(errorText(e));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <label htmlFor="repository">GitHub 仓库</label>
-        <input
-          id="repository"
-          placeholder="owner/repository 或 https://github.com/…"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          autoComplete="off"
-          required
-          maxLength={250}
-        />
-        <TokenField value={token} onChange={setToken} />
-        <div className="dialog-tip">
-          <Clock3 size={17} />
-          <span>
-            添加后立即建立初始基线，此后每日自动比对。
-            <br />
-            第一份快照不会把已有关注者计为新增。
-          </span>
-        </div>
-        {error && (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        )}
-        <button className="button primary full" disabled={busy}>
-          {busy ? (
-            <Spinner />
-          ) : (
-            <>
-              <Plus size={17} />
-              开始监控
-            </>
-          )}
-        </button>
-      </form>
-    </Dialog>
-  );
-}
-function RepoCard({
-  repository: r,
-  onToken,
-  onContinue,
-  lastScheduledAt,
-  busy,
-  onSelect,
-  onSync,
-  embedded = false,
-}: {
-  repository: RepoSummary;
-  onToken: () => void;
-  onContinue: () => void;
-  lastScheduledAt: number | null;
-  busy: boolean;
-  onSelect: () => void;
-  onSync: () => void;
-  embedded?: boolean;
-}) {
-  const tokenConfigured = r.tokenConfigured;
-  const waiting = !!r.active && r.active.retry_at > Date.now() / 1000;
-  const running = !!r.active && r.active.lease_until > Date.now() / 1000;
-  return (
-    <article className={`repo-card ${embedded ? 'embedded' : ''}`}>
-      <div className="repo-card-heading">
-        <span className="repo-icon">
-          <FolderGit2 size={21} />
-        </span>
-        <span
-          className={`pill ${!r.enabled || !tokenConfigured ? 'neutral' : r.lastError ? 'red' : 'green'}`}
-        >
-          <span className="status-dot" />
-          {!r.enabled
-            ? '已暂停'
-            : !tokenConfigured
-              ? '待配置 Token'
-              : r.lastError
-                ? '需关注'
-                : r.active
-                  ? waiting
-                    ? '等待重试'
-                    : running
-                      ? '采集中'
-                      : '等待续采'
-                  : '监控中'}
-        </span>
-      </div>
-      <h3>
-        <button onClick={onSelect}>{r.full_name}</button>
-        <a
-          href={`https://github.com/${r.full_name}`}
-          target="_blank"
-          rel="noreferrer"
-          aria-label={`在 GitHub 打开 ${r.full_name}`}
-        >
-          <ArrowUpRight size={16} />
-        </a>
-      </h3>
-      <p className="repo-description">
-        {r.description || '一个正在成长的项目，下一点星光值得期待。'}
-      </p>
-      <div className="repo-metrics">
-        <strong>
-          <Star size={17} />
-          {r.latest ? number(r.latest.total) : '—'}
-          <small>Stars</small>
-        </strong>
-        {r.latest?.comparison_id ? (
-          <span className="repo-delta">
-            <span className="positive">+{r.latest.added}</span>
-            <span className="negative">−{r.latest.removed}</span>
-          </span>
-        ) : (
-          <span className="muted tiny">{r.latest ? '初始基线' : '等待完整快照'}</span>
-        )}
-      </div>
-      {!tokenConfigured && <p className="repo-error">请为此项目设置 GitHub Token。</p>}
-      <button className="text-button" onClick={onToken}>
-        <LockKeyhole size={13} />
-        {tokenConfigured ? '更新项目 Token' : '设置项目 Token'}
-      </button>
-      {r.active && tokenConfigured && (
-        <div className="collection-progress">
-          <progress
-            value={r.active.total}
-            max={Math.max(1, r.active.expected_total)}
-            aria-label={`${r.full_name} 采集进度`}
-          />
-          <small>
-            已读取 {number(r.active.total)} / {number(r.active.expected_total)} 位关注者 · 第{' '}
-            {r.active.page} 页
-          </small>
-          {r.active.error && <small>{r.active.error}</small>}
-          <small>
-            {waiting
-              ? `下次重试：${time(r.active.retry_at, true)}`
-              : running
-                ? '正在读取下一页…'
-                : '页面打开时会自动续采。'}
-          </small>
-          <small>
-            最近定时触发：{lastScheduledAt ? time(lastScheduledAt, true) : '尚未记录到'}
-          </small>
-          <button
-            className="text-button"
-            disabled={busy || running || waiting || !r.enabled}
-            onClick={onContinue}
-          >
-            继续采集
-          </button>
-        </div>
-      )}
-      {r.lastError && (
-        <p className="repo-error">
-          {r.lastError}
-          <button className="text-button" onClick={onSelect}>
-            查看记录
-          </button>
-        </p>
-      )}
-      <div className="repo-card-footer">
-        <span>
-          {r.language && (
-            <>
-              <span className="language-dot" />
-              {r.language}
-              <span className="dot-separator">·</span>
-            </>
-          )}
-          <Clock3 size={12} />
-          {time(r.latest?.completed_at ?? null)}
-        </span>
-        <button
-          className="icon-button"
-          aria-label={`采集 ${r.full_name}`}
-          title="手动采集完整快照"
-          onClick={onSync}
-          disabled={busy || !!r.active || !r.enabled || !tokenConfigured}
-        >
-          <RefreshCw size={14} className={r.active && r.enabled && tokenConfigured ? 'spin' : ''} />
-        </button>
-      </div>
-    </article>
-  );
-}
-
-function Changes({
-  data,
-  repo,
-  snapshot,
-  kind,
-  page,
-  onSnapshot,
-  onKind,
-  onPage,
-}: {
-  data: Dashboard | null;
-  repo: string;
-  snapshot: string;
-  kind: string;
-  page: number;
-  onSnapshot: (id: string) => void;
-  onKind: (kind: string) => void;
-  onPage: (page: number) => void;
-}) {
-  const selected = data?.snapshots.find((s) => s.id === snapshot);
-  const snapshots =
-    data?.snapshots.filter((s) => s.status === 'complete' && (!repo || s.repo_id === repo)) ?? [];
-  return (
-    <section className="panel changes-panel">
-      <div className="panel-header">
-        <div>
-          <h2>
-            Star 动态 <span className="label-tag">{data?.changeTotal ?? 0} 条</span>
-          </h2>
-          <p>
-            {selected
-              ? `${selected.day} ${kindLabel(selected.kind)} · ${selected.comparison_day ? `对比 ${selected.comparison_day} 的有效快照` : '初始基线，不计算新增与取消'}`
-              : '各项目最近一份完整快照的变化'}
-          </p>
-        </div>
-        <div className="snapshot-select">
-          <select
-            aria-label="选择快照"
-            value={snapshot}
-            onChange={(e) => onSnapshot(e.target.value)}
-          >
-            <option value="">最近完整快照</option>
-            {snapshots.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.day} {kindLabel(s.kind)} · {!repo ? `${s.full_name} · ` : ''}
-                {time(s.started_at)}
-              </option>
-            ))}
-          </select>
-          <ChevronDown size={14} />
-        </div>
-      </div>
-      <div className="change-tabs">
-        {[
-          { key: 'all', label: '全部变化' },
-          { key: 'added', label: '新增 Star' },
-          { key: 'removed', label: '取消 Star' },
-        ].map((tab) => (
-          <button
-            key={tab.key}
-            className={kind === tab.key ? 'selected' : ''}
-            aria-pressed={kind === tab.key}
-            onClick={() => onKind(tab.key)}
-          >
-            {tab.key === 'added' ? (
-              <ArrowUpRight size={15} />
-            ) : tab.key === 'removed' ? (
-              <ArrowDownRight size={15} />
-            ) : (
-              <Activity size={15} />
-            )}
-            {tab.label}
-          </button>
-        ))}
-      </div>
-      {data?.changes.length ? (
-        <>
-          <div className="table-scroll">
-            <table className="changes-table">
-              <thead>
-                <tr>
-                  <th>GitHub 用户</th>
-                  <th>项目</th>
-                  <th>变化</th>
-                  <th>
-                    记录时间 <span className="tiny">UTC+8</span>
-                  </th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {data.changes.map((c) => (
-                  <tr key={`${c.snapshot_id}-${c.user_id}`}>
-                    <td>
-                      <a
-                        className="user-cell"
-                        href={`https://github.com/${c.login}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <img
-                          src={`https://avatars.githubusercontent.com/u/${c.user_id}?s=80`}
-                          alt=""
-                          loading="lazy"
-                          width="34"
-                          height="34"
-                        />
-                        <span>
-                          <strong>{c.login}</strong>
-                          <small>GitHub 开发者</small>
-                        </span>
-                      </a>
-                    </td>
-                    <td>
-                      <span className="repo-table-name">
-                        <FolderGit2 size={14} />
-                        {c.full_name}
-                      </span>
-                    </td>
-                    <td>
-                      <span className={`pill ${c.kind === 'added' ? 'green' : 'red'}`}>
-                        {c.kind === 'added' ? (
-                          <ArrowUpRight size={13} />
-                        ) : (
-                          <ArrowDownRight size={13} />
-                        )}
-                        {c.kind === 'added' ? '新增 Star' : '取消 Star'}
-                      </span>
-                    </td>
-                    <td>{time(c.observed_at)}</td>
-                    <td>
-                      <a
-                        className="icon-button"
-                        href={`https://github.com/${c.login}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        aria-label={`查看 ${c.login} 的 GitHub 主页`}
-                      >
-                        <ArrowUpRight size={16} />
-                      </a>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="pagination">
-            <span>
-              共 {number(data.changeTotal)} 条记录 · 第 {page} 页
-            </span>
-            <div>
-              <button
-                className="icon-button"
-                disabled={page <= 1}
-                onClick={() => onPage(page - 1)}
-                aria-label="上一页"
-              >
-                <ChevronLeft size={17} />
-              </button>
-              <button
-                className="icon-button"
-                disabled={page * 30 >= data.changeTotal}
-                onClick={() => onPage(page + 1)}
-                aria-label="下一页"
-              >
-                <ChevronRight size={17} />
-              </button>
-            </div>
-          </div>
-        </>
-      ) : (
-        <div className="changes-empty">
-          <span className="empty-star">
-            <Star size={25} />
-          </span>
-          <strong>{snapshots.length ? '平静也是一种状态' : '第一束星光，还在路上'}</strong>
-          <p>
-            {snapshots.length
-              ? '所选快照和筛选下暂无变化。新的关注会在下一次完整采集后出现。'
-              : '建立初始基线后，后续快照会告诉你谁来了、谁离开了。'}
-          </p>
-        </div>
-      )}
-      <div className="table-note">
-        <HelpCircle size={14} />
-        记录时间是采集完成时间；取消 Star 的具体发生时间无法由 GitHub 获取。
-      </div>
-    </section>
-  );
-}
-
 function SettingsView({
   settings,
   onManageProjects,
@@ -1674,11 +1412,11 @@ function SettingsView({
               <Moon size={21} />
             </span>
             <div>
-              <h2>每日采集计划</h2>
+              <h2>每日汇总计划</h2>
               <p>在夜晚记录项目，让白天留给创造。</p>
             </div>
           </div>
-          <label htmlFor="daily-hour">每日开始时间</label>
+          <label htmlFor="daily-hour">每日汇总时间</label>
           <div className="schedule-input">
             <select id="daily-hour" value={hour} onChange={(e) => setHour(Number(e.target.value))}>
               {Array.from({ length: 24 }, (_, i) => (
@@ -1690,7 +1428,8 @@ function SettingsView({
             <span>北京时间 · Asia/Shanghai（UTC+8）</span>
           </div>
           <p className="field-note">
-            定时器每分钟检查一次并续跑未完成任务。大仓库会分批采集；仅完整快照参与每日比对。修改时间不会重复生成同一天的每日快照。
+            定时器每分钟检查一次。按上次汇总到本次截止时间内收到的事件计算净变化，同一用户在期间新增后又取消会相互抵消；总量取最近一次
+            Webhook 上报值。修改时间从下一份汇总生效。
           </p>
           <p className="field-note">
             最近定时触发：
@@ -1793,27 +1532,22 @@ function SettingsView({
             <h2>GitHub 连接</h2>
           </div>
           <p className="field-note">
-            每个项目独立设置自己的 GitHub
-            Token。添加项目时填写，需要更换时在监控项目中点击「更新项目 Token」。
+            每个仓库配置一次 Star Webhook。需要该仓库的管理员权限；公开和私有仓库均可使用。
           </p>
-          <div className="token-guide">
-            <strong>项目独立管理</strong>
+          <div className="webhook-guide">
+            <strong>收到事件，立即记录</strong>
             <p>
-              Token 在服务器端加密保存，不会回显到页面。组织项目请选择对应的组织作为 Resource
-              owner，并选择要监控的仓库。
+              添加项目后复制 Payload URL 和 Secret 到 GitHub → 仓库 Settings → Webhooks。选择
+              application/json、Stars 和 Active，保留 SSL 验证。
             </p>
             <button className="button secondary" onClick={onManageProjects}>
-              管理项目 Token
+              管理项目 Webhook
             </button>
-            <a
-              className="text-button"
-              href="https://github.com/settings/personal-access-tokens/new"
-              target="_blank"
-              rel="noreferrer"
-            >
-              创建 GitHub Token <ArrowUpRight size={14} />
-            </a>
           </div>
+          <p className="field-note">
+            只记录启用后送达的事件，无法补回历史名单或停用期间的变化。GitHub 投递失败时，可在 Recent
+            Deliveries 中手动 Redeliver；重复投递不会重复计数。
+          </p>
         </section>
         <section className="panel settings-panel future-panel">
           <span className="eyebrow">ROOM TO GROW</span>
