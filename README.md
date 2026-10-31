@@ -1,6 +1,6 @@
 # RepoTrace ✦
 
-个人 GitHub 项目的 Star 观测站，基于 Cloudflare Workers + D1，无需自己的服务器。
+个人 GitHub 项目的 Star 观测站，基于 Cloudflare Workers + D1 + KV，无需自己的服务器。
 
 ## 支持的功能
 
@@ -11,7 +11,7 @@
 - 手动采集、分页续跑、失败重试；只有完整快照才参与比对，手动采集不影响每日对比基准。
 - 首份快照建立初始基线，后续快照开始显示变化。
 
-**必须配置 `GITHUB_TOKEN` 才能添加项目和采集 Star。**
+**添加项目时填写该项目的 GitHub Token，每个项目可使用不同 Token；后续可在网页中更新。**
 
 ## 部署到 Cloudflare
 
@@ -32,7 +32,7 @@
 | 部署命令     | `npx wrangler deploy`            |
 | 构建环境变量 | `NODE_VERSION=24`                |
 
-选择 **Workers** 部署。Cloudflare 会自动创建 D1 数据库并绑定为 `DB`，配置定时任务；表结构在首次运行时自动初始化。
+选择 **Workers** 部署。Cloudflare 会自动创建并绑定 D1 数据库 `DB` 和 KV 命名空间 `TOKEN_KEYS`，配置定时任务；表结构在首次运行时自动初始化。
 
 ### 3. 获取并配置 GitHub Token
 
@@ -41,9 +41,11 @@
 3. **Resource owner** 选择要监控仓库所属的账号或组织。
 4. **Repository access → Only select repositories**，勾选要监控的仓库。
 5. 仓库权限保留 **Metadata → Read-only**，无需写权限；点击 **Generate token** 并复制，完整值只显示一次。
-6. 在 Cloudflare 的 RepoTrace Worker → **设置 → 变量和机密 → 添加**，类型选择 **Secret / 机密**，名称填 `GITHUB_TOKEN`，值粘贴刚生成的 Token，然后保存并部署。
+6. 打开 RepoTrace，设置管理员密码并登录，点击 **添加项目**，填写仓库地址和这个项目的 **GitHub Token**。应用验证仓库及 Star 读取权限后开始监控。
 
-打开部署地址，设置管理员密码并登录，在「设置」中会显示“已配置 GitHub Token”，随后即可添加监控仓库。Token 到期后需更新 Cloudflare 中的机密；不要将 Token 提交到仓库。
+不同项目可以填写不同 Token。Token 到期或需要调整权限时，点击项目卡片的 **更新项目 Token**。Token 在 D1 中加密保存，加密密钥由应用自动保存在 KV，不需要配置 GitHub Token Secret，旧值不会回显。
+
+升级前已添加的项目，请在项目卡片中补填各自的 Token，历史数据会保留。
 
 ### 保护首次初始化（可选）
 
@@ -51,7 +53,7 @@
 
 ### 后续更新
 
-同步 Fork 的上游更新后，Cloudflare 可自动重新构建。后续部署须保持同一 `DB` 绑定，以保留密码和历史数据；可从 D1 控制台取得数据库 UUID，写入 Fork 中 `wrangler.jsonc` 的 D1 绑定字段 `database_id`。
+同步 Fork 的上游更新后，Cloudflare 可自动重新构建。后续部署须保持同一 `DB` 和 `TOKEN_KEYS` 绑定，以保留密码、历史和已保存的项目 Token。首次部署后可从 Cloudflare 控制台取得数据库和 KV 的 ID，分别固定到 Fork 中 `wrangler.jsonc` 的 `database_id` 与 KV `id`。
 
 ## 命令行部署
 
@@ -63,10 +65,9 @@ cd repotrace
 npm ci
 npx wrangler login
 npm run deploy
-npx wrangler secret put GITHUB_TOKEN
 ```
 
-最后一条命令会提示安全输入 Token。若需要保护首次初始化，在首次访问前执行：
+部署后在网页中为每个项目填写 Token。若需要保护首次初始化，在首次访问前执行：
 
 ```bash
 npx wrangler secret put SETUP_TOKEN

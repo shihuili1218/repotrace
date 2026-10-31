@@ -1,5 +1,5 @@
 // Versioned, additive migrations run on first API/cron access. No deployment-time SQL step.
-const migrations = [
+export const migrations = [
   [
     `CREATE TABLE IF NOT EXISTS admin (id INTEGER PRIMARY KEY CHECK(id = 1), hash TEXT NOT NULL, salt TEXT NOT NULL, iterations INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`,
@@ -29,6 +29,14 @@ const migrations = [
     )`,
     `CREATE TABLE IF NOT EXISTS monitor_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
     `INSERT OR IGNORE INTO monitor_settings(key,value) VALUES ('daily_hour','23')`,
+  ],
+  [
+    `CREATE TABLE IF NOT EXISTS repository_tokens (
+      repo_id TEXT PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+      key_id TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at INTEGER NOT NULL
+    )`,
+    `UPDATE snapshots SET error = 'GitHub 暂时限制请求，稍后自动重试。'
+      WHERE error LIKE '%GitHub API 额度受限%' OR error LIKE '%配置 GITHUB_TOKEN 提高额度%'`,
   ],
 ];
 

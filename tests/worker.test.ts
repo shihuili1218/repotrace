@@ -3,9 +3,11 @@ import { env as bindings } from 'cloudflare:workers';
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../worker';
-import { initDB } from '../worker/db';
+import { initDB, migrations } from '../worker/db';
+import { getRepositoryToken, saveRepositoryToken } from '../worker/token-vault';
 import {
   collectStars,
+  continueSnapshot,
   enqueueDue,
   enqueueSnapshot,
   latestDue,
@@ -22,7 +24,7 @@ import {
 import { nowSeconds, type Env } from '../worker/types';
 import type { Dashboard, Snapshot } from '../shared/types';
 
-const env = { ...bindings, GITHUB_TOKEN: 'test-token' } as unknown as Env;
+const env = bindings as unknown as Env;
 const password = 'a-secure-test-password-2026';
 const origin = 'https://repotrace.test';
 
@@ -57,12 +59,19 @@ async function setup() {
   expect(response.status).toBe(201);
   return response.headers.get('Set-Cookie')!.split(';')[0];
 }
-async function addRepo(id = 'repo', createdAt = nowSeconds() - 86400) {
+const githubId = (id: string) =>
+  id === 'repo' ? 100 : 1000 + [...id].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+async function addRepo(
+  id = 'repo',
+  createdAt = nowSeconds() - 86400,
+  token: string | null = 'test-token',
+) {
   await env.DB.prepare(
     'INSERT INTO repositories(id,github_id,full_name,description,language,created_at) VALUES (?,?,?,?,?,?)',
   )
-    .bind(id, 100, `owner/${id}`, 'Test repository', 'TypeScript', createdAt)
+    .bind(id, githubId(id), `owner/${id}`, 'Test repository', 'TypeScript', createdAt)
     .run();
+  if (token) await saveRepositoryToken(env, id, token);
 }
 const users = (...ids: number[]): Stargazer[] =>
   ids.map((id) => ({ id, login: `user-${id}`, starred_at: '2026-10-01T12:00:00Z' }));
@@ -98,6 +107,8 @@ async function snapshot(
 
 beforeEach(async () => {
   await initDB(env.DB);
+  const keys = await env.TOKEN_KEYS.list();
+  await Promise.all(keys.keys.map((key) => env.TOKEN_KEYS.delete(key.name)));
   await env.DB.batch(
     [
       'DELETE FROM repositories',
@@ -105,6 +116,7 @@ beforeEach(async () => {
       'DELETE FROM sessions',
       'DELETE FROM admin',
       'DELETE FROM login_limits',
+      "DELETE FROM monitor_settings WHERE key != 'daily_hour'",
       "UPDATE monitor_settings SET value='23' WHERE key='daily_hour'",
     ].map((sql) => env.DB.prepare(sql)),
   );
@@ -242,14 +254,26 @@ describe('private admin workspace', () => {
         stargazers_count: 1,
       });
     });
-    const added = await request('/repositories', 'POST', { repository: 'owner/repo' }, session);
+    const added = await request(
+      '/repositories',
+      'POST',
+      { repository: 'owner/repo', token: 'test-token' },
+      session,
+    );
     expect(added.status).toBe(201);
     const { id } = await added.json<{ id: string }>();
     const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
     expect(data.repositories[0].latest?.total).toBe(1);
     expect(data.changes).toHaveLength(0);
     expect(
-      (await request('/repositories', 'POST', { repository: 'owner/repo' }, session)).status,
+      (
+        await request(
+          '/repositories',
+          'POST',
+          { repository: 'owner/repo', token: 'test-token' },
+          session,
+        )
+      ).status,
     ).toBe(409);
     expect(
       (await request(`/repositories/${id}`, 'PATCH', { enabled: false }, session)).status,
@@ -268,110 +292,370 @@ describe('private admin workspace', () => {
   });
 });
 
-describe('required GitHub Token', () => {
-  it('never sends anonymous GitHub requests for an absent, empty or whitespace token', async () => {
+describe('project credentials', () => {
+  it('rejects missing or malformed project tokens before any outgoing request', async () => {
     const outbound = vi
       .spyOn(globalThis, 'fetch')
-      .mockRejectedValue(new Error('Unexpected outbound request'));
-    for (const token of [undefined, '', '   ']) {
-      const missing = { ...env, GITHUB_TOKEN: token } as unknown as Env;
-      await expect(github(missing).repository('owner/repo')).rejects.toMatchObject({ status: 503 });
-      await expect(github(missing).stargazers('owner/repo', 1)).rejects.toMatchObject({
-        status: 503,
+      .mockRejectedValue(new Error('Unexpected request'));
+    const session = await setup();
+    for (const token of [undefined, '', '   ', 'bad\ntoken']) {
+      await expect(github(token as string).repository('owner/repo')).rejects.toMatchObject({
+        status: 400,
       });
+      const response = await request(
+        '/repositories',
+        'POST',
+        { repository: 'owner/repo', token },
+        session,
+      );
+      expect(response.status).toBe(400);
     }
     expect(outbound).not.toHaveBeenCalled();
   });
 
-  it('blocks collection APIs without a token while keeping history, settings and existing snapshots intact', async () => {
-    await addRepo();
-    const baseline = await snapshot(users(1, 2));
-    const failed = await enqueueSnapshot(env.DB, 'repo', 'manual');
-    await env.DB.prepare(
-      "UPDATE snapshots SET status = 'failed',error = 'previous failure' WHERE id = ?",
-    )
-      .bind(failed)
-      .run();
-    await env.DB.prepare('INSERT INTO snapshot_members(snapshot_id,user_id,login) VALUES (?,1,?)')
-      .bind(failed, 'user-1')
-      .run();
+  it('encrypts tokens with separate KV key material and never returns token contents', async () => {
+    await addRepo('repo', undefined, 'private-project-token');
+    const stored = await env.DB.prepare('SELECT * FROM repository_tokens WHERE repo_id = ?')
+      .bind('repo')
+      .first<{ key_id: string; ciphertext: string }>();
+    expect(stored?.ciphertext).not.toContain('private-project-token');
+    expect(await getRepositoryToken(env, 'repo')).toBe('private-project-token');
+    const rawKey = await env.TOKEN_KEYS.get(`vault/${stored!.key_id}`, 'arrayBuffer');
+    expect(rawKey?.byteLength).toBe(32);
     const session = await setup();
-    const missing = { ...env, GITHUB_TOKEN: '' };
-    const outbound = vi
-      .spyOn(globalThis, 'fetch')
-      .mockRejectedValue(new Error('Unexpected outbound request'));
-    const settings = await request('/settings', 'GET', undefined, session, undefined, missing);
-    expect(await settings.json()).toMatchObject({ githubTokenConfigured: false });
-    const history = await request('/dashboard', 'GET', undefined, session, undefined, missing);
-    expect((await history.json<Dashboard>()).repositories[0].latest?.id).toBe(baseline.id);
-    for (const [path, method, data] of [
-      ['/repositories', 'POST', { repository: 'owner/new-repo' }],
-      ['/repositories/repo/sync', 'POST', {}],
-      [`/snapshots/${failed}/retry`, 'POST', {}],
-      ['/repositories/repo', 'PATCH', { enabled: true }],
-    ] as const) {
-      const response = await request(path, method, data, session, undefined, missing);
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({
-        error: expect.stringContaining('GITHUB_TOKEN'),
+    const response = await request('/dashboard', 'GET', undefined, session);
+    const json = await response.json<Dashboard>();
+    expect(json.repositories[0].tokenConfigured).toBe(true);
+    expect(JSON.stringify(json)).not.toContain('private-project-token');
+    expect(JSON.stringify(json)).not.toContain(stored!.ciphertext);
+  });
+
+  it('initializes the vault safely for concurrent projects and binds ciphertext to its project', async () => {
+    await addRepo('alpha', undefined, null);
+    await addRepo('beta', undefined, null);
+    await Promise.all([
+      saveRepositoryToken(env, 'alpha', 'token-alpha'),
+      saveRepositoryToken(env, 'beta', 'token-beta'),
+    ]);
+    expect(await getRepositoryToken(env, 'alpha')).toBe('token-alpha');
+    expect(await getRepositoryToken(env, 'beta')).toBe('token-beta');
+    const records = await env.DB.prepare(
+      'SELECT key_id,ciphertext FROM repository_tokens ORDER BY repo_id',
+    ).all<{ key_id: string; ciphertext: string }>();
+    expect(records.results[0].key_id).toBe(records.results[1].key_id);
+    expect((await env.TOKEN_KEYS.list()).keys).toHaveLength(1);
+    await env.DB.prepare('UPDATE repository_tokens SET ciphertext = ? WHERE repo_id = ?')
+      .bind(records.results[0].ciphertext, 'beta')
+      .run();
+    await expect(getRepositoryToken(env, 'beta')).rejects.toMatchObject({ status: 503 });
+  });
+
+  it('uses each repository own token for all collection requests', async () => {
+    await addRepo('alpha', undefined, 'token-alpha');
+    await addRepo('beta', undefined, 'token-beta');
+    for (const id of ['alpha', 'beta']) await enqueueSnapshot(env.DB, id, 'baseline');
+    const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+      const url = new URL(String(input));
+      const name = url.pathname.split('/')[3];
+      expect((options?.headers as Record<string, string>).Authorization).toBe(
+        `Bearer token-${name}`,
+      );
+      if (url.pathname.endsWith('/stargazers'))
+        return Response.json([
+          {
+            starred_at: '2026-11-01T00:00:00Z',
+            user: { id: name === 'alpha' ? 1 : 2, login: `${name}-user` },
+          },
+        ]);
+      return Response.json({
+        id: githubId(name),
+        full_name: `owner/${name}`,
+        description: '',
+        language: null,
+        stargazers_count: 1,
       });
-    }
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(2);
+    });
+    await collectStars(env);
+    expect(outbound).toHaveBeenCalledTimes(6);
     expect(
-      await env.DB.prepare('SELECT status FROM snapshots WHERE id = ?')
-        .bind(failed)
-        .first('status'),
-    ).toBe('failed');
-    expect(
-      await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshot_members WHERE snapshot_id = ?')
-        .bind(failed)
-        .first('count'),
-    ).toBe(1);
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM snapshots WHERE status = 'complete'",
+      ).first('count'),
+    ).toBe(2);
+  });
+
+  it('starts the newly added project even when another project already has a queued job', async () => {
+    await addRepo('alpha', undefined, 'token-alpha');
+    await enqueueSnapshot(env.DB, 'alpha', 'baseline');
+    const session = await setup();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+      expect(String(input)).toContain('/owner/beta');
+      expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer token-beta');
+      return String(input).includes('/stargazers?')
+        ? Response.json([
+            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'beta-user' } },
+          ])
+        : Response.json({
+            id: githubId('beta'),
+            full_name: 'owner/beta',
+            description: '',
+            language: null,
+            stargazers_count: 1,
+          });
+    });
     expect(
       (
         await request(
-          '/repositories/repo',
-          'PATCH',
-          { enabled: false },
+          '/repositories',
+          'POST',
+          { repository: 'owner/beta', token: 'token-beta' },
           session,
-          undefined,
-          missing,
         )
       ).status,
-    ).toBe(200);
-    expect(outbound).not.toHaveBeenCalled();
+    ).toBe(201);
+    const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
+    expect(data.repositories.find((r) => r.full_name === 'owner/beta')?.latest?.total).toBe(1);
+    expect(data.repositories.find((r) => r.id === 'alpha')?.active?.total).toBe(0);
   });
 
-  it('pauses scheduled and in-progress collection without a token and resumes once configured', async () => {
+  it('keeps historical data while an existing project waits for its own token', async () => {
     await addRepo();
-    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
-    const missing = { ...env, GITHUB_TOKEN: '' };
-    const source = provider(users(1, 2));
-    const ctx = createExecutionContext();
-    await worker.scheduled({} as ScheduledController, missing, ctx);
-    await waitOnExecutionContext(ctx);
-    await collectStars(missing, source);
+    const baseline = await snapshot(users(1, 2));
+    await env.DB.prepare('DELETE FROM repository_tokens WHERE repo_id = ?').bind('repo').run();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'manual');
+    const source = provider(users(1, 2, 3));
+    await collectStars(env, source);
     expect(source.repository).not.toHaveBeenCalled();
-    expect(source.stargazers).not.toHaveBeenCalled();
-    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(1);
-    expect(
-      await env.DB.prepare('SELECT status,page,total,lease_token FROM snapshots WHERE id = ?')
-        .bind(id)
-        .first(),
-    ).toEqual({
-      status: 'collecting',
-      page: 1,
-      total: 0,
-      lease_token: null,
-    });
+    const session = await setup();
+    const data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
+    expect(data.repositories[0].latest?.id).toBe(baseline.id);
+    expect(data.repositories[0].tokenConfigured).toBe(false);
+    expect((await request('/repositories/repo/sync', 'POST', {}, session)).status).toBe(409);
+    await saveRepositoryToken(env, 'repo', 'new-project-token');
     await collectStars(env, source);
     expect(
       await env.DB.prepare('SELECT status,total FROM snapshots WHERE id = ?').bind(id).first(),
-    ).toEqual({ status: 'complete', total: 2 });
+    ).toEqual({ status: 'complete', total: 3 });
+  });
+
+  it('validates a replacement before saving, then clears obsolete backoff and resumes', async () => {
+    await addRepo();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
+    await env.DB.prepare('UPDATE snapshots SET retry_at=?, error=? WHERE id=?')
+      .bind(nowSeconds() + 3600, 'old error', id)
+      .run();
+    const session = await setup();
+    const outbound = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 401 }));
+    expect(
+      (await request('/repositories/repo/token', 'PUT', { token: 'bad-token' }, session)).status,
+    ).toBe(502);
+    expect(await getRepositoryToken(env, 'repo')).toBe('test-token');
+    outbound.mockImplementation(async (input) =>
+      String(input).includes('/stargazers?')
+        ? Response.json([
+            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'first-user' } },
+          ])
+        : Response.json({
+            id: 100,
+            full_name: 'owner/repo',
+            description: '',
+            language: null,
+            stargazers_count: 1,
+          }),
+    );
+    const response = await request(
+      '/repositories/repo/token',
+      'PUT',
+      { token: 'updated-token' },
+      session,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).not.toContain('updated-token');
+    expect(await getRepositoryToken(env, 'repo')).toBe('updated-token');
+    expect(
+      await env.DB.prepare('SELECT status,error,retry_at FROM snapshots WHERE id = ?')
+        .bind(id)
+        .first(),
+    ).toEqual({ status: 'complete', error: null, retry_at: 0 });
+  });
+
+  it('rejects inaccessible stargazers before creating a project and ends a revoked-token job', async () => {
+    const session = await setup();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) =>
+      String(input).includes('/stargazers?')
+        ? Response.json(
+            { message: 'Resource not accessible by personal access token' },
+            { status: 403 },
+          )
+        : Response.json({
+            id: 100,
+            full_name: 'owner/repo',
+            description: '',
+            language: null,
+            stargazers_count: 1,
+          }),
+    );
+    const rejected = await request(
+      '/repositories',
+      'POST',
+      { repository: 'owner/repo', token: 'project-token' },
+      session,
+    );
+    expect(rejected.status).toBe(502);
+    expect(await rejected.json()).toMatchObject({ error: expect.stringContaining('403') });
+    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM repositories').first('count')).toBe(
+      0,
+    );
+    await addRepo();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
+    await collectStars(env);
+    expect(
+      await env.DB.prepare('SELECT status FROM snapshots WHERE id = ?').bind(id).first('status'),
+    ).toBe('failed');
+  });
+
+  it('migrates existing data and removes the obsolete global-token advice from persisted errors', async () => {
+    const legacy = (bindings as unknown as { LEGACY_DB: D1Database }).LEGACY_DB;
+    await legacy.batch([
+      ...migrations[0].map((sql) => legacy.prepare(sql)),
+      legacy.prepare('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)'),
+      legacy.prepare('INSERT INTO schema_migrations(version) VALUES (1)'),
+      legacy.prepare(
+        "INSERT INTO repositories(id,github_id,full_name,description,created_at) VALUES ('old',100,'owner/old','',1)",
+      ),
+      legacy
+        .prepare(
+          "INSERT INTO snapshots(id,repo_id,kind,day,started_at,error) VALUES ('old-snapshot','old','baseline','2026-11-01',1,?)",
+        )
+        .bind('GitHub API 额度受限，等待额度恢复后继续。可配置 GITHUB_TOKEN 提高额度。'),
+    ]);
+    await initDB(legacy);
+    expect(await legacy.prepare('SELECT COUNT(*) AS count FROM repositories').first('count')).toBe(
+      1,
+    );
+    expect(await legacy.prepare('SELECT error FROM snapshots').first('error')).toBe(
+      'GitHub 暂时限制请求，稍后自动重试。',
+    );
+    expect(
+      await legacy.prepare('SELECT COUNT(*) AS count FROM repository_tokens').first('count'),
+    ).toBe(0);
   });
 });
 
 describe('complete, resumable Star snapshots', () => {
+  it('finishes a 519-star collection through bounded HTTP continuations', async () => {
+    const list = users(...Array.from({ length: 519 }, (_, i) => i + 1));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (!url.pathname.endsWith('/stargazers'))
+        return Response.json({
+          id: 100,
+          full_name: 'owner/repo',
+          description: '',
+          language: null,
+          stargazers_count: 519,
+        });
+      const page = Number(url.searchParams.get('page') ?? 1);
+      return Response.json(
+        list.slice((page - 1) * 100, page * 100).map((user) => ({
+          starred_at: user.starred_at,
+          user: { id: user.id, login: user.login },
+        })),
+        {
+          headers:
+            page < 6
+              ? {
+                  Link: `<https://api.github.com/repos/owner/repo/stargazers?page=${page + 1}>; rel="next"`,
+                }
+              : {},
+        },
+      );
+    });
+    const session = await setup();
+    const created = await request(
+      '/repositories',
+      'POST',
+      { repository: 'owner/repo', token: 'project-token' },
+      session,
+    );
+    expect(created.status).toBe(201);
+    let data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
+    expect(data.repositories[0].active?.total).toBe(100);
+    const id = data.repositories[0].active!.id;
+    for (let page = 2; page <= 6; page++) {
+      const response = await request(`/snapshots/${id}/continue`, 'POST', {}, session);
+      expect(response.status).toBe(200);
+    }
+    data = await (await request('/dashboard', 'GET', undefined, session)).json<Dashboard>();
+    expect(data.repositories[0].active).toBeNull();
+    expect(data.repositories[0].latest).toMatchObject({
+      status: 'complete',
+      total: 519,
+      added: 0,
+      removed: 0,
+    });
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshot_members WHERE snapshot_id = ?')
+        .bind(id)
+        .first('count'),
+    ).toBe(519);
+  });
+
+  it('respects live leases and retry time when continuing a snapshot', async () => {
+    await addRepo();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
+    const source = provider(users(1));
+    await env.DB.prepare('UPDATE snapshots SET lease_until=? WHERE id=?')
+      .bind(nowSeconds() + 180, id)
+      .run();
+    await expect(continueSnapshot(env, id!, source)).rejects.toMatchObject({ status: 409 });
+    await env.DB.prepare('UPDATE snapshots SET lease_until=0,retry_at=? WHERE id=?')
+      .bind(nowSeconds() + 180, id)
+      .run();
+    await expect(continueSnapshot(env, id!, source)).rejects.toMatchObject({ status: 429 });
+    expect(source.repository).not.toHaveBeenCalled();
+    await env.DB.prepare('UPDATE snapshots SET retry_at=0 WHERE id=?').bind(id).run();
+    expect(await continueSnapshot(env, id!, source)).toMatchObject({
+      status: 'complete',
+      total: 1,
+    });
+  });
+
+  it('runs scheduled collection with the saved project token and records the trigger time', async () => {
+    await addRepo();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+      expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
+      return String(input).includes('/stargazers?')
+        ? Response.json([
+            { starred_at: '2026-11-01T00:00:00Z', user: { id: 1, login: 'first-user' } },
+          ])
+        : Response.json({
+            id: 100,
+            full_name: 'owner/repo',
+            description: '',
+            language: null,
+            stargazers_count: 1,
+          });
+    });
+    const before = nowSeconds();
+    const ctx = createExecutionContext();
+    await worker.scheduled({} as ScheduledController, env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(
+      await env.DB.prepare('SELECT status,total FROM snapshots WHERE id = ?').bind(id).first(),
+    ).toEqual({ status: 'complete', total: 1 });
+    expect(
+      Number(
+        await env.DB.prepare("SELECT value FROM monitor_settings WHERE key='last_cron_at'").first(
+          'value',
+        ),
+      ),
+    ).toBeGreaterThanOrEqual(before);
+  });
+
   it('builds a baseline then records added/removed IDs while ignoring username changes', async () => {
     await addRepo();
     const baseline = await snapshot(users(1, 2));
@@ -574,9 +858,9 @@ describe('scheduling, charts and upstream behavior', () => {
         },
       }),
     );
-    await expect(
-      github({ ...env, GITHUB_TOKEN: 'test-token' }).repository('owner/repo'),
-    ).rejects.toMatchObject({ transient: true });
+    await expect(github('test-token').repository('owner/repo')).rejects.toMatchObject({
+      transient: true,
+    });
     const [, options] = mock.mock.calls[0];
     expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
     mock.mockResolvedValue(
@@ -589,7 +873,7 @@ describe('scheduling, charts and upstream behavior', () => {
         },
       ),
     );
-    const page = await github(env).stargazers('owner/repo', 1);
+    const page = await github('test-token').stargazers('owner/repo', 1);
     expect(page.hasNext).toBe(true);
     expect(page.users[0].id).toBe(1);
     expect(page.users[0].login).toBe('star-bot[bot]');

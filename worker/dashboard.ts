@@ -17,7 +17,12 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
   )
     throw new AppError(400, '筛选参数无效。');
   const [repoResult, recent, list, history] = await Promise.all([
-    db.prepare('SELECT * FROM repositories ORDER BY created_at, full_name').all<Repository>(),
+    db
+      .prepare(
+        `SELECT r.*, EXISTS(SELECT 1 FROM repository_tokens t WHERE t.repo_id = r.id) AS token_configured
+      FROM repositories r ORDER BY created_at,full_name`,
+      )
+      .all<Repository & { token_configured: number }>(),
     db
       .prepare(
         `SELECT * FROM (SELECT s.*, ROW_NUMBER() OVER (PARTITION BY repo_id,status ORDER BY started_at DESC,rowid DESC) AS rn FROM snapshots s) WHERE rn = 1`,
@@ -82,8 +87,9 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
       .first<{ count: number }>(),
   ]);
   return {
-    repositories: repoResult.results.map((repo) => ({
+    repositories: repoResult.results.map(({ token_configured, ...repo }) => ({
       ...repo,
+      tokenConfigured: !!token_configured,
       latest: recent.results.find((s) => s.repo_id === repo.id && s.status === 'complete') ?? null,
       active:
         recent.results.find((s) => s.repo_id === repo.id && s.status === 'collecting') ?? null,

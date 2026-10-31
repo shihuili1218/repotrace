@@ -11,9 +11,11 @@ import {
 } from './auth';
 import { initDB } from './db';
 import { dashboard } from './dashboard';
-import { github, GitHubError, hasGitHubToken, parseRepository, requireGitHubToken } from './github';
+import { github, GitHubError, parseRepository, validateGitHubToken } from './github';
+import { requireRepositoryToken, sealRepositoryToken, tokenStatement } from './token-vault';
 import {
   collectStars,
+  continueSnapshot,
   enqueueDue,
   enqueueSnapshot,
   retrySnapshot,
@@ -57,6 +59,15 @@ async function body(request: Request): Promise<Record<string, unknown>> {
   } finally {
     reader.releaseLock();
   }
+}
+
+async function kickCollection(env: Env, ctx: ExecutionContext, repoId: string) {
+  const active = await env.DB.prepare(
+    "SELECT id FROM snapshots WHERE repo_id = ? AND status = 'collecting'",
+  )
+    .bind(repoId)
+    .first<{ id: string }>();
+  if (active) ctx.waitUntil(collectStars(env, undefined, 1, active.id));
 }
 
 async function api(request: Request, env: Env, ctx: ExecutionContext) {
@@ -126,13 +137,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   }
   if (path === '/api/dashboard' && method === 'GET') return json(await dashboard(env.DB, url));
   if (path === '/api/settings' && method === 'GET') {
-    const hour = await env.DB.prepare(
-      "SELECT value FROM monitor_settings WHERE key = 'daily_hour'",
-    ).first<{ value: string }>();
+    const rows = await env.DB.prepare(
+      "SELECT key,value FROM monitor_settings WHERE key IN ('daily_hour','last_cron_at')",
+    ).all<{ key: string; value: string }>();
+    const values = Object.fromEntries(rows.results.map((row) => [row.key, row.value]));
     return json({
-      dailyHour: Number(hour?.value ?? 23),
+      dailyHour: Number(values.daily_hour ?? 23),
       timezone: 'Asia/Shanghai',
-      githubTokenConfigured: hasGitHubToken(env),
+      lastScheduledAt: Number(values.last_cron_at) || null,
       monitors: [starMonitor],
     });
   }
@@ -153,12 +165,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (path === '/api/repositories' && method === 'POST') {
     const data = await body(request);
     const name = parseRepository(data.repository);
-    requireGitHubToken(env);
+    const token = validateGitHubToken(data.token);
     const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM repositories').first<{
       count: number;
     }>();
     if ((count?.count ?? 0) >= 20) throw new AppError(400, '第一版最多监控 20 个仓库。');
-    const repo = await github(env).repository(name);
+    const source = github(token);
+    const repo = await source.repository(name);
+    await source.stargazers(repo.full_name, 1);
     if (
       await env.DB.prepare('SELECT 1 FROM repositories WHERE github_id = ? OR full_name = ?')
         .bind(repo.id, repo.full_name)
@@ -166,27 +180,74 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     )
       throw new AppError(409, '这个仓库已经在监控中了。');
     const id = crypto.randomUUID();
+    const sealed = await sealRepositoryToken(env, id, token);
     try {
-      await env.DB.prepare(
-        'INSERT INTO repositories(id,github_id,full_name,description,language,created_at) VALUES (?,?,?,?,?,?)',
-      )
-        .bind(id, repo.id, repo.full_name, repo.description ?? '', repo.language, nowSeconds())
-        .run();
+      await env.DB.batch([
+        env.DB.prepare(
+          'INSERT INTO repositories(id,github_id,full_name,description,language,created_at) VALUES (?,?,?,?,?,?)',
+        ).bind(id, repo.id, repo.full_name, repo.description ?? '', repo.language, nowSeconds()),
+        tokenStatement(env.DB, id, sealed),
+      ]);
     } catch (error) {
       if (String(error).includes('UNIQUE')) throw new AppError(409, '这个仓库已经在监控中了。');
       throw error;
     }
     await enqueueSnapshot(env.DB, id, 'baseline');
-    ctx.waitUntil(collectStars(env));
+    await kickCollection(env, ctx, id);
     return json({ id }, 201);
   }
-  const repository = path.match(/^\/api\/repositories\/([^/]+)(?:\/(sync))?$/);
+  const repository = path.match(/^\/api\/repositories\/([^/]+)(?:\/(sync|token))?$/);
   if (repository) {
     const id = repository[1];
     if (!(await env.DB.prepare('SELECT id FROM repositories WHERE id = ?').bind(id).first()))
       throw new AppError(404, '仓库不存在。');
+    if (repository[2] === 'token' && method === 'PUT') {
+      const data = await body(request);
+      const token = validateGitHubToken(data.token);
+      const current = await env.DB.prepare('SELECT * FROM repositories WHERE id = ?')
+        .bind(id)
+        .first<{ full_name: string; github_id: number; enabled: number }>();
+      const source = github(token);
+      const accessible = await source.repository(current!.full_name);
+      if (accessible.id !== current!.github_id)
+        throw new AppError(409, '仓库身份已变化，请重新添加项目。');
+      await source.stargazers(accessible.full_name, 1);
+      const sealed = await sealRepositoryToken(env, id, token);
+      await env.DB.batch([
+        tokenStatement(env.DB, id, sealed),
+        env.DB.prepare(
+          `UPDATE snapshots SET retry_at=0,failures=0,error=NULL,lease_token=NULL,lease_until=0
+          WHERE repo_id = ? AND status = 'collecting'`,
+        ).bind(id),
+      ]);
+      if (current!.enabled) {
+        const active = await env.DB.prepare(
+          "SELECT 1 FROM snapshots WHERE repo_id = ? AND status = 'collecting'",
+        )
+          .bind(id)
+          .first();
+        if (!active) {
+          const failed = await env.DB.prepare(
+            "SELECT id FROM snapshots WHERE repo_id = ? AND status = 'failed' ORDER BY started_at DESC LIMIT 1",
+          )
+            .bind(id)
+            .first<{ id: string }>();
+          if (failed) await retrySnapshot(env.DB, failed.id);
+          else if (
+            !(await env.DB.prepare(
+              "SELECT 1 FROM snapshots WHERE repo_id = ? AND status = 'complete'",
+            )
+              .bind(id)
+              .first())
+          )
+            await enqueueSnapshot(env.DB, id, 'baseline');
+        }
+        await kickCollection(env, ctx, id);
+      }
+      return json({ ok: true });
+    }
     if (repository[2] === 'sync' && method === 'POST') {
-      requireGitHubToken(env);
+      await requireRepositoryToken(env, id);
       const repo = await env.DB.prepare('SELECT enabled FROM repositories WHERE id = ?')
         .bind(id)
         .first<{ enabled: number }>();
@@ -199,17 +260,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
       if (last && nowSeconds() - last.started_at < 60)
         throw new AppError(429, '快照刚刚启动，请稍等一分钟再刷新。');
       const snapshotId = await enqueueSnapshot(env.DB, id, 'manual');
-      ctx.waitUntil(collectStars(env));
+      if (snapshotId) ctx.waitUntil(collectStars(env, undefined, 1, snapshotId));
       return json({ id: snapshotId }, 202);
     }
     if (!repository[2] && method === 'PATCH') {
       const { enabled } = await body(request);
       if (typeof enabled !== 'boolean') throw new AppError(400, '监控开关无效。');
-      if (enabled) requireGitHubToken(env);
+      if (enabled) await requireRepositoryToken(env, id);
       await env.DB.prepare('UPDATE repositories SET enabled = ? WHERE id = ?')
         .bind(Number(enabled), id)
         .run();
-      if (enabled) ctx.waitUntil(collectStars(env));
+      if (enabled) await kickCollection(env, ctx, id);
       return json({ ok: true });
     }
     if (!repository[2] && method === 'DELETE') {
@@ -217,11 +278,16 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
       return json({ ok: true });
     }
   }
-  const retry = path.match(/^\/api\/snapshots\/([^/]+)\/retry$/);
+  const retry = path.match(/^\/api\/snapshots\/([^/]+)\/(retry|continue)$/);
   if (retry && method === 'POST') {
-    requireGitHubToken(env);
+    if (retry[2] === 'continue') return json(await continueSnapshot(env, retry[1]));
+    const snapshot = await env.DB.prepare('SELECT repo_id FROM snapshots WHERE id = ?')
+      .bind(retry[1])
+      .first<{ repo_id: string }>();
+    if (!snapshot) throw new AppError(404, '快照不存在。');
+    await requireRepositoryToken(env, snapshot.repo_id);
     const id = await retrySnapshot(env.DB, retry[1]);
-    ctx.waitUntil(collectStars(env));
+    if (id) ctx.waitUntil(collectStars(env, undefined, 1, id));
     return json({ ok: true, id }, 202);
   }
   throw new AppError(404, '接口不存在。');
@@ -258,10 +324,14 @@ export default {
       secured.headers.set('Strict-Transport-Security', 'max-age=31536000');
     return secured;
   },
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
-    if (!hasGitHubToken(env)) return;
+  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
     await initDB(env.DB);
+    await env.DB.prepare(
+      "INSERT INTO monitor_settings(key,value) VALUES ('last_cron_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    )
+      .bind(String(nowSeconds()))
+      .run();
     await enqueueDue(env.DB);
-    ctx.waitUntil(collectStars(env));
+    await collectStars(env);
   },
 } satisfies ExportedHandler<Env>;

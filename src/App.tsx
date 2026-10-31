@@ -37,11 +37,11 @@ import {
   X,
 } from 'lucide-react';
 import type { Dashboard, RepoSummary, Snapshot } from '../shared/types';
-import { api } from './api';
+import { api, ApiError } from './api';
 import { ChangesChart, TrendChart } from './Charts';
 
 type AuthStatus = { initialized: boolean; authenticated: boolean; setupProtected: boolean };
-type Settings = { dailyHour: number; timezone: string; githubTokenConfigured: boolean };
+type Settings = { dailyHour: number; timezone: string; lastScheduledAt: number | null };
 type View = 'overview' | 'activity' | 'repositories' | 'settings';
 const number = (n: number) => n.toLocaleString('zh-CN');
 const time = (seconds: number | null, full = false) =>
@@ -326,11 +326,20 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
   const [modal, setModal] = useState<'add' | RepoSummary | null>(null);
+  const [tokenRepo, setTokenRepo] = useState<RepoSummary | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const requestId = useRef(0);
+  const continuing = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const refresh = useCallback(async () => {
     const id = ++requestId.current;
     setLoading(true);
@@ -352,10 +361,41 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       if (id === requestId.current) setLoading(false);
     }
   }, [repo, snapshot, days, changeKind, page]);
+  const latestRefresh = useRef(refresh);
+  latestRefresh.current = refresh;
   useEffect(() => {
     void refresh();
   }, [refresh]);
   const hasActive = data?.repositories.some((r) => r.active);
+  useEffect(() => {
+    const now = Date.now() / 1000;
+    const pending = data?.repositories
+      .filter(
+        (r) =>
+          r.enabled &&
+          r.tokenConfigured &&
+          r.active &&
+          r.active.retry_at <= now &&
+          r.active.lease_until <= now,
+      )
+      .sort((a, b) => a.active!.page - b.active!.page)[0];
+    if (!pending?.active || busy) return;
+    const id = pending.active.id;
+    const timer = window.setTimeout(async () => {
+      if (document.hidden || continuing.current) return;
+      continuing.current = true;
+      try {
+        await api(`/snapshots/${id}/continue`, { method: 'POST' });
+      } catch (error) {
+        if (alive.current && (!(error instanceof ApiError) || ![409, 429].includes(error.status)))
+          setError(errorText(error));
+      } finally {
+        continuing.current = false;
+        if (alive.current) void latestRefresh.current();
+      }
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [data, busy]);
   useEffect(() => {
     const timer = window.setInterval(
       () => {
@@ -389,7 +429,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     }
   }
   const repositories = data?.repositories ?? [];
-  const githubReady = settings?.githubTokenConfigured ?? false;
+  const missingTokens = repositories.filter((r) => !r.tokenConfigured).length;
   const shown = repositories.filter((r) => !repo || r.id === repo);
   const total = shown.reduce((sum, r) => sum + (r.latest?.total ?? 0), 0);
   const added = shown.reduce((sum, r) => sum + (r.latest?.added ?? 0), 0);
@@ -556,11 +596,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </p>
             </div>
             {view !== 'settings' && (
-              <button
-                className="button primary"
-                disabled={!githubReady}
-                onClick={() => setModal('add')}
-              >
+              <button className="button primary" onClick={() => setModal('add')}>
                 <Plus size={17} />
                 添加项目
               </button>
@@ -579,15 +615,15 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </button>
             </div>
           )}
-          {settings && !githubReady && view !== 'settings' && (
+          {missingTokens > 0 && view !== 'repositories' && (
             <div className="info-note token-banner" role="status">
               <Github size={21} />
               <span>
-                <strong>请先配置 GITHUB_TOKEN</strong>
-                <small>完成配置后即可添加项目并开始采集 Star。</small>
+                <strong>{missingTokens} 个项目需要设置 GitHub Token</strong>
+                <small>请为每个项目填写自己的 Token，已有数据会保留。</small>
               </span>
-              <button className="button secondary" onClick={() => setView('settings')}>
-                前往设置 <ArrowRight size={15} />
+              <button className="button secondary" onClick={() => setView('repositories')}>
+                管理项目 <ArrowRight size={15} />
               </button>
             </div>
           )}
@@ -611,11 +647,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </div>
               <span className="filterbar-status">
                 <span className={`status-dot ${hasActive ? 'pulse' : ''}`} />
-                {!githubReady
-                  ? '等待配置 GITHUB_TOKEN'
-                  : hasActive
-                    ? '快照采集中 · 自动更新'
-                    : '每日自动记录'}
+                {hasActive ? '快照采集中 · 自动更新' : '每日自动记录'}
                 <button
                   className="icon-button"
                   aria-label="刷新页面数据"
@@ -726,7 +758,16 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                         <RepoCard
                           key={r.id}
                           repository={r}
-                          tokenConfigured={githubReady}
+                          onToken={() => setTokenRepo(r)}
+                          lastScheduledAt={settings?.lastScheduledAt ?? null}
+                          onContinue={() =>
+                            void action(
+                              `/snapshots/${r.active?.id}/continue`,
+                              'POST',
+                              {},
+                              '已执行一轮续采。',
+                            )
+                          }
                           busy={busy}
                           onSelect={() => {
                             chooseRepo(r.id);
@@ -744,10 +785,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       ))}
                     </div>
                   ) : (
-                    <EmptyProjects
-                      tokenConfigured={githubReady}
-                      onAdd={() => (githubReady ? setModal('add') : setView('settings'))}
-                    />
+                    <EmptyProjects onAdd={() => setModal('add')} />
                   )}
                   <Changes
                     data={data}
@@ -839,7 +877,11 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                                   {s.status === 'failed' ? (
                                     <button
                                       className="text-button"
-                                      disabled={busy || !githubReady}
+                                      disabled={
+                                        busy ||
+                                        !repositories.find((r) => r.id === s.repo_id)
+                                          ?.tokenConfigured
+                                      }
                                       onClick={() =>
                                         void action(
                                           `/snapshots/${s.id}/retry`,
@@ -895,7 +937,16 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                           <section key={r.id} className="panel managed-repo">
                             <RepoCard
                               repository={r}
-                              tokenConfigured={githubReady}
+                              onToken={() => setTokenRepo(r)}
+                              lastScheduledAt={settings?.lastScheduledAt ?? null}
+                              onContinue={() =>
+                                void action(
+                                  `/snapshots/${r.active?.id}/continue`,
+                                  'POST',
+                                  {},
+                                  '已执行一轮续采。',
+                                )
+                              }
                               busy={busy}
                               onSelect={() => {
                                 chooseRepo(r.id);
@@ -915,7 +966,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                               <span className="muted">添加于 {time(r.created_at)}</span>
                               <button
                                 className="text-button"
-                                disabled={busy || (!r.enabled && !githubReady)}
+                                disabled={busy || (!r.enabled && !r.tokenConfigured)}
                                 onClick={() =>
                                   void action(
                                     `/repositories/${r.id}`,
@@ -939,10 +990,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                   ) : search ? (
                     <div className="panel small-empty">没有找到匹配的项目。</div>
                   ) : (
-                    <EmptyProjects
-                      tokenConfigured={githubReady}
-                      onAdd={() => (githubReady ? setModal('add') : setView('settings'))}
-                    />
+                    <EmptyProjects onAdd={() => setModal('add')} />
                   )}
                   <div className="info-note">
                     <HelpCircle size={17} />
@@ -955,6 +1003,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               {view === 'settings' && settings && (
                 <SettingsView
                   settings={settings}
+                  onManageProjects={() => setView('repositories')}
                   busy={busy}
                   onSave={(hour) =>
                     action(
@@ -1001,6 +1050,17 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           onAdded={async () => {
             setModal(null);
             setToast('项目已添加，正在建立第一份 Star 基线。');
+            await refresh();
+          }}
+        />
+      )}
+      {tokenRepo && (
+        <EditRepositoryToken
+          repository={tokenRepo}
+          onClose={() => setTokenRepo(null)}
+          onSaved={async () => {
+            setTokenRepo(null);
+            setToast('项目 Token 已更新。');
             await refresh();
           }}
         />
@@ -1067,13 +1127,7 @@ function Stat({
     </article>
   );
 }
-function EmptyProjects({
-  onAdd,
-  tokenConfigured,
-}: {
-  onAdd: () => void;
-  tokenConfigured: boolean;
-}) {
+function EmptyProjects({ onAdd }: { onAdd: () => void }) {
   return (
     <section className="panel empty-projects">
       <div className="empty-illustration">
@@ -1088,12 +1142,102 @@ function EmptyProjects({
       </p>
       <button className="button primary" onClick={onAdd}>
         <Plus size={17} />
-        {tokenConfigured ? '添加第一个项目' : '配置 GitHub Token'}
+        添加第一个项目
       </button>
-      <small>GITHUB_TOKEN 为必需配置 · 支持公开与私有仓库</small>
+      <small>每个项目单独设置 Token · 支持公开与私有仓库</small>
     </section>
   );
 }
+function TokenField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <>
+      <label htmlFor="project-token">GitHub Token</label>
+      <div className="password-input">
+        <input
+          id="project-token"
+          type={visible ? 'text' : 'password'}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete="off"
+          placeholder="填写此项目的 Token"
+          required
+          maxLength={512}
+        />
+        <button
+          type="button"
+          aria-label={visible ? '隐藏 Token' : '显示 Token'}
+          onClick={() => setVisible(!visible)}
+        >
+          {visible ? <EyeOff size={18} /> : <Eye size={18} />}
+        </button>
+      </div>
+      <p className="field-note">
+        组织项目请选择组织作为 Resource owner，并保留 Metadata 只读权限。Token
+        加密保存，旧值不会回显。
+      </p>
+      <a
+        className="text-button"
+        href="https://github.com/settings/personal-access-tokens/new"
+        target="_blank"
+        rel="noreferrer"
+      >
+        创建 GitHub Token <ArrowUpRight size={14} />
+      </a>
+    </>
+  );
+}
+
+function EditRepositoryToken({
+  repository,
+  onClose,
+  onSaved,
+}: {
+  repository: RepoSummary;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [token, setToken] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  return (
+    <Dialog title="设置项目 Token" subtitle={repository.full_name} onClose={onClose}>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError('');
+          try {
+            await api(`/repositories/${repository.id}/token`, { method: 'PUT', body: { token } });
+            await onSaved();
+          } catch (e) {
+            setError(errorText(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <TokenField value={token} onChange={setToken} />
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="button primary full" disabled={busy}>
+          {busy ? (
+            <Spinner />
+          ) : (
+            <>
+              <Check size={16} />
+              验证并保存
+            </>
+          )}
+        </button>
+      </form>
+    </Dialog>
+  );
+}
+
 function AddRepository({
   onClose,
   onAdded,
@@ -1102,12 +1246,13 @@ function AddRepository({
   onAdded: () => Promise<void>;
 }) {
   const [value, setValue] = useState('');
+  const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   return (
     <Dialog
       title="让新项目加入观测"
-      subtitle="输入 GitHub 仓库地址，剩下的交给 RepoTrace。"
+      subtitle="输入仓库地址和此项目的 GitHub Token，验证通过后开始监控。"
       onClose={onClose}
     >
       <form
@@ -1116,7 +1261,7 @@ function AddRepository({
           setBusy(true);
           setError('');
           try {
-            await api('/repositories', { method: 'POST', body: { repository: value } });
+            await api('/repositories', { method: 'POST', body: { repository: value, token } });
             await onAdded();
           } catch (e) {
             setError(errorText(e));
@@ -1135,6 +1280,7 @@ function AddRepository({
           required
           maxLength={250}
         />
+        <TokenField value={token} onChange={setToken} />
         <div className="dialog-tip">
           <Clock3 size={17} />
           <span>
@@ -1164,19 +1310,26 @@ function AddRepository({
 }
 function RepoCard({
   repository: r,
-  tokenConfigured,
+  onToken,
+  onContinue,
+  lastScheduledAt,
   busy,
   onSelect,
   onSync,
   embedded = false,
 }: {
   repository: RepoSummary;
-  tokenConfigured: boolean;
+  onToken: () => void;
+  onContinue: () => void;
+  lastScheduledAt: number | null;
   busy: boolean;
   onSelect: () => void;
   onSync: () => void;
   embedded?: boolean;
 }) {
+  const tokenConfigured = r.tokenConfigured;
+  const waiting = !!r.active && r.active.retry_at > Date.now() / 1000;
+  const running = !!r.active && r.active.lease_until > Date.now() / 1000;
   return (
     <article className={`repo-card ${embedded ? 'embedded' : ''}`}>
       <div className="repo-card-heading">
@@ -1194,7 +1347,11 @@ function RepoCard({
               : r.lastError
                 ? '需关注'
                 : r.active
-                  ? '采集中'
+                  ? waiting
+                    ? '等待重试'
+                    : running
+                      ? '采集中'
+                      : '等待续采'
                   : '监控中'}
         </span>
       </div>
@@ -1227,7 +1384,12 @@ function RepoCard({
           <span className="muted tiny">{r.latest ? '初始基线' : '等待完整快照'}</span>
         )}
       </div>
-      {r.active && (
+      {!tokenConfigured && <p className="repo-error">请为此项目设置 GitHub Token。</p>}
+      <button className="text-button" onClick={onToken}>
+        <LockKeyhole size={13} />
+        {tokenConfigured ? '更新项目 Token' : '设置项目 Token'}
+      </button>
+      {r.active && tokenConfigured && (
         <div className="collection-progress">
           <progress
             value={r.active.total}
@@ -1235,9 +1397,27 @@ function RepoCard({
             aria-label={`${r.full_name} 采集进度`}
           />
           <small>
-            {r.active.error ||
-              `已读取 ${number(r.active.total)} / ${number(r.active.expected_total)} 位关注者`}
+            已读取 {number(r.active.total)} / {number(r.active.expected_total)} 位关注者 · 第{' '}
+            {r.active.page} 页
           </small>
+          {r.active.error && <small>{r.active.error}</small>}
+          <small>
+            {waiting
+              ? `下次重试：${time(r.active.retry_at, true)}`
+              : running
+                ? '正在读取下一页…'
+                : '页面打开时会自动续采。'}
+          </small>
+          <small>
+            最近定时触发：{lastScheduledAt ? time(lastScheduledAt, true) : '尚未记录到'}
+          </small>
+          <button
+            className="text-button"
+            disabled={busy || running || waiting || !r.enabled}
+            onClick={onContinue}
+          >
+            继续采集
+          </button>
         </div>
       )}
       {r.lastError && (
@@ -1467,11 +1647,13 @@ function Changes({
 
 function SettingsView({
   settings,
+  onManageProjects,
   busy,
   onSave,
   onPassword,
 }: {
   settings: Settings;
+  onManageProjects: () => void;
   busy: boolean;
   onSave: (hour: number) => Promise<void>;
   onPassword: (current: string, password: string) => Promise<void>;
@@ -1509,6 +1691,10 @@ function SettingsView({
           </div>
           <p className="field-note">
             定时器每分钟检查一次并续跑未完成任务。大仓库会分批采集；仅完整快照参与每日比对。修改时间不会重复生成同一天的每日快照。
+          </p>
+          <p className="field-note">
+            最近定时触发：
+            {settings.lastScheduledAt ? time(settings.lastScheduledAt, true) : '尚未记录到'}
           </p>
           <button
             className="button primary"
@@ -1606,21 +1792,19 @@ function SettingsView({
             <Github size={24} />
             <h2>GitHub 连接</h2>
           </div>
-          <span className={`pill ${settings.githubTokenConfigured ? 'green' : 'red'}`}>
-            <span className="status-dot" />
-            {settings.githubTokenConfigured ? '已配置 GitHub Token' : '请配置 GITHUB_TOKEN（必需）'}
-          </span>
           <p className="field-note">
-            {settings.githubTokenConfigured
-              ? '使用配置的 Token 读取仓库与关注者。若权限不足或 Token 过期，会在采集记录中显示。'
-              : '配置 GITHUB_TOKEN 后才能添加项目和采集 Star。请先创建只读 GitHub Token，并在 Cloudflare 中保存为机密。'}
+            每个项目独立设置自己的 GitHub
+            Token。添加项目时填写，需要更换时在监控项目中点击「更新项目 Token」。
           </p>
           <div className="token-guide">
-            <strong>配置方式</strong>
+            <strong>项目独立管理</strong>
             <p>
-              在 Cloudflare Worker 的「设置 → 变量和机密」中添加机密 <code>GITHUB_TOKEN</code>
-              ，然后重新部署。Token 仅保存在服务器端。
+              Token 在服务器端加密保存，不会回显到页面。组织项目请选择对应的组织作为 Resource
+              owner，并选择要监控的仓库。
             </p>
+            <button className="button secondary" onClick={onManageProjects}>
+              管理项目 Token
+            </button>
             <a
               className="text-button"
               href="https://github.com/settings/personal-access-tokens/new"

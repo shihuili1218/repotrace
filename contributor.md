@@ -10,17 +10,18 @@ npm run build
 npm run dev:api
 ```
 
-Wrangler 使用本地 D1 模拟数据库（`.wrangler/state`，已忽略）。直接使用终端打印的本地地址可查看生产构建。开发前端时，另开终端：
+Wrangler 使用本地 D1 和 KV 模拟存储（`.wrangler/state`，已忽略）。直接使用终端打印的本地地址可查看生产构建。开发前端时，另开终端：
 
 ```bash
 npm run dev
 ```
 
-Vite 自动把 `/api` 代理到 8787。本地采集也必须配置 `GITHUB_TOKEN`，在仓库根目录新建已忽略的 `.dev.vars`：
+Vite 自动把 `/api` 代理到 8787。项目 Token 在本地网页的添加项目表单中填写，无需配置 GitHub Token 环境变量。本地同样使用 D1 保存密文、KV 保存 AES-GCM 加密密钥。
+
+如需测试初始化保护，可在已忽略的 `.dev.vars` 中配置：
 
 ```dotenv
-GITHUB_TOKEN="填入你的只读 Token"
-# SETUP_TOKEN="可选的首次初始化口令"
+SETUP_TOKEN="你的本地初始化口令"
 ```
 
 测试命令：
@@ -49,7 +50,8 @@ shared/types.ts            前后端接口约定
 worker/index.ts            路由、鉴权、定时入口、安全响应头
 worker/auth.ts             密码、会话、限速
 worker/db.ts               版本化、幂等 D1 迁移
-worker/github.ts           GitHub 数据源与分页/限流适配
+worker/github.ts           GitHub 数据源与分页/权限适配
+worker/token-vault.ts      项目 Token 加密存储，密钥单独保存在 KV
 worker/monitors/stars.ts   Star 任务、租约、检查点、快照发布与集合差异
 worker/dashboard.ts        历史、统计和分页查询
 tests/                     Workers + D1 集成测试

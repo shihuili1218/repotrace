@@ -6,7 +6,8 @@ export default defineConfig({
     cloudflareTest({
       miniflare: {
         compatibilityDate: '2026-10-30',
-        d1Databases: ['DB'],
+        d1Databases: ['DB', 'LEGACY_DB'],
+        kvNamespaces: ['TOKEN_KEYS'],
       },
     }),
   ],

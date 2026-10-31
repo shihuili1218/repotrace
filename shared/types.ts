@@ -30,6 +30,7 @@ export interface Snapshot {
 }
 
 export interface RepoSummary extends Repository {
+  tokenConfigured: boolean;
   latest: Snapshot | null;
   active: Snapshot | null;
   lastError: string | null;

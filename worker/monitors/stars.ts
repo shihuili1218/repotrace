@@ -1,5 +1,6 @@
 import type { Snapshot } from '../../shared/types';
-import { github, GitHubError, hasGitHubToken, type StarProvider } from '../github';
+import { github, GitHubError, type StarProvider } from '../github';
+import { requireRepositoryToken } from '../token-vault';
 import { type Env, nowSeconds, AppError } from '../types';
 
 export const starMonitor = { key: 'stars', label: 'Star 监控', version: 1 } as const;
@@ -59,6 +60,7 @@ export async function enqueueDue(db: D1Database, now = nowSeconds()) {
   const repos = await db
     .prepare(
       `SELECT id FROM repositories r WHERE enabled = 1 AND created_at <= ?
+    AND EXISTS (SELECT 1 FROM repository_tokens t WHERE t.repo_id = r.id)
     AND NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = r.id AND s.kind = 'daily' AND s.day = ?)
     AND NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = r.id AND s.status = 'collecting')`,
     )
@@ -123,18 +125,20 @@ async function completeSnapshot(db: D1Database, snapshot: Snapshot, token: strin
 
 export async function collectStars(
   env: Env,
-  provider: StarProvider = github(env),
+  provider?: StarProvider,
   budget = PAGE_BUDGET,
+  onlySnapshotId: string | null = null,
 ) {
-  if (!hasGitHubToken(env)) return;
   const db = env.DB;
   const candidates = await db
     .prepare(
       `SELECT s.*, r.full_name, r.github_id FROM snapshots s JOIN repositories r ON r.id = s.repo_id
+      JOIN repository_tokens t ON t.repo_id = r.id
     WHERE s.status = 'collecting' AND r.enabled = 1 AND s.retry_at <= ? AND s.lease_until <= ?
-    ORDER BY s.started_at, s.rowid LIMIT 3`,
+    AND (? IS NULL OR s.id = ?)
+    ORDER BY s.page, s.started_at, s.rowid LIMIT 3`,
     )
-    .bind(nowSeconds(), nowSeconds())
+    .bind(nowSeconds(), nowSeconds(), onlySnapshotId, onlySnapshotId)
     .all<Snapshot & { full_name: string; github_id: number }>();
   let pages = 0;
   for (const candidate of candidates.results) {
@@ -150,7 +154,9 @@ export async function collectStars(
     // Re-read the checkpoint atomically with the lease, not from the earlier candidate list.
     const snapshot = { ...candidate, ...leased };
     try {
-      const repo = await provider.repository(snapshot.full_name);
+      const tokenValue = await requireRepositoryToken(env, snapshot.repo_id);
+      const source = provider ?? github(tokenValue);
+      const repo = await source.repository(snapshot.full_name);
       if (repo.id !== snapshot.github_id)
         throw new GitHubError('仓库身份已变化，请移除后重新添加该仓库。');
       await db
@@ -164,7 +170,7 @@ export async function collectStars(
         .bind(repo.full_name, repo.description ?? '', repo.language, snapshot.repo_id)
         .run();
       for (; pages < budget;) {
-        const page = await provider.stargazers(repo.full_name, snapshot.page);
+        const page = await source.stargazers(repo.full_name, snapshot.page);
         pages++;
         await db.batch([
           db
@@ -183,7 +189,7 @@ export async function collectStars(
         ]);
         snapshot.page++;
         if (!page.hasNext) {
-          const finalRepo = await provider.repository(repo.full_name);
+          const finalRepo = await source.repository(repo.full_name);
           const result = await db
             .prepare('SELECT COUNT(*) AS count FROM snapshot_members WHERE snapshot_id = ?')
             .bind(snapshot.id)
@@ -202,7 +208,9 @@ export async function collectStars(
       const failure =
         error instanceof GitHubError
           ? error
-          : new GitHubError('快照暂时采集失败，将自动重试。', 0, true);
+          : error instanceof AppError
+            ? new GitHubError(error.message, 0, error.status === 503)
+            : new GitHubError('快照暂时采集失败，将自动重试。', 0, true);
       const retry = failure.transient && (failure.retryAt > 0 || snapshot.failures < 4);
       await db
         .prepare(
@@ -227,6 +235,31 @@ export async function collectStars(
         .run();
     }
   }
+}
+
+export async function continueSnapshot(env: Env, id: string, provider?: StarProvider) {
+  const row = await env.DB.prepare(
+    `SELECT s.*, r.enabled FROM snapshots s
+    JOIN repositories r ON r.id = s.repo_id WHERE s.id = ?`,
+  )
+    .bind(id)
+    .first<Snapshot & { enabled: number }>();
+  if (!row) throw new AppError(404, '快照不存在。');
+  if (!row.enabled) throw new AppError(409, '请先恢复此仓库的监控。');
+  if (row.status !== 'collecting') throw new AppError(409, '此快照已结束，请刷新查看结果。');
+  if (row.lease_until > nowSeconds()) throw new AppError(409, '采集正在运行，请稍后查看进度。');
+  if (row.retry_at > nowSeconds())
+    throw new AppError(429, '当前任务正在等待重试，请按页面显示的时间稍后查看。');
+  if (
+    !(await env.DB.prepare('SELECT 1 FROM repository_tokens WHERE repo_id = ?')
+      .bind(row.repo_id)
+      .first())
+  )
+    throw new AppError(409, '请先为此项目设置 GitHub Token。');
+  await collectStars(env, provider, 1, id);
+  return env.DB.prepare('SELECT status,total,page,error FROM snapshots WHERE id = ?')
+    .bind(id)
+    .first();
 }
 
 export async function retrySnapshot(db: D1Database, id: string) {

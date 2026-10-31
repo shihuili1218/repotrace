@@ -14,7 +14,15 @@ export async function api<T>(
   if (!response.ok) {
     if (response.status === 401 && !path.startsWith('/auth/'))
       window.dispatchEvent(new Event('session-expired'));
-    throw new Error(data.error ?? '请求失败，请重试。');
+    throw new ApiError(response.status, data.error ?? '请求失败，请重试。');
   }
   return data as T;
+}
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+  }
 }
