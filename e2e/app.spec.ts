@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 
 const password = 'browser-test-password-2026';
 
-test('first-run setup, private dashboard, project validation, settings and re-login', async ({
+test('first-run setup, required token guidance, settings and re-login', async ({
   page,
   request,
 }) => {
@@ -17,13 +17,15 @@ test('first-run setup, private dashboard, project validation, settings and re-lo
   await page.getByRole('button', { name: '创建我的观测站' }).click();
   await expect(page.getByRole('heading', { name: '项目总览' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '从第一个项目开始' })).toBeVisible();
-  await page.getByRole('button', { name: '添加第一个项目' }).click();
-  await page.getByLabel('GitHub 仓库', { exact: true }).fill('https://not-github.example/project');
-  await page.getByRole('button', { name: '开始监控' }).click();
-  await expect(page.getByRole('alert')).toContainText('仓库格式');
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
-  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(page.getByRole('button', { name: '添加项目', exact: true })).toBeDisabled();
+  await expect(page.getByRole('status')).toContainText('请先配置 GITHUB_TOKEN');
+  await page.getByRole('button', { name: '配置 GitHub Token', exact: true }).click();
   await expect(page.getByRole('heading', { name: '观测站设置' })).toBeVisible();
+  await expect(page.getByText('请配置 GITHUB_TOKEN（必需）', { exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: '创建 GitHub Token' })).toHaveAttribute(
+    'href',
+    'https://github.com/settings/personal-access-tokens/new',
+  );
   await page.getByLabel('每日开始时间').selectOption('22');
   await page.getByRole('button', { name: '保存计划' }).click();
   await expect(page.getByRole('status')).toContainText('采集时间已更新');

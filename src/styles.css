@@ -1275,6 +1275,29 @@ td small {
 .info-note > svg {
   flex-shrink: 0;
 }
+.token-banner {
+  margin: 0 0 18px;
+  align-items: center;
+  flex-wrap: wrap;
+  color: #6675b1;
+}
+.token-banner > span {
+  flex: 1;
+  min-width: 150px;
+}
+.token-banner strong {
+  display: block;
+  font-size: 12px;
+}
+.token-banner small {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+}
+.token-banner > button {
+  margin-left: auto;
+  font-size: 11px;
+}
 .snapshot-panel {
   margin-top: 24px;
 }

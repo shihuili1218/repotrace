@@ -11,7 +11,7 @@ import {
 } from './auth';
 import { initDB } from './db';
 import { dashboard } from './dashboard';
-import { github, GitHubError, parseRepository } from './github';
+import { github, GitHubError, hasGitHubToken, parseRepository, requireGitHubToken } from './github';
 import {
   collectStars,
   enqueueDue,
@@ -132,7 +132,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     return json({
       dailyHour: Number(hour?.value ?? 23),
       timezone: 'Asia/Shanghai',
-      githubTokenConfigured: !!env.GITHUB_TOKEN,
+      githubTokenConfigured: hasGitHubToken(env),
       monitors: [starMonitor],
     });
   }
@@ -153,6 +153,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (path === '/api/repositories' && method === 'POST') {
     const data = await body(request);
     const name = parseRepository(data.repository);
+    requireGitHubToken(env);
     const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM repositories').first<{
       count: number;
     }>();
@@ -185,6 +186,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     if (!(await env.DB.prepare('SELECT id FROM repositories WHERE id = ?').bind(id).first()))
       throw new AppError(404, '仓库不存在。');
     if (repository[2] === 'sync' && method === 'POST') {
+      requireGitHubToken(env);
       const repo = await env.DB.prepare('SELECT enabled FROM repositories WHERE id = ?')
         .bind(id)
         .first<{ enabled: number }>();
@@ -203,6 +205,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     if (!repository[2] && method === 'PATCH') {
       const { enabled } = await body(request);
       if (typeof enabled !== 'boolean') throw new AppError(400, '监控开关无效。');
+      if (enabled) requireGitHubToken(env);
       await env.DB.prepare('UPDATE repositories SET enabled = ? WHERE id = ?')
         .bind(Number(enabled), id)
         .run();
@@ -216,6 +219,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   }
   const retry = path.match(/^\/api\/snapshots\/([^/]+)\/retry$/);
   if (retry && method === 'POST') {
+    requireGitHubToken(env);
     const id = await retrySnapshot(env.DB, retry[1]);
     ctx.waitUntil(collectStars(env));
     return json({ ok: true, id }, 202);
@@ -255,6 +259,7 @@ export default {
     return secured;
   },
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (!hasGitHubToken(env)) return;
     await initDB(env.DB);
     await enqueueDue(env.DB);
     ctx.waitUntil(collectStars(env));

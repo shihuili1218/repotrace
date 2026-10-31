@@ -22,7 +22,7 @@ import {
 import { nowSeconds, type Env } from '../worker/types';
 import type { Dashboard, Snapshot } from '../shared/types';
 
-const env = bindings as unknown as Env;
+const env = { ...bindings, GITHUB_TOKEN: 'test-token' } as unknown as Env;
 const password = 'a-secure-test-password-2026';
 const origin = 'https://repotrace.test';
 
@@ -268,6 +268,109 @@ describe('private admin workspace', () => {
   });
 });
 
+describe('required GitHub Token', () => {
+  it('never sends anonymous GitHub requests for an absent, empty or whitespace token', async () => {
+    const outbound = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('Unexpected outbound request'));
+    for (const token of [undefined, '', '   ']) {
+      const missing = { ...env, GITHUB_TOKEN: token } as unknown as Env;
+      await expect(github(missing).repository('owner/repo')).rejects.toMatchObject({ status: 503 });
+      await expect(github(missing).stargazers('owner/repo', 1)).rejects.toMatchObject({
+        status: 503,
+      });
+    }
+    expect(outbound).not.toHaveBeenCalled();
+  });
+
+  it('blocks collection APIs without a token while keeping history, settings and existing snapshots intact', async () => {
+    await addRepo();
+    const baseline = await snapshot(users(1, 2));
+    const failed = await enqueueSnapshot(env.DB, 'repo', 'manual');
+    await env.DB.prepare(
+      "UPDATE snapshots SET status = 'failed',error = 'previous failure' WHERE id = ?",
+    )
+      .bind(failed)
+      .run();
+    await env.DB.prepare('INSERT INTO snapshot_members(snapshot_id,user_id,login) VALUES (?,1,?)')
+      .bind(failed, 'user-1')
+      .run();
+    const session = await setup();
+    const missing = { ...env, GITHUB_TOKEN: '' };
+    const outbound = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('Unexpected outbound request'));
+    const settings = await request('/settings', 'GET', undefined, session, undefined, missing);
+    expect(await settings.json()).toMatchObject({ githubTokenConfigured: false });
+    const history = await request('/dashboard', 'GET', undefined, session, undefined, missing);
+    expect((await history.json<Dashboard>()).repositories[0].latest?.id).toBe(baseline.id);
+    for (const [path, method, data] of [
+      ['/repositories', 'POST', { repository: 'owner/new-repo' }],
+      ['/repositories/repo/sync', 'POST', {}],
+      [`/snapshots/${failed}/retry`, 'POST', {}],
+      ['/repositories/repo', 'PATCH', { enabled: true }],
+    ] as const) {
+      const response = await request(path, method, data, session, undefined, missing);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        error: expect.stringContaining('GITHUB_TOKEN'),
+      });
+    }
+    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(2);
+    expect(
+      await env.DB.prepare('SELECT status FROM snapshots WHERE id = ?')
+        .bind(failed)
+        .first('status'),
+    ).toBe('failed');
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshot_members WHERE snapshot_id = ?')
+        .bind(failed)
+        .first('count'),
+    ).toBe(1);
+    expect(
+      (
+        await request(
+          '/repositories/repo',
+          'PATCH',
+          { enabled: false },
+          session,
+          undefined,
+          missing,
+        )
+      ).status,
+    ).toBe(200);
+    expect(outbound).not.toHaveBeenCalled();
+  });
+
+  it('pauses scheduled and in-progress collection without a token and resumes once configured', async () => {
+    await addRepo();
+    const id = await enqueueSnapshot(env.DB, 'repo', 'baseline');
+    const missing = { ...env, GITHUB_TOKEN: '' };
+    const source = provider(users(1, 2));
+    const ctx = createExecutionContext();
+    await worker.scheduled({} as ScheduledController, missing, ctx);
+    await waitOnExecutionContext(ctx);
+    await collectStars(missing, source);
+    expect(source.repository).not.toHaveBeenCalled();
+    expect(source.stargazers).not.toHaveBeenCalled();
+    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM snapshots').first('count')).toBe(1);
+    expect(
+      await env.DB.prepare('SELECT status,page,total,lease_token FROM snapshots WHERE id = ?')
+        .bind(id)
+        .first(),
+    ).toEqual({
+      status: 'collecting',
+      page: 1,
+      total: 0,
+      lease_token: null,
+    });
+    await collectStars(env, source);
+    expect(
+      await env.DB.prepare('SELECT status,total FROM snapshots WHERE id = ?').bind(id).first(),
+    ).toEqual({ status: 'complete', total: 2 });
+  });
+});
+
 describe('complete, resumable Star snapshots', () => {
   it('builds a baseline then records added/removed IDs while ignoring username changes', async () => {
     await addRepo();
@@ -462,28 +565,29 @@ describe('scheduling, charts and upstream behavior', () => {
   });
 
   it('maps GitHub rate limits to deferred retries and preserves token confidentiality', async () => {
-    const mock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(
-        new Response('{}', {
-          status: 403,
-          headers: {
-            'X-RateLimit-Remaining': '0',
-            'X-RateLimit-Reset': String(nowSeconds() + 600),
-          },
-        }),
-      );
+    const mock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{}', {
+        status: 403,
+        headers: {
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Reset': String(nowSeconds() + 600),
+        },
+      }),
+    );
     await expect(
       github({ ...env, GITHUB_TOKEN: 'test-token' }).repository('owner/repo'),
     ).rejects.toMatchObject({ transient: true });
     const [, options] = mock.mock.calls[0];
     expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
     mock.mockResolvedValue(
-      Response.json([{ starred_at: '2026-10-31T00:00:00Z', user: { id: 1, login: 'star-bot[bot]' } }], {
-        headers: {
-          Link: '<https://api.github.com/repos/owner/repo/stargazers?page=2>; rel="next"',
+      Response.json(
+        [{ starred_at: '2026-10-31T00:00:00Z', user: { id: 1, login: 'star-bot[bot]' } }],
+        {
+          headers: {
+            Link: '<https://api.github.com/repos/owner/repo/stargazers?page=2>; rel="next"',
+          },
         },
-      }),
+      ),
     );
     const page = await github(env).stargazers('owner/repo', 1);
     expect(page.hasNext).toBe(true);

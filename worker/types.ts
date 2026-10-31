@@ -1,7 +1,7 @@
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
-  GITHUB_TOKEN?: string;
+  GITHUB_TOKEN: string;
   SETUP_TOKEN?: string;
 }
 

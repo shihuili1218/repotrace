@@ -1,5 +1,5 @@
 import type { Snapshot } from '../../shared/types';
-import { github, GitHubError, type StarProvider } from '../github';
+import { github, GitHubError, hasGitHubToken, type StarProvider } from '../github';
 import { type Env, nowSeconds, AppError } from '../types';
 
 export const starMonitor = { key: 'stars', label: 'Star 监控', version: 1 } as const;
@@ -126,6 +126,7 @@ export async function collectStars(
   provider: StarProvider = github(env),
   budget = PAGE_BUDGET,
 ) {
+  if (!hasGitHubToken(env)) return;
   const db = env.DB;
   const candidates = await db
     .prepare(

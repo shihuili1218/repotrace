@@ -389,6 +389,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     }
   }
   const repositories = data?.repositories ?? [];
+  const githubReady = settings?.githubTokenConfigured ?? false;
   const shown = repositories.filter((r) => !repo || r.id === repo);
   const total = shown.reduce((sum, r) => sum + (r.latest?.total ?? 0), 0);
   const added = shown.reduce((sum, r) => sum + (r.latest?.added ?? 0), 0);
@@ -555,7 +556,11 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </p>
             </div>
             {view !== 'settings' && (
-              <button className="button primary" onClick={() => setModal('add')}>
+              <button
+                className="button primary"
+                disabled={!githubReady}
+                onClick={() => setModal('add')}
+              >
                 <Plus size={17} />
                 添加项目
               </button>
@@ -571,6 +576,18 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 onClick={() => setError('')}
               >
                 <X size={17} />
+              </button>
+            </div>
+          )}
+          {settings && !githubReady && view !== 'settings' && (
+            <div className="info-note token-banner" role="status">
+              <Github size={21} />
+              <span>
+                <strong>请先配置 GITHUB_TOKEN</strong>
+                <small>完成配置后即可添加项目并开始采集 Star。</small>
+              </span>
+              <button className="button secondary" onClick={() => setView('settings')}>
+                前往设置 <ArrowRight size={15} />
               </button>
             </div>
           )}
@@ -594,7 +611,11 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </div>
               <span className="filterbar-status">
                 <span className={`status-dot ${hasActive ? 'pulse' : ''}`} />
-                {hasActive ? '快照采集中 · 自动更新' : '每日自动记录'}
+                {!githubReady
+                  ? '等待配置 GITHUB_TOKEN'
+                  : hasActive
+                    ? '快照采集中 · 自动更新'
+                    : '每日自动记录'}
                 <button
                   className="icon-button"
                   aria-label="刷新页面数据"
@@ -705,6 +726,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                         <RepoCard
                           key={r.id}
                           repository={r}
+                          tokenConfigured={githubReady}
                           busy={busy}
                           onSelect={() => {
                             chooseRepo(r.id);
@@ -722,7 +744,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       ))}
                     </div>
                   ) : (
-                    <EmptyProjects onAdd={() => setModal('add')} />
+                    <EmptyProjects
+                      tokenConfigured={githubReady}
+                      onAdd={() => (githubReady ? setModal('add') : setView('settings'))}
+                    />
                   )}
                   <Changes
                     data={data}
@@ -814,7 +839,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                                   {s.status === 'failed' ? (
                                     <button
                                       className="text-button"
-                                      disabled={busy}
+                                      disabled={busy || !githubReady}
                                       onClick={() =>
                                         void action(
                                           `/snapshots/${s.id}/retry`,
@@ -870,6 +895,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                           <section key={r.id} className="panel managed-repo">
                             <RepoCard
                               repository={r}
+                              tokenConfigured={githubReady}
                               busy={busy}
                               onSelect={() => {
                                 chooseRepo(r.id);
@@ -889,7 +915,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                               <span className="muted">添加于 {time(r.created_at)}</span>
                               <button
                                 className="text-button"
-                                disabled={busy}
+                                disabled={busy || (!r.enabled && !githubReady)}
                                 onClick={() =>
                                   void action(
                                     `/repositories/${r.id}`,
@@ -913,7 +939,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                   ) : search ? (
                     <div className="panel small-empty">没有找到匹配的项目。</div>
                   ) : (
-                    <EmptyProjects onAdd={() => setModal('add')} />
+                    <EmptyProjects
+                      tokenConfigured={githubReady}
+                      onAdd={() => (githubReady ? setModal('add') : setView('settings'))}
+                    />
                   )}
                   <div className="info-note">
                     <HelpCircle size={17} />
@@ -1038,7 +1067,13 @@ function Stat({
     </article>
   );
 }
-function EmptyProjects({ onAdd }: { onAdd: () => void }) {
+function EmptyProjects({
+  onAdd,
+  tokenConfigured,
+}: {
+  onAdd: () => void;
+  tokenConfigured: boolean;
+}) {
   return (
     <section className="panel empty-projects">
       <div className="empty-illustration">
@@ -1053,9 +1088,9 @@ function EmptyProjects({ onAdd }: { onAdd: () => void }) {
       </p>
       <button className="button primary" onClick={onAdd}>
         <Plus size={17} />
-        添加第一个项目
+        {tokenConfigured ? '添加第一个项目' : '配置 GitHub Token'}
       </button>
-      <small>支持公开仓库 · 私有仓库需配置 Token</small>
+      <small>GITHUB_TOKEN 为必需配置 · 支持公开与私有仓库</small>
     </section>
   );
 }
@@ -1129,12 +1164,14 @@ function AddRepository({
 }
 function RepoCard({
   repository: r,
+  tokenConfigured,
   busy,
   onSelect,
   onSync,
   embedded = false,
 }: {
   repository: RepoSummary;
+  tokenConfigured: boolean;
   busy: boolean;
   onSelect: () => void;
   onSync: () => void;
@@ -1146,9 +1183,19 @@ function RepoCard({
         <span className="repo-icon">
           <FolderGit2 size={21} />
         </span>
-        <span className={`pill ${!r.enabled ? 'neutral' : r.lastError ? 'red' : 'green'}`}>
+        <span
+          className={`pill ${!r.enabled || !tokenConfigured ? 'neutral' : r.lastError ? 'red' : 'green'}`}
+        >
           <span className="status-dot" />
-          {!r.enabled ? '已暂停' : r.lastError ? '需关注' : r.active ? '采集中' : '监控中'}
+          {!r.enabled
+            ? '已暂停'
+            : !tokenConfigured
+              ? '待配置 Token'
+              : r.lastError
+                ? '需关注'
+                : r.active
+                  ? '采集中'
+                  : '监控中'}
         </span>
       </div>
       <h3>
@@ -1218,9 +1265,9 @@ function RepoCard({
           aria-label={`采集 ${r.full_name}`}
           title="手动采集完整快照"
           onClick={onSync}
-          disabled={busy || !!r.active || !r.enabled}
+          disabled={busy || !!r.active || !r.enabled || !tokenConfigured}
         >
-          <RefreshCw size={14} className={r.active && r.enabled ? 'spin' : ''} />
+          <RefreshCw size={14} className={r.active && r.enabled && tokenConfigured ? 'spin' : ''} />
         </button>
       </div>
     </article>
@@ -1559,14 +1606,14 @@ function SettingsView({
             <Github size={24} />
             <h2>GitHub 连接</h2>
           </div>
-          <span className={`pill ${settings.githubTokenConfigured ? 'green' : 'neutral'}`}>
+          <span className={`pill ${settings.githubTokenConfigured ? 'green' : 'red'}`}>
             <span className="status-dot" />
-            {settings.githubTokenConfigured ? '已配置 GitHub Token' : '使用匿名 API'}
+            {settings.githubTokenConfigured ? '已配置 GitHub Token' : '请配置 GITHUB_TOKEN（必需）'}
           </span>
           <p className="field-note">
             {settings.githubTokenConfigured
               ? '使用配置的 Token 读取仓库与关注者。若权限不足或 Token 过期，会在采集记录中显示。'
-              : '匿名访问通常只有每小时 60 次请求。建议添加只读 GitHub Token，提高额度并支持私有仓库。'}
+              : '配置 GITHUB_TOKEN 后才能添加项目和采集 Star。请先创建只读 GitHub Token，并在 Cloudflare 中保存为机密。'}
           </p>
           <div className="token-guide">
             <strong>配置方式</strong>
@@ -1574,6 +1621,14 @@ function SettingsView({
               在 Cloudflare Worker 的「设置 → 变量和机密」中添加机密 <code>GITHUB_TOKEN</code>
               ，然后重新部署。Token 仅保存在服务器端。
             </p>
+            <a
+              className="text-button"
+              href="https://github.com/settings/personal-access-tokens/new"
+              target="_blank"
+              rel="noreferrer"
+            >
+              创建 GitHub Token <ArrowUpRight size={14} />
+            </a>
           </div>
         </section>
         <section className="panel settings-panel future-panel">
