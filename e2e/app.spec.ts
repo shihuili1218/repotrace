@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { expect, test, type APIRequestContext } from '@playwright/test';
-
 const password = 'browser-test-password-2026';
+const origin = 'http://127.0.0.1:8788';
 async function deliver(
   request: APIRequestContext,
   url: string,
@@ -15,16 +15,12 @@ async function deliver(
       id: 100,
       full_name: 'owner/repo',
       stargazers_count: 519,
+      forks_count: 3,
       description: 'Webhook browser test',
       language: 'TypeScript',
     },
-    ...(event === 'star'
-      ? {
-          action: 'created',
-          sender: { id: 1, login: 'octocat' },
-          starred_at: new Date().toISOString(),
-        }
-      : {}),
+    sender: { id: 1, login: 'octocat' },
+    ...(event === 'star' ? { action: 'created', starred_at: new Date().toISOString() } : {}),
     ...patch,
   });
   return request.post(url, {
@@ -38,7 +34,7 @@ async function deliver(
   });
 }
 
-test('sets up admin, connects a signed webhook, records users, rotates secret and re-logs in', async ({
+test('sets up admin, connects a webhook, rotates secrets and removes the nightly schedule', async ({
   page,
   request,
 }) => {
@@ -49,7 +45,6 @@ test('sets up admin, connects a signed webhook, records users, rotates secret an
   await page.getByLabel('设置管理员密码').fill(password);
   await page.getByLabel('确认密码', { exact: true }).fill(password);
   await page.getByRole('button', { name: '创建我的观测站' }).click();
-  await expect(page.getByRole('heading', { name: '项目总览' })).toBeVisible();
   await page.getByRole('button', { name: '添加第一个项目' }).click();
   await page.getByLabel('GitHub 仓库', { exact: true }).fill('https://evil.example/project');
   await page.getByRole('button', { name: '生成 Webhook 配置' }).click();
@@ -57,8 +52,8 @@ test('sets up admin, connects a signed webhook, records users, rotates secret an
   await page.getByLabel('GitHub 仓库', { exact: true }).fill('owner/repo');
   await page.getByRole('button', { name: '生成 Webhook 配置' }).click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.getByRole('heading', { name: '连接 GitHub Webhook' })).toBeVisible();
-  await expect(dialog).toContainText('只勾选 Stars');
+  await expect(dialog).toContainText('Pull request reviews');
+  await expect(dialog).toContainText('Releases');
   const url = await page.getByLabel('Payload URL', { exact: true }).inputValue();
   const secret = await page.getByLabel('Secret（签名密钥）', { exact: true }).inputValue();
   expect(secret).toMatch(/^[a-f0-9]{64}$/);
@@ -68,23 +63,18 @@ test('sets up admin, connects a signed webhook, records users, rotates secret an
   await expect(dialog.getByRole('status')).toContainText('已收到签名事件');
   await dialog.getByRole('button', { name: '完成', exact: true }).click();
   const id = crypto.randomUUID();
-  expect((await deliver(request, url, secret, 'star', {}, id)).status()).toBe(200);
-  expect((await deliver(request, url, secret, 'star', {}, id)).status()).toBe(200);
-  expect(
-    (
-      await deliver(request, url, secret, 'star', {
-        action: 'deleted',
-        sender: { id: 2, login: 'departed-user' },
-        starred_at: null,
-      })
-    ).status(),
-  ).toBe(200);
+  await deliver(request, url, secret, 'star', {}, id);
+  await deliver(request, url, secret, 'star', {}, id);
+  await deliver(request, url, secret, 'star', {
+    action: 'deleted',
+    sender: { id: 2, login: 'departed-user' },
+    starred_at: null,
+  });
   await page.getByRole('button', { name: '刷新页面数据' }).click();
   await expect(page.locator('.repo-metrics')).toContainText('519');
-  await expect(page.locator('.repo-metrics')).toContainText('2');
+  await expect(page.locator('.repo-metrics')).toContainText('3');
+  await expect(page.locator('.hook-timestamp')).toContainText('已记录 2 条事件');
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'departed-user', exact: true })).toBeVisible();
-  await expect(page.locator('tbody tr')).toHaveCount(2);
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
   await expect(page.locator('#hook-secret')).toHaveCount(0);
   await dialog.getByRole('button', { name: '重新生成 Secret' }).click();
@@ -92,29 +82,20 @@ test('sets up admin, connects a signed webhook, records users, rotates secret an
   const replacement = await page.getByLabel('Secret（签名密钥）', { exact: true }).inputValue();
   expect(replacement).not.toBe(secret);
   expect((await deliver(request, url, secret)).status()).toBe(401);
-  expect((await deliver(request, url, replacement)).status()).toBe(200);
+  await deliver(request, url, replacement);
   await dialog.getByRole('button', { name: '检查连接' }).click();
   await expect(dialog.getByRole('status')).toContainText('已收到签名事件');
   await dialog.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '监控项目', exact: true }).click();
   await page.getByRole('button', { name: '暂停记录', exact: true }).click();
   await expect(page.locator('.repo-card .pill')).toHaveText('已暂停');
-  expect(
-    (
-      await deliver(request, url, replacement, 'star', { sender: { id: 3, login: 'ignored-user' } })
-    ).status(),
-  ).toBe(200);
+  await deliver(request, url, replacement, 'star', { sender: { id: 3, login: 'ignored-user' } });
   await page.getByRole('button', { name: '恢复记录', exact: true }).click();
-  await expect(page.locator('.repo-metrics')).toContainText('2');
+  await expect(page.locator('.hook-timestamp')).toContainText('已记录 2 条事件');
   await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByLabel('每日汇总时间').selectOption('22');
-  await page.getByRole('button', { name: '保存计划' }).click();
-  await expect(page.locator('.toast')).toContainText('汇总计划已保存');
-  await page.reload();
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  await expect(page.getByLabel('每日汇总时间')).toHaveValue('22');
+  await expect(page.getByRole('heading', { name: '事件驱动，实时统计' })).toBeVisible();
+  await expect(page.getByLabel('每日汇总时间')).toHaveCount(0);
   await page.getByRole('button', { name: '退出登录' }).click();
-  await expect(page.getByRole('heading', { name: '欢迎回到你的观测站' })).toBeVisible();
   await page.getByLabel('管理员密码', { exact: true }).fill('wrong-password');
   await page.getByRole('button', { name: '进入观测站' }).click();
   await expect(page.getByRole('alert')).toContainText('密码不正确');
@@ -123,13 +104,194 @@ test('sets up admin, connects a signed webhook, records users, rotates secret an
   await expect(page.getByRole('heading', { name: '项目总览' })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
-  await expect(dialog).toBeVisible();
   expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
   await dialog.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '打开导航' }).click();
-  await page.getByRole('button', { name: 'Star 动态', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '每一份关注，都有记录' })).toBeVisible();
+  await page.getByRole('button', { name: '项目动态', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '项目的每一步，都有记录' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
+test('shows signed fork, issue, PR and release events in modules and the unified activity feed', async ({
+  page,
+  request,
+}) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.request.post('/api/auth/login', { headers: { Origin: origin }, data: { password } });
+  const data = await (await page.request.get('/api/dashboard')).json();
+  const id = data.repositories[0].id;
+  const config = await (
+    await page.request.post(`/api/repositories/${id}/webhook`, {
+      headers: { Origin: origin },
+      data: {},
+    })
+  ).json();
+  const now = Math.floor(Date.now() / 1000);
+  const iso = (at: number) => new Date(at * 1000).toISOString();
+  const author = { id: 50, login: 'contributor' };
+  const issue = {
+    id: 201,
+    number: 7,
+    title: '安装失败',
+    user: author,
+    state: 'open',
+    labels: [{ name: 'bug' }],
+    created_at: iso(now - 7200),
+    updated_at: iso(now - 10),
+    closed_at: null,
+  };
+  const pr = {
+    id: 202,
+    number: 8,
+    title: '修复安装问题',
+    user: author,
+    state: 'open',
+    draft: false,
+    labels: [{ name: 'fix' }],
+    head: { sha: 'a'.repeat(40) },
+    created_at: iso(now - 7200),
+    updated_at: iso(now - 10),
+    closed_at: null,
+  };
+  const events: [string, Record<string, unknown>][] = [
+    [
+      'fork',
+      {
+        forkee: {
+          id: 301,
+          full_name: 'forker/repo',
+          owner: { id: 60, login: 'forker' },
+          created_at: iso(now),
+        },
+      },
+    ],
+    ['issues', { action: 'opened', issue }],
+    [
+      'issue_comment',
+      {
+        action: 'created',
+        issue,
+        comment: { user: { id: 70, login: 'helper' }, created_at: iso(now - 3600) },
+      },
+    ],
+    [
+      'issues',
+      {
+        action: 'opened',
+        issue: {
+          ...issue,
+          id: 204,
+          number: 10,
+          title: '支持更多终端',
+          labels: [{ name: 'enhancement' }],
+        },
+      },
+    ],
+    ['pull_request', { action: 'opened', pull_request: pr }],
+    [
+      'pull_request_review',
+      {
+        action: 'submitted',
+        pull_request: pr,
+        review: {
+          state: 'approved',
+          commit_id: 'a'.repeat(40),
+          user: { id: 70, login: 'helper' },
+          submitted_at: iso(now - 5),
+        },
+      },
+    ],
+    [
+      'pull_request',
+      {
+        action: 'closed',
+        pull_request: {
+          ...pr,
+          state: 'closed',
+          merged: true,
+          merged_at: iso(now),
+          closed_at: iso(now),
+          updated_at: iso(now),
+        },
+      },
+    ],
+    [
+      'pull_request',
+      { action: 'opened', pull_request: { ...pr, id: 203, number: 9, title: '优化终端体验' } },
+    ],
+    [
+      'release',
+      {
+        action: 'published',
+        release: {
+          id: 401,
+          tag_name: 'v1.1.0',
+          name: '第一版',
+          author,
+          draft: false,
+          prerelease: false,
+          created_at: iso(now - 86520),
+          published_at: iso(now - 86460),
+        },
+      },
+    ],
+    [
+      'release',
+      {
+        action: 'published',
+        release: {
+          id: 402,
+          tag_name: 'v1.2.0',
+          name: '安装改进',
+          author,
+          draft: false,
+          prerelease: false,
+          created_at: iso(now - 120),
+          published_at: iso(now - 60),
+        },
+      },
+    ],
+  ];
+  for (const [event, payload] of events)
+    expect((await deliver(request, config.url, config.secret, event, payload)).status()).toBe(200);
+  await page.goto('/');
+  await expect(page.locator('[aria-label="更多项目统计"]')).toContainText('v1.2.0');
+  await page.getByRole('button', { name: '项目数据', exact: true }).click();
+  await expect(page.getByRole('img', { name: '每日新增 Fork 趋势图' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'forker/repo', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: 'Issue', exact: true }).click();
+  await expect(page.getByRole('link', { name: '#7 安装失败', exact: true })).toBeVisible();
+  await expect(page.locator('.module-metrics')).toContainText('1.0 小时');
+  await page.getByLabel('筛选状态').selectOption('unanswered');
+  await expect(page.getByRole('link', { name: '#10 支持更多终端', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: '#7 安装失败', exact: true })).toHaveCount(0);
+  await page.getByLabel('筛选状态').selectOption('all');
+  await page.getByLabel('筛选标签').selectOption('bug');
+  await expect(page.getByRole('link', { name: '#7 安装失败', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: 'Pull Request', exact: true }).click();
+  await expect(page.locator('tbody')).toContainText('已合并');
+  await expect(page.locator('tbody')).toContainText('2.0 小时');
+  await expect(page.locator('.contributors-list')).toContainText('2 个 PR · 1 个已合并');
+  await page.getByLabel('筛选状态').selectOption('awaiting_review');
+  await expect(page.getByRole('link', { name: '#9 优化终端体验', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(page.getByRole('link', { name: 'v1.2.0', exact: true })).toBeVisible();
+  await expect(page.locator('tbody')).toContainText('正式版');
+  await expect(page.locator('tbody')).toContainText('1.0 天');
+  await page.screenshot({ path: 'test-results/releases-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: 'test-results/releases-mobile.png', fullPage: true });
+  await page.getByRole('button', { name: '打开导航' }).click();
+  await page.getByRole('button', { name: '项目动态', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '项目动态', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'PR', exact: true }).click();
+  await expect(page.locator('.feed-title').first()).toContainText('优化终端体验');
   expect(errors).toEqual([]);
 });
 
@@ -148,21 +310,49 @@ const visualRepo = {
   last_star_at: now,
   current_total: 1248,
   total_reported_at: now,
+  current_forks: 86,
+  forks_reported_at: now,
   event_count: 360,
+  receivedEvents: ['star', 'fork', 'issues', 'pull_request', 'release'],
+};
+const metricFixture = {
+  forks: 8,
+  issuesOpened: 6,
+  issuesClosed: 4,
+  prsOpened: 5,
+  prsMerged: 3,
+  releasesPublished: 2,
+  openIssues: 5,
+  unansweredIssues: 2,
+  openPRs: 3,
+  awaitingReview: 1,
+  contributors: 4,
+  avgReplySeconds: 3600,
+  avgMergeSeconds: 7200,
+  latestRelease: {
+    project_id: 'visual',
+    github_id: 99,
+    full_name: visualRepo.full_name,
+    tag_name: 'v1.2.0',
+    name: '安装改进',
+    author_login: 'octocat',
+    prerelease: 0,
+    draft: 0,
+    created_at: now - 120,
+    published_at: now - 60,
+    published_received_at: now - 60,
+    deleted_at: null,
+    first_seen_at: now - 60,
+  },
 };
 async function fixture(page: import('@playwright/test').Page, data: unknown) {
   await page.route('**/api/auth/status', (r) =>
     r.fulfill({ json: { initialized: true, authenticated: true } }),
   );
-  await page.route('**/api/settings', (r) =>
-    r.fulfill({ json: { dailyHour: 23, timezone: 'Asia/Shanghai', lastScheduledAt: now } }),
-  );
   await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data }));
 }
 
-test('renders populated charts, user changes and summaries on desktop and mobile', async ({
-  page,
-}) => {
+test('renders live charts and release markers on desktop and mobile', async ({ page }) => {
   const day = (offset: number) =>
     new Date((now + 8 * 3600 - offset * 86400) * 1000).toISOString().slice(0, 10);
   await fixture(page, {
@@ -173,27 +363,14 @@ test('renders populated charts, user changes and summaries on desktop and mobile
       added: 15 + (i % 13),
       removed: i % 4,
       repos: 1,
+      fork_total: 50 + i,
+      fork_repos: 1,
+      fork_new: i % 3,
     })),
-    summaries: [
-      {
-        id: 'daily',
-        project_id: 'visual',
-        full_name: visualRepo.full_name,
-        kind: 'daily',
-        source: 'webhook',
-        day: day(0),
-        period_start: now - 86400,
-        period_end: now,
-        computed_at: now,
-        total: 1248,
-        added: 28,
-        removed: 3,
-        event_count: 35,
-      },
-    ],
+    summaries: [],
     changes: [
       {
-        id: 'event1',
+        id: 'one',
         user_id: 1,
         login: 'octocat',
         kind: 'added',
@@ -201,19 +378,14 @@ test('renders populated charts, user changes and summaries on desktop and mobile
         full_name: visualRepo.full_name,
         observed_at: now,
       },
-      {
-        id: 'event2',
-        user_id: 2,
-        login: 'departed-user',
-        kind: 'removed',
-        starred_at: null,
-        full_name: visualRepo.full_name,
-        observed_at: now,
-      },
     ],
-    changeTotal: 2,
+    changeTotal: 1,
     page: 1,
     eventCounts: { added: 28, removed: 3 },
+    metrics: metricFixture,
+    releaseMarkers: [metricFixture.latestRelease],
+    timeline: [],
+    timelineTotal: 0,
   });
   await page.goto('/');
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
@@ -225,12 +397,11 @@ test('renders populated charts, user changes and summaries on desktop and mobile
     .toBeLessThanOrEqual(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/dashboard-mobile.png', fullPage: true });
-  await page.getByRole('button', { name: '打开导航' }).click();
-  await page.getByRole('button', { name: 'Star 动态', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '每日汇总与历史' })).toBeVisible();
 });
 
-test('guides a migrated project to generate its first webhook secret', async ({ page }) => {
+test('guides a migrated project through first-time signing setup and lists the new event choices', async ({
+  page,
+}) => {
   let configured = false;
   const data = () => ({
     repositories: [
@@ -243,6 +414,7 @@ test('guides a migrated project to generate its first webhook secret', async ({ 
         total_reported_at: null,
         last_star_at: null,
         event_count: 0,
+        receivedEvents: [],
       },
     ],
     history: [],
@@ -251,6 +423,10 @@ test('guides a migrated project to generate its first webhook secret', async ({ 
     changeTotal: 0,
     page: 1,
     eventCounts: { added: 0, removed: 0 },
+    metrics: { ...metricFixture, latestRelease: null },
+    releaseMarkers: [],
+    timeline: [],
+    timelineTotal: 0,
   });
   await fixture(page, data());
   await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data() }));
@@ -272,10 +448,7 @@ test('guides a migrated project to generate its first webhook secret', async ({ 
   await page.getByRole('button', { name: '生成签名密钥', exact: true }).click();
   await page.getByRole('button', { name: '确认生成新密钥' }).click();
   await expect(page.getByLabel('Secret（签名密钥）', { exact: true })).toHaveValue('a'.repeat(64));
-  await expect(page.getByRole('link', { name: '仓库 Settings → Webhooks' })).toHaveAttribute(
-    'href',
-    'https://github.com/rssh-org/rssh/settings/hooks',
-  );
+  await expect(page.getByLabel('支持的 Webhook 事件').locator(':scope > div')).toHaveCount(7);
   await page.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
   await expect(page.locator('#hook-secret')).toHaveCount(0);

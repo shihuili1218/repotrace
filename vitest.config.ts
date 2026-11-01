@@ -6,7 +6,7 @@ export default defineConfig({
     cloudflareTest({
       miniflare: {
         compatibilityDate: '2026-10-30',
-        d1Databases: ['DB', 'LEGACY_DB'],
+        d1Databases: ['DB', 'LEGACY_DB', 'WEBHOOK_V3_DB'],
         kvNamespaces: ['WEBHOOK_KEYS'],
       },
     }),

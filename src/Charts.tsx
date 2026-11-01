@@ -1,14 +1,20 @@
 import { Activity, ChartNoAxesCombined } from 'lucide-react';
-import type { Dashboard } from '../shared/types';
+import type { Dashboard, ReleaseRecord } from '../shared/types';
 
-export function TrendChart({ history }: { history: Dashboard['history'] }) {
+export function TrendChart({
+  history,
+  markers = [],
+}: {
+  history: Dashboard['history'];
+  markers?: ReleaseRecord[];
+}) {
   const data = history.filter((p) => p.repos > 0);
   if (!data.length)
     return (
       <div className="chart-empty">
         <ChartNoAxesCombined size={32} />
         <strong>让时间记录你的成长</strong>
-        <span>连接 Webhook 后，这里会展示初始基线与每日汇总。</span>
+        <span>收到仓库上报后，图表会随事件实时更新。</span>
       </div>
     );
   const max = Math.max(5, ...data.map((p) => p.total));
@@ -46,6 +52,32 @@ export function TrendChart({ history }: { history: Dashboard['history'] }) {
         strokeLinejoin="round"
         strokeLinecap="round"
       />
+      {data.map((p, i) => {
+        const releases = markers.filter(
+          (r) =>
+            r.published_at &&
+            new Date((r.published_at + 8 * 3600) * 1000).toISOString().slice(0, 10) === p.day,
+        );
+        return releases.length ? (
+          <g key={`release-${p.day}`}>
+            <line
+              x1={point(i, p.total)[0]}
+              x2={point(i, p.total)[0]}
+              y1="25"
+              y2="196"
+              stroke="#a18bd2"
+              strokeDasharray="4 5"
+            />
+            <circle cx={point(i, p.total)[0]} cy="23" r="5" fill="#9c7bc9">
+              <title>
+                {releases
+                  .map((r) => `${r.full_name} ${r.tag_name}${r.prerelease ? '（预发布）' : ''}`)
+                  .join('、')}
+              </title>
+            </circle>
+          </g>
+        ) : null;
+      })}
       {data.map((p, i) => (
         <circle
           key={p.day}
@@ -84,7 +116,7 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
       <div className="chart-empty compact">
         <Activity size={28} />
         <strong>变化即将发生</strong>
-        <span>每晚汇总已收到的新增与取消事件。</span>
+        <span>按北京时间自然日实时计算新增与取消。</span>
       </div>
     );
   const max = Math.max(1, ...data.flatMap((p) => [p.added, p.removed]));
@@ -134,6 +166,56 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
       {!data.some((p) => p.added || p.removed) && (
         <text x="180" y="82" textAnchor="middle" className="axis-label">
           所选时间内暂无每日变化
+        </text>
+      )}
+    </svg>
+  );
+}
+
+export function ForkChart({ history }: { history: Dashboard['history'] }) {
+  const max = Math.max(1, ...history.map((p) => p.fork_new));
+  const step = 696 / Math.max(1, history.length);
+  return (
+    <svg className="trend-svg" viewBox="0 0 800 242" role="img" aria-label="每日新增 Fork 趋势图">
+      {[0, 1, 2, 3, 4].map((i) => (
+        <g key={i}>
+          <line x1="64" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
+          <text x="48" y={201 - i * 41} textAnchor="end" className="axis-label">
+            {Math.round((max * i) / 4)}
+          </text>
+        </g>
+      ))}
+      {history.map((p, i) => (
+        <rect
+          key={p.day}
+          x={64 + i * step + step * 0.18}
+          y={196 - (p.fork_new / max) * 164}
+          width={Math.max(1, step * 0.64)}
+          height={p.fork_new ? (p.fork_new / max) * 164 : 0}
+          fill="#8291e4"
+          rx="2"
+        >
+          <title>
+            {p.day} · 新增 {p.fork_new} Fork
+          </title>
+        </rect>
+      ))}
+      {[...new Set([0, Math.floor((history.length - 1) / 2), history.length - 1])]
+        .filter((i) => i >= 0)
+        .map((i) => (
+          <text
+            key={i}
+            x={64 + (i + 0.5) * step}
+            y="229"
+            textAnchor="middle"
+            className="axis-label"
+          >
+            {history[i]?.day.slice(5).replace('-', '/')}
+          </text>
+        ))}
+      {!history.some((p) => p.fork_new) && (
+        <text x="415" y="95" textAnchor="middle" className="axis-label">
+          所选时间内尚未记录到新增 Fork
         </text>
       )}
     </svg>

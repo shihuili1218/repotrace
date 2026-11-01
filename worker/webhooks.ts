@@ -1,7 +1,8 @@
 import { initDB } from './db';
 import { getWebhookCredentials } from './webhook-secrets';
 import { parseRepository } from './projects';
-import { localDay } from './summaries';
+import { webhookEvents } from '../shared/monitors';
+import { normalizeEvent, object, integer, count } from './events';
 import { AppError, type Env, json, nowSeconds } from './types';
 
 export const newWebhookSecret = () =>
@@ -59,24 +60,24 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
   if (!(await crypto.subtle.verify('HMAC', key, signed, raw)))
     throw new AppError(401, 'Webhook 签名无效。');
   const event = request.headers.get('X-GitHub-Event');
-  if (event !== 'ping' && event !== 'star') return json({ ok: true, ignored: true });
+  if (event !== 'ping' && !webhookEvents.some((item) => item.event === event))
+    return json({ ok: true, ignored: true });
   const delivery = request.headers.get('X-GitHub-Delivery') ?? '';
   if (!/^[a-zA-Z0-9-]{1,128}$/.test(delivery)) throw new AppError(400, '缺少有效的 Delivery ID。');
-  let data;
+  let parsed: unknown;
   try {
-    data = JSON.parse(new TextDecoder().decode(raw));
+    parsed = JSON.parse(new TextDecoder().decode(raw));
   } catch {
     throw new AppError(400, 'Webhook JSON 无效。');
   }
-  const repo = data?.repository;
-  if (
-    !Number.isSafeInteger(repo?.id) ||
-    repo.id <= 0 ||
-    !Number.isSafeInteger(repo.stargazers_count) ||
-    repo.stargazers_count < 0
-  )
-    throw new AppError(400, 'Webhook 缺少仓库及 Star 总量。');
+  const data = object(parsed);
+  const repo = object(data.repository);
+  const githubId = integer(repo.id);
   const name = parseRepository(repo.full_name);
+  const stars = count(repo.stargazers_count);
+  const forks = count(repo.forks_count);
+  const at = nowSeconds();
+  const normalized = normalizeEvent(event!, data, name, at);
   const project = await env.DB.prepare(
     'SELECT github_id,full_name,enabled FROM projects WHERE id = ?',
   )
@@ -85,116 +86,87 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
   if (
     !project ||
     (project.github_id !== null
-      ? project.github_id !== repo.id
+      ? project.github_id !== githubId
       : project.full_name.toLowerCase() !== name.toLowerCase())
   )
     throw new AppError(409, 'Webhook 仓库与此项目不匹配。');
-  const sender = data.sender;
-  if (
-    event === 'star' &&
-    (!['created', 'deleted'].includes(data.action) ||
-      !Number.isSafeInteger(sender?.id) ||
-      sender.id <= 0 ||
-      typeof sender.login !== 'string' ||
-      !/^[a-zA-Z0-9-]{1,39}(?:\[bot\])?$/.test(sender.login))
-  )
-    throw new AppError(400, 'Star 事件内容无效。');
-  const starredAt =
-    event === 'star' &&
-    data.action === 'created' &&
-    typeof data.starred_at === 'string' &&
-    Number.isFinite(Date.parse(data.starred_at))
-      ? data.starred_at
-      : null;
-  const at = nowSeconds();
-  // All effects, including the deduplication marker, commit together. Retries cannot
-  // lose a user event between accepting a delivery and updating the counters.
+  // The delivery marker and every state/event update commit together.
   const fresh = `EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0)`;
   const statements = [
     env.DB.prepare(
       'UPDATE projects SET github_id=?,full_name=?,description=?,language=? WHERE id=? AND (github_id IS NULL OR github_id=?) AND NOT EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=1) AND EXISTS(SELECT 1 FROM webhook_connections WHERE project_id=? AND ciphertext=?)',
     ).bind(
-      repo.id,
+      githubId,
       name,
       typeof repo.description === 'string' ? repo.description.slice(0, 2000) : '',
       typeof repo.language === 'string' ? repo.language.slice(0, 100) : null,
       id,
-      repo.id,
+      githubId,
       id,
       delivery,
       id,
       credentials.version,
     ),
     env.DB.prepare(
-      `INSERT OR IGNORE INTO webhook_deliveries(project_id,delivery_id,event_name,received_at,observed_total,recorded)
-      SELECT p.id,?,?,?,?,p.enabled FROM projects p JOIN webhook_connections c ON c.project_id=p.id WHERE p.id=? AND p.github_id=? AND c.ciphertext=?`,
-    ).bind(delivery, event, at, repo.stargazers_count, id, repo.id, credentials.version),
+      `INSERT OR IGNORE INTO webhook_deliveries(project_id,delivery_id,event_name,received_at,observed_total,observed_forks,recorded)
+      SELECT p.id,?,?,?,?,?,p.enabled FROM projects p JOIN webhook_connections c ON c.project_id=p.id WHERE p.id=? AND p.github_id=? AND c.ciphertext=?`,
+    ).bind(delivery, event, at, stars ?? -1, forks, id, githubId, credentials.version),
     // A valid redelivery confirms the current signing secret, even when its effects
     // were already recorded. This also makes re-delivered Ping useful after rotation.
     env.DB.prepare(
       `UPDATE webhook_connections SET first_received_at=MIN(COALESCE(first_received_at,?),?),last_received_at=MAX(COALESCE(last_received_at,?),?) WHERE project_id=? AND ciphertext=? AND EXISTS(SELECT 1 FROM projects WHERE id=? AND github_id=?)`,
-    ).bind(at, at, at, at, id, credentials.version, id, repo.id),
+    ).bind(at, at, at, at, id, credentials.version, id, githubId),
   ];
-  if (event === 'star')
-    statements.push(
-      env.DB.prepare(
-        `INSERT OR IGNORE INTO star_events(delivery_seq,project_id,user_id,login,kind,starred_at,received_at)
-    SELECT seq,project_id,?,?,?,?,received_at FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1`,
-      ).bind(
-        sender.id,
-        sender.login,
-        data.action === 'created' ? 'added' : 'removed',
-        starredAt,
-        id,
-        delivery,
-      ),
-    );
+  if (normalized) {
+    statements.push(...normalized.statements(env.DB, id, delivery, at));
+    if (normalized.category !== 'star')
+      statements.push(
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO project_events(delivery_seq,project_id,category,action,object_id,actor_id,actor_login,title,number,url,received_at)
+      SELECT seq,project_id,?,?,?,?,?,?,?,?,received_at FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1`,
+        ).bind(
+          normalized.category,
+          normalized.action,
+          normalized.objectId,
+          normalized.actor.id,
+          normalized.actor.login,
+          normalized.title,
+          normalized.number,
+          normalized.url,
+          id,
+          delivery,
+        ),
+      );
+  }
   statements.push(
     env.DB.prepare(
       `UPDATE webhook_connections SET
-      first_received_at=MIN(COALESCE(first_received_at,?),?),last_received_at=MAX(COALESCE(last_received_at,?),?),
-      last_star_at=CASE WHEN ?='star' AND EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND recorded=1) THEN MAX(COALESCE(last_star_at,?),?) ELSE last_star_at END,
-      current_total=CASE WHEN ?>=COALESCE(total_reported_at,0) AND EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND recorded=1) THEN ? ELSE current_total END,
-      total_reported_at=CASE WHEN EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND recorded=1) THEN MAX(COALESCE(total_reported_at,?),?) ELSE total_reported_at END
-      WHERE project_id=? AND ${fresh}`,
-    ).bind(
-      at,
-      at,
-      at,
-      at,
-      event,
-      id,
-      delivery,
-      at,
-      at,
-      at,
-      id,
-      delivery,
-      repo.stargazers_count,
-      id,
-      delivery,
-      at,
-      at,
-      id,
-      id,
-      delivery,
-    ),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO summaries(id,project_id,kind,source,day,period_start,period_end,computed_at,total)
-      SELECT ?,?,'baseline','webhook',?,?,?, ?,? WHERE ${fresh}
-      AND NOT EXISTS(SELECT 1 FROM summaries WHERE project_id=? AND source='webhook' AND kind='baseline')
+      last_star_at=CASE WHEN ?='star' THEN MAX(COALESCE(last_star_at,?),?) ELSE last_star_at END,
+      current_total=CASE WHEN ? IS NOT NULL AND ?>=COALESCE(total_reported_at,0) THEN ? ELSE current_total END,
+      total_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(total_reported_at,?),?) ELSE total_reported_at END,
+      current_forks=CASE WHEN ? IS NOT NULL AND ?>=COALESCE(forks_reported_at,0) THEN ? ELSE current_forks END,
+      forks_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(forks_reported_at,?),?) ELSE forks_reported_at END
+      WHERE project_id=? AND ${fresh}
       AND EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND recorded=1)`,
     ).bind(
-      crypto.randomUUID(),
+      event,
+      at,
+      at,
+      stars,
+      at,
+      stars,
+      stars,
+      at,
+      at,
+      forks,
+      at,
+      forks,
+      forks,
+      at,
+      at,
       id,
-      localDay(at),
-      at,
-      at,
-      at,
-      repo.stargazers_count,
       id,
       delivery,
-      id,
       id,
       delivery,
     ),

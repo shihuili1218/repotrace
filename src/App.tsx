@@ -4,7 +4,9 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
-  Bell,
+  Tag,
+  MessageCircle,
+  GitPullRequest,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -22,7 +24,6 @@ import {
   LockKeyhole,
   LogOut,
   Menu,
-  Moon,
   Pause,
   Play,
   Plus,
@@ -37,10 +38,11 @@ import {
 import type { Dashboard, RepoSummary, WebhookConfig } from '../shared/types';
 import { api } from './api';
 import { ChangesChart, TrendChart } from './Charts';
+import { Monitoring, ActivityFeed } from './Monitoring';
+import { webhookEvents } from '../shared/monitors';
 
 type AuthStatus = { initialized: boolean; authenticated: boolean; setupProtected: boolean };
-type Settings = { dailyHour: number; timezone: string; lastScheduledAt: number | null };
-type View = 'overview' | 'activity' | 'repositories' | 'settings';
+type View = 'overview' | 'activity' | 'data' | 'repositories' | 'settings';
 const number = (n: number) => n.toLocaleString('zh-CN');
 const time = (seconds: number | null, full = false) =>
   seconds
@@ -314,11 +316,11 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [view, setView] = useState<View>('overview');
   const [mobileNav, setMobileNav] = useState(false);
   const [data, setData] = useState<Dashboard | null>(null);
-  const [settings, setSettings] = useState<Settings | null>(null);
   const [repo, setRepo] = useState('');
   const [summary, setSummary] = useState('');
   const [days, setDays] = useState(30);
   const [kind, setKind] = useState('all');
+  const [category, setCategory] = useState('all');
   const [page, setPage] = useState(1);
   const [adding, setAdding] = useState(false);
   const [hook, setHook] = useState<WebhookConfig | null>(null);
@@ -330,21 +332,17 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const refresh = useCallback(async () => {
     const id = ++requestId.current;
     try {
-      const [next, config] = await Promise.all([
-        api<Dashboard>(
-          `/dashboard?${new URLSearchParams({ repo, summary, days: String(days), kind, page: String(page) })}`,
-        ),
-        api<Settings>('/settings'),
-      ]);
+      const next = await api<Dashboard>(
+        `/dashboard?${new URLSearchParams({ repo, summary, days: String(days), kind, category, page: String(page) })}`,
+      );
       if (id === requestId.current) {
         setData(next);
-        setSettings(config);
         setError('');
       }
     } catch (e) {
       if (id === requestId.current) setError(errorText(e));
     }
-  }, [repo, summary, days, kind, page]);
+  }, [repo, summary, days, kind, category, page]);
   useEffect(() => {
     void refresh();
     const interval = window.setInterval(() => void refresh(), hook ? 5000 : 15000);
@@ -385,7 +383,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const pending = repositories.filter((r) => !r.webhookConfigured || !r.last_received_at).length;
   const navs = [
     { view: 'overview' as const, label: '项目总览', icon: <LayoutDashboard size={19} /> },
-    { view: 'activity' as const, label: 'Star 动态', icon: <Activity size={19} /> },
+    { view: 'activity' as const, label: '项目动态', icon: <Activity size={19} /> },
+    { view: 'data' as const, label: '项目数据', icon: <GitFork size={19} /> },
     { view: 'repositories' as const, label: '监控项目', icon: <FolderGit2 size={19} /> },
     { view: 'settings' as const, label: '设置', icon: <Settings2 size={19} /> },
   ];
@@ -418,6 +417,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               aria-current={view === item.view ? 'page' : undefined}
               onClick={() => {
                 setView(item.view);
+                setPage(1);
                 setMobileNav(false);
               }}
             >
@@ -430,18 +430,18 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="night-note">
-            <span className="night-icon">
-              <Moon size={18} />
+          <div className="event-note">
+            <span className="event-icon">
+              <Activity size={18} />
             </span>
-            <strong>把记录交给夜晚</strong>
+            <strong>事件到了，就有记录</strong>
             <p>
-              每日 {String(settings?.dailyHour ?? 23).padStart(2, '0')}:00 自动汇总
+              Star · Fork · Issue · PR · Release
               <br />
-              Asia/Shanghai · UTC+8
+              北京时间自然日 · 实时统计
             </p>
-            <button onClick={() => setView('settings')}>
-              管理汇总计划 <ArrowUpRight size={14} />
+            <button onClick={() => setView('repositories')}>
+              管理 Webhook <ArrowUpRight size={14} />
             </button>
           </div>
           <a
@@ -501,7 +501,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 {
                   {
                     overview: '项目总览',
-                    activity: '每一份关注，都有记录',
+                    activity: '项目的每一步，都有记录',
+                    data: '看见项目的更多维度',
                     repositories: '我的监控项目',
                     settings: '观测站设置',
                   }[view]
@@ -512,9 +513,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 {
                   {
                     overview: '让每一次关注，汇成项目成长的轨迹。',
-                    activity: '查看送达的 Star 事件与每晚的用户净变化。',
+                    activity: '关注、反馈、贡献与发布，汇在同一条时间线。',
+                    data: '了解 Fork 增长、Issue 反馈、PR 进度与版本发布。',
                     repositories: '连接 GitHub Webhook，开始记录你的项目。',
-                    settings: '安排汇总时间，然后专注创造。',
+                    settings: '管理 Webhook 连接与管理员密码。',
                   }[view]
                 }
               </p>
@@ -553,25 +555,43 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           )}
           {view !== 'settings' && (
             <div className="filterbar">
-              <div className="select-wrap">
-                <FolderGit2 size={16} />
-                <select
-                  aria-label="选择项目"
-                  value={repo}
-                  onChange={(e) => {
-                    setRepo(e.target.value);
-                    setSummary('');
-                    setPage(1);
-                  }}
-                >
-                  <option value="">全部项目</option>
-                  {repositories.map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.full_name}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown size={14} />
+              <div className="filterbar-controls">
+                <div className="select-wrap">
+                  <FolderGit2 size={16} />
+                  <select
+                    aria-label="选择项目"
+                    value={repo}
+                    onChange={(e) => {
+                      setRepo(e.target.value);
+                      setSummary('');
+                      setPage(1);
+                    }}
+                  >
+                    <option value="">全部项目</option>
+                    {repositories.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.full_name}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown size={14} />
+                </div>
+                <div className="select-wrap">
+                  <select
+                    aria-label="统计范围"
+                    value={days}
+                    onChange={(e) => {
+                      setDays(Number(e.target.value));
+                      setPage(1);
+                    }}
+                  >
+                    {[7, 30, 90].map((n) => (
+                      <option key={n} value={n}>
+                        近 {n} 天
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
               <span className="filterbar-status">
                 Webhook 实时记录
@@ -613,7 +633,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       title={`近 ${days} 天取消事件`}
                       value={`−${number(data.eventCounts.removed)}`}
                       icon={<ArrowDownRight size={20} />}
-                      note="每日净变化可在汇总中查看"
+                      note="自然日净变化在图表中实时计算"
                       tone="red"
                     />
                     <Stat
@@ -624,12 +644,42 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       tone="blue"
                     />
                   </section>
+                  <section className="stats-grid" aria-label="更多项目统计">
+                    <Stat
+                      title={`近 ${days} 天新增 Fork`}
+                      value={number(data.metrics.forks)}
+                      icon={<GitFork size={20} />}
+                      note="查看新 Fork 的用户和仓库"
+                      tone="purple"
+                    />
+                    <Stat
+                      title={`近 ${days} 天新建 Issue`}
+                      value={number(data.metrics.issuesOpened)}
+                      icon={<MessageCircle size={20} />}
+                      note={`${data.metrics.unansweredIssues} 个已记录的 Issue 待回复`}
+                      tone="green"
+                    />
+                    <Stat
+                      title={`近 ${days} 天合并 PR`}
+                      value={number(data.metrics.prsMerged)}
+                      icon={<GitPullRequest size={20} />}
+                      note={`${data.metrics.awaitingReview} 个已记录的 PR 待评审`}
+                      tone="blue"
+                    />
+                    <Stat
+                      title="最近记录的正式版"
+                      value={data.metrics.latestRelease?.tag_name ?? '—'}
+                      icon={<Tag size={20} />}
+                      note={data.metrics.latestRelease?.full_name ?? '收到发布事件后显示'}
+                      tone="purple"
+                    />
+                  </section>
                   <div className="chart-grid">
                     <section className="panel">
                       <div className="panel-header">
                         <div>
                           <h2>Star 总量趋势</h2>
-                          <p>初始基线与每日汇总 · 最近上报值延续至次日</p>
+                          <p>每日最近上报值 · 今日随事件实时更新</p>
                         </div>
                         <div className="range-switch">
                           {[7, 30, 90].map((n) => (
@@ -646,13 +696,19 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                           ))}
                         </div>
                       </div>
-                      <TrendChart history={data.history} />
+                      <TrendChart history={data.history} markers={data.releaseMarkers} />
+                      <div className="chart-legend">
+                        <span>
+                          <i className="legend-dot purple" />
+                          版本发布（含预发布）
+                        </span>
+                      </div>
                     </section>
                     <section className="panel">
                       <div className="panel-header">
                         <div>
                           <h2>每日净变化</h2>
-                          <p>近 14 天 · 同一用户反向操作相互抵消</p>
+                          <p>北京时间自然日 · 同一用户反向操作相互抵消</p>
                         </div>
                       </div>
                       <ChangesChart history={data.history} />
@@ -724,12 +780,31 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                     </div>
                     <p className="info-note">
                       <HelpCircle size={16} />
-                      暂停期间收到的 Star 事件会忽略，恢复后只记录之后送达的变化。无法补回历史 Star
-                      名单。
+                      暂停期间所有监控维度都停止记录，恢复后只记录之后送达的变化。
                     </p>
                   </>
                 ))}
-              {(view === 'activity' || view === 'overview') && (
+              {view === 'data' && (
+                <Monitoring
+                  repo={repo}
+                  days={days}
+                  metrics={data.metrics}
+                  history={data.history}
+                  repositories={repositories}
+                />
+              )}
+              {view === 'activity' && (
+                <ActivityFeed
+                  data={data}
+                  category={category}
+                  onCategory={(value) => {
+                    setCategory(value);
+                    setPage(1);
+                  }}
+                  onPage={setPage}
+                />
+              )}
+              {(view === 'overview' || (view === 'activity' && !!summary)) && (
                 <Changes
                   data={data}
                   summary={summary}
@@ -750,8 +825,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <section className="panel snapshot-panel">
                   <div className="panel-header">
                     <div>
-                      <h2>每日汇总与历史</h2>
-                      <p>北京时间 · 最近 100 份记录</p>
+                      <h2>历史快照与旧汇总</h2>
+                      <p>仅保留升级前的记录 · 新事件直接参与实时统计</p>
                     </div>
                   </div>
                   {data.summaries.length ? (
@@ -802,21 +877,15 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       </table>
                     </div>
                   ) : (
-                    <p className="small-empty">连接 Webhook 后生成初始基线，每晚自动汇总。</p>
+                    <p className="small-empty">
+                      暂无旧快照。当前图表直接从事件计算，无需等待夜间汇总。
+                    </p>
                   )}
                 </section>
               )}
-              {view === 'settings' && settings && (
+              {view === 'settings' && (
                 <SettingsView
-                  settings={settings}
-                  busy={busy}
                   onManageProjects={() => setView('repositories')}
-                  onSave={async (hour) => {
-                    await action(
-                      () => api('/settings', { method: 'PATCH', body: { dailyHour: hour } }),
-                      '汇总计划已保存',
-                    );
-                  }}
                   onPassword={async (currentPassword, password) => {
                     await api('/auth/password', {
                       method: 'POST',
@@ -903,7 +972,7 @@ function EmptyProjects({ onAdd }: { onAdd: () => void }) {
       </div>
       <h2>从第一个项目开始</h2>
       <p>
-        添加仓库并连接 Star Webhook，
+        添加仓库并连接 GitHub Webhook，
         <br />
         为每一份关注留下记录。
       </p>
@@ -926,11 +995,7 @@ function AddRepository({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   return (
-    <Dialog
-      title="添加监控项目"
-      subtitle="填写仓库，下一步连接 GitHub Star Webhook。"
-      onClose={onClose}
-    >
+    <Dialog title="添加监控项目" subtitle="填写仓库，下一步连接 GitHub Webhook。" onClose={onClose}>
       <form
         onSubmit={async (e) => {
           e.preventDefault();
@@ -1069,26 +1134,41 @@ function WebhookDialog({
           <a href={config.settingsUrl} target="_blank" rel="noreferrer">
             仓库 Settings → Webhooks <ExternalLink size={12} />
           </a>
-          ，点击 <strong>Add webhook</strong>。
+          ，新增或编辑现有 Webhook。已有地址和 Secret 可继续使用。
         </li>
         <li>
           粘贴上方 <strong>Payload URL</strong> 与 <strong>Secret</strong>；Content type 选择{' '}
           <strong>application/json</strong>，保持 <strong>Enable SSL verification</strong>。
         </li>
         <li>
-          选择 <strong>Let me select individual events</strong>，只勾选 <strong>Stars</strong>；勾选{' '}
-          <strong>Active</strong>，保存。
+          选择 <strong>Let me select individual events</strong>，勾选下面需要的事件，再勾选{' '}
+          <strong>Active</strong> 并保存。
         </li>
         <li>
           等待此处显示已收到签名事件。若未连接，查看 GitHub 的 <strong>Recent Deliveries</strong>
           ；修改 Secret 后可重新投递 Ping。
         </li>
       </ol>
+      <div className="webhook-event-list" aria-label="支持的 Webhook 事件">
+        {webhookEvents.map((item) => (
+          <div key={item.event}>
+            <span>
+              <strong>{item.label}</strong>
+              <small>{item.feature}</small>
+            </span>
+            <span
+              className={`pill ${project?.receivedEvents?.includes(item.event) ? 'green' : 'neutral'}`}
+            >
+              {project?.receivedEvents?.includes(item.event) ? '已收到' : '待事件'}
+            </span>
+          </div>
+        ))}
+      </div>
       <div className="dialog-tip">
         <HelpCircle size={16} />
         <span>
-          记录从连接之后开始；不会读取历史 Star 名单。总量取最近收到的 Webhook
-          上报值。没有新事件时，上报时间不会更新。
+          只记录启用后收到的事件。总量取最近上报值；Issue / PR
+          列表只包含收到过事件的条目。每日图表按北京时间实时计算。
         </span>
       </div>
       {confirm ? (
@@ -1173,14 +1253,17 @@ function RepoCard({ project: r, onConfigure }: { project: RepoSummary; onConfigu
           </strong>
         </div>
         <div>
-          <span>已记录事件</span>
-          <strong>{number(r.event_count)}</strong>
+          <span>最近上报 Forks</span>
+          <strong>
+            <GitFork size={16} />
+            {r.current_forks === null ? '—' : number(r.current_forks)}
+          </strong>
         </div>
       </div>
       <p className="hook-timestamp">
         总量上报：{time(r.total_reported_at)}
         <br />
-        最近 Star 事件：{time(r.last_star_at)}
+        已记录 {number(r.event_count)} 条事件 · 最近收到 {time(r.last_received_at)}
       </p>
       <div className="repo-card-footer">
         <span>
@@ -1215,15 +1298,19 @@ function Changes({
     <section className="panel changes-panel">
       <div className="panel-header">
         <div>
-          <h2>{summary ? '汇总中的用户净变化' : 'Star 事件记录'}</h2>
+          <h2>{summary ? '历史名单' : 'Star 事件记录'}</h2>
           <p>
             {summary
-              ? '同一用户在汇总期间的反向操作相互抵消'
+              ? '保留原快照或汇总时的统计口径'
               : `最近 ${days} 天收到的事件 · 同一用户可有多次操作`}
           </p>
         </div>
         <div className="select-wrap snapshot-select">
-          <select aria-label="选择汇总" value={summary} onChange={(e) => onSummary(e.target.value)}>
+          <select
+            aria-label="选择历史记录"
+            value={summary}
+            onChange={(e) => onSummary(e.target.value)}
+          >
             <option value="">实时事件记录</option>
             {data.summaries.map((s) => (
               <option key={s.id} value={s.id}>
@@ -1345,7 +1432,7 @@ function Changes({
           <h3>暂无变化记录</h3>
           <p>
             {summary
-              ? '这份汇总没有净变化。初始基线只保存总量。'
+              ? '这份历史记录没有名单变化。初始基线只保存总量。'
               : '连接 Webhook 后，新增或取消 Star 的事件会出现在这里。'}
           </p>
         </div>
@@ -1384,66 +1471,20 @@ function Stat({
   );
 }
 function SettingsView({
-  settings,
   onManageProjects,
-  busy,
-  onSave,
   onPassword,
 }: {
-  settings: Settings;
   onManageProjects: () => void;
-  busy: boolean;
-  onSave: (hour: number) => Promise<void>;
   onPassword: (current: string, password: string) => Promise<void>;
 }) {
-  const [hour, setHour] = useState(settings.dailyHour);
   const [current, setCurrent] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [changing, setChanging] = useState(false);
   const [error, setError] = useState('');
-  useEffect(() => setHour(settings.dailyHour), [settings.dailyHour]);
   return (
     <div className="settings-grid">
       <div>
-        <section className="panel settings-panel">
-          <div className="settings-title">
-            <span className="settings-icon">
-              <Moon size={21} />
-            </span>
-            <div>
-              <h2>每日汇总计划</h2>
-              <p>在夜晚记录项目，让白天留给创造。</p>
-            </div>
-          </div>
-          <label htmlFor="daily-hour">每日汇总时间</label>
-          <div className="schedule-input">
-            <select id="daily-hour" value={hour} onChange={(e) => setHour(Number(e.target.value))}>
-              {Array.from({ length: 24 }, (_, i) => (
-                <option key={i} value={i}>
-                  {String(i).padStart(2, '0')}:00
-                </option>
-              ))}
-            </select>
-            <span>北京时间 · Asia/Shanghai（UTC+8）</span>
-          </div>
-          <p className="field-note">
-            定时器每分钟检查一次。按上次汇总到本次截止时间内收到的事件计算净变化，同一用户在期间新增后又取消会相互抵消；总量取最近一次
-            Webhook 上报值。修改时间从下一份汇总生效。
-          </p>
-          <p className="field-note">
-            最近定时触发：
-            {settings.lastScheduledAt ? time(settings.lastScheduledAt, true) : '尚未记录到'}
-          </p>
-          <button
-            className="button primary"
-            disabled={busy || hour === settings.dailyHour}
-            onClick={() => void onSave(hour)}
-          >
-            <Check size={16} />
-            保存计划
-          </button>
-        </section>
         <section className="panel settings-panel">
           <div className="settings-title">
             <span className="settings-icon">
@@ -1532,13 +1573,13 @@ function SettingsView({
             <h2>GitHub 连接</h2>
           </div>
           <p className="field-note">
-            每个仓库配置一次 Star Webhook。需要该仓库的管理员权限；公开和私有仓库均可使用。
+            每个仓库配置一次 Webhook。需要该仓库的管理员权限；公开和私有仓库均可使用。
           </p>
           <div className="webhook-guide">
             <strong>收到事件，立即记录</strong>
             <p>
               添加项目后复制 Payload URL 和 Secret 到 GitHub → 仓库 Settings → Webhooks。选择
-              application/json、Stars 和 Active，保留 SSL 验证。
+              application/json，勾选所需事件及 Active，保留 SSL 验证。
             </p>
             <button className="button secondary" onClick={onManageProjects}>
               管理项目 Webhook
@@ -1549,25 +1590,20 @@ function SettingsView({
             Deliveries 中手动 Redeliver；重复投递不会重复计数。
           </p>
         </section>
-        <section className="panel settings-panel future-panel">
-          <span className="eyebrow">ROOM TO GROW</span>
-          <h2>不止于 Star</h2>
-          <p className="field-note">第一版先专注关注度。更多维度，留给未来的项目故事。</p>
-          <div className="future-metric">
-            <Star size={17} />
-            <span>Star 关注度</span>
-            <span className="pill green">已开启</span>
+        <section className="panel settings-panel">
+          <div className="settings-title">
+            <Activity size={23} />
+            <h2>事件驱动，实时统计</h2>
           </div>
-          <div className="future-metric muted">
-            <GitFork size={17} />
-            <span>Fork 与贡献</span>
-            <span className="tiny">后续扩展</span>
-          </div>
-          <div className="future-metric muted">
-            <Bell size={17} />
-            <span>Issue 与 Release</span>
-            <span className="tiny">后续扩展</span>
-          </div>
+          <p className="field-note">
+            收到 Webhook 后立即保存并更新统计。每日图表按北京时间 00:00—24:00
+            分组，同一用户当天新增后又取消 Star 会相互抵消。没有夜间任务，也无需设置汇总时间。
+          </p>
+          <p className="field-note">
+            Fork 只记录新增；Issue / PR 待办仅覆盖已收到的条目。新模块请在 GitHub 编辑现有
+            Webhook，增加勾选 Forks、Issues、Issue comments、Pull requests、Pull request
+            reviews、Releases。
+          </p>
         </section>
       </div>
     </div>

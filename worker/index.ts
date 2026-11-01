@@ -14,7 +14,8 @@ import { dashboard } from './dashboard';
 import { parseRepository } from './projects';
 import { sealWebhookSecret, secretStatement } from './webhook-secrets';
 import { newWebhookSecret, receiveWebhook } from './webhooks';
-import { summarizeDue } from './summaries';
+import { monitoring } from './monitoring';
+import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
 
 async function body(request: Request): Promise<Record<string, unknown>> {
@@ -121,32 +122,9 @@ async function api(request: Request, env: Env) {
     return json({ ok: true }, 200, { 'Set-Cookie': await createSession(env.DB, request) });
   }
   if (path === '/api/dashboard' && method === 'GET') return json(await dashboard(env.DB, url));
-  if (path === '/api/settings' && method === 'GET') {
-    const rows = await env.DB.prepare(
-      "SELECT key,value FROM monitor_settings WHERE key IN ('daily_hour','last_cron_at')",
-    ).all<{ key: string; value: string }>();
-    const values = Object.fromEntries(rows.results.map((row) => [row.key, row.value]));
-    return json({
-      dailyHour: Number(values.daily_hour ?? 23),
-      timezone: 'Asia/Shanghai',
-      lastScheduledAt: Number(values.last_cron_at) || null,
-      monitors: [{ id: 'stars', source: 'webhook' }],
-    });
-  }
-  if (path === '/api/settings' && method === 'PATCH') {
-    const { dailyHour } = await body(request);
-    if (
-      typeof dailyHour !== 'number' ||
-      !Number.isInteger(dailyHour) ||
-      dailyHour < 0 ||
-      dailyHour > 23
-    )
-      throw new AppError(400, '汇总时间应为 0–23 时。');
-    await env.DB.prepare("UPDATE monitor_settings SET value = ? WHERE key = 'daily_hour'")
-      .bind(String(dailyHour))
-      .run();
-    return json({ ok: true });
-  }
+  if (path === '/api/monitoring' && method === 'GET') return json(await monitoring(env.DB, url));
+  if (path === '/api/settings' && method === 'GET')
+    return json({ timezone: 'Asia/Shanghai', monitors: webhookEvents });
   if (path === '/api/repositories' && method === 'POST') {
     const data = await body(request);
     const name = parseRepository(data.repository);
@@ -247,14 +225,5 @@ export default {
     if (new URL(request.url).protocol === 'https:')
       secured.headers.set('Strict-Transport-Security', 'max-age=31536000');
     return secured;
-  },
-  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext) {
-    await initDB(env.DB);
-    await env.DB.prepare(
-      "INSERT INTO monitor_settings(key,value) VALUES ('last_cron_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    )
-      .bind(String(nowSeconds()))
-      .run();
-    await summarizeDue(env.DB);
   },
 } satisfies ExportedHandler<Env>;

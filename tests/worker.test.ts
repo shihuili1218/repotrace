@@ -4,11 +4,15 @@ import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test'
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../worker';
 import { initDB, migrations } from '../worker/db';
-import { getWebhookCredentials } from '../worker/webhook-secrets';
-import { latestDue, localDay, summarizeDue, summarizePeriod } from '../worker/summaries';
+import {
+  getWebhookCredentials,
+  sealWebhookSecret,
+  secretStatement,
+} from '../worker/webhook-secrets';
+import { localDay, localMidnight } from '../worker/time';
 import { parseRepository } from '../worker/projects';
 import { nowSeconds, type Env } from '../worker/types';
-import type { Dashboard, WebhookConfig } from '../shared/types';
+import type { Dashboard, MonitorData, WebhookConfig } from '../shared/types';
 
 const env = bindings as unknown as Env;
 const password = 'a-secure-test-password-2026';
@@ -68,7 +72,9 @@ async function signed(
       description: 'A project',
       language: 'TypeScript',
       stargazers_count: 10,
+      forks_count: 2,
     },
+    sender: { id: 1, login: 'octocat' },
     ...(event === 'star'
       ? {
           action: 'created',
@@ -121,8 +127,7 @@ beforeEach(async () => {
       'DELETE FROM sessions',
       'DELETE FROM admin',
       'DELETE FROM login_limits',
-      "DELETE FROM monitor_settings WHERE key!='daily_hour'",
-      "UPDATE monitor_settings SET value='23' WHERE key='daily_hour'",
+      'DELETE FROM monitor_settings',
     ].map((sql) => env.DB.prepare(sql)),
   );
 });
@@ -134,7 +139,7 @@ describe('private admin workspace', () => {
       authenticated: false,
       setupProtected: false,
     });
-    for (const endpoint of ['/dashboard', '/settings']) {
+    for (const endpoint of ['/dashboard', '/settings', '/monitoring?type=issues']) {
       const r = await request(endpoint);
       expect(r.status).toBe(401);
       expect(r.headers.get('Cache-Control')).toBe('no-store');
@@ -343,7 +348,7 @@ describe('signed GitHub deliveries', () => {
     const data = await dashboard(session);
     expect(data.repositories[0]).toMatchObject({ github_id: 100, current_total: 0 });
     expect(data.repositories[0].last_received_at).toBeTypeOf('number');
-    expect(data.summaries[0]).toMatchObject({ kind: 'baseline', total: 0, added: 0, removed: 0 });
+    expect(data.summaries).toEqual([]);
   });
   it('rejects missing/wrong signatures and changes to the signed bytes without writing data', async () => {
     const config = await add(await setup());
@@ -471,153 +476,6 @@ describe('signed GitHub deliveries', () => {
   });
 });
 
-describe('nightly summaries and charts', () => {
-  const end = latestDue(nowSeconds(), 23);
-  const at = end - 3600; // 22:00 Shanghai, immediately before the last daily cutoff
-  it('computes net users by stable ID, cancels opposite actions and keeps latest usernames', async () => {
-    const session = await setup();
-    const config = await add(session);
-    await signed(config, 'ping', {}, crypto.randomUUID(), at);
-    for (const [offset, id, login, action] of [
-      [1, 1, 'original', 'created'],
-      [2, 1, 'renamed', 'deleted'],
-      [3, 2, 'second', 'deleted'],
-      [4, 2, 'second', 'created'],
-      [5, 3, 'third-old', 'created'],
-      [6, 3, 'third-new', 'created'],
-      [7, 4, 'fourth', 'deleted'],
-    ] as const)
-      await signed(
-        config,
-        'star',
-        { action, sender: { id, login } },
-        crypto.randomUUID(),
-        at + offset,
-      );
-    await summarizeDue(env.DB, end - 1);
-    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(0);
-    await summarizeDue(env.DB, end);
-    await summarizeDue(env.DB, end + 60);
-    const summary = await env.DB.prepare("SELECT * FROM summaries WHERE kind='daily'").first<{
-      id: string;
-      added: number;
-      removed: number;
-      event_count: number;
-      period_start: number;
-      period_end: number;
-    }>();
-    expect(summary).toMatchObject({
-      added: 1,
-      removed: 1,
-      event_count: 7,
-      period_start: at,
-      period_end: end,
-    });
-    const changes = await env.DB.prepare('SELECT * FROM summary_changes WHERE summary_id=?')
-      .bind(summary!.id)
-      .all();
-    expect(changes.results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ user_id: 3, login: 'third-new', kind: 'added' }),
-        expect.objectContaining({ user_id: 4, kind: 'removed' }),
-      ]),
-    );
-    expect(changes.results).toHaveLength(2);
-    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
-  });
-  it('uses half-open windows, catches up quiet days and carries forward the last reported total', async () => {
-    const config = await add(await setup());
-    await signed(config, 'ping', {}, crypto.randomUUID(), at);
-    await signed(config, 'star', {}, crypto.randomUUID(), end);
-    await summarizeDue(env.DB, end + 86400 * 2);
-    const list = await env.DB.prepare(
-      "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
-    ).all();
-    expect(list.results).toHaveLength(3);
-    expect(list.results.map((s) => s.event_count)).toEqual([0, 1, 0]);
-    expect(list.results.map((s) => s.total)).toEqual([10, 10, 10]);
-    expect(list.results.map((s) => s.added)).toEqual([0, 1, 0]);
-  });
-  it('recomputes a boundary window when a received event commits after its first summary', async () => {
-    const config = await add(await setup());
-    await signed(config, 'ping', {}, crypto.randomUUID(), at);
-    await summarizeDue(env.DB, end);
-    await signed(config, 'star', {}, crypto.randomUUID(), end - 1);
-    await summarizeDue(env.DB, end + 60);
-    expect(
-      (await env.DB.prepare("SELECT added FROM summaries WHERE kind='daily'").first())?.added,
-    ).toBe(1);
-  });
-  it('preserves continuous windows when the schedule moves and does not summarize before connection', async () => {
-    const session = await setup();
-    const config = await add(session);
-    await summarizeDue(env.DB, end + 86400);
-    expect(await scalar('SELECT COUNT(*) AS count FROM summaries')).toBe(0);
-    await signed(config, 'ping', {}, crypto.randomUUID(), at);
-    await summarizeDue(env.DB, end);
-    expect((await request('/settings', 'PATCH', { dailyHour: 22 }, session)).status).toBe(200);
-    await signed(config, 'star', {}, crypto.randomUUID(), end + 100);
-    await summarizeDue(env.DB, end + 23 * 3600);
-    const list = await env.DB.prepare(
-      "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
-    ).all();
-    expect(list.results).toHaveLength(2);
-    expect(list.results[1]).toMatchObject({
-      period_start: end,
-      period_end: end + 23 * 3600,
-      added: 1,
-    });
-  });
-  it('uses Beijing cutoff boundaries across midnight and validates settings', async () => {
-    expect(localDay(Date.parse('2026-10-30T16:00:00Z') / 1000)).toBe('2026-10-31');
-    expect(latestDue(end - 1, 23)).toBe(end - 86400);
-    expect(latestDue(end, 23)).toBe(end);
-    const session = await setup();
-    for (const hour of [-1, 24, 3.5, '22'])
-      expect((await request('/settings', 'PATCH', { dailyHour: hour }, session)).status).toBe(400);
-  });
-  it('paginates and filters live events and summary users without leaking secret data', async () => {
-    const session = await setup();
-    const config = await add(session);
-    for (let id = 1; id <= 33; id++)
-      await signed(config, 'star', {
-        action: id === 33 ? 'deleted' : 'created',
-        sender: { id, login: `user-${id}` },
-      });
-    const first = await dashboard(session);
-    expect(first.changes).toHaveLength(30);
-    expect(first.changeTotal).toBe(33);
-    expect((await dashboard(session, '?page=2')).changes).toHaveLength(3);
-    expect((await dashboard(session, '?kind=removed')).changeTotal).toBe(1);
-    await summarizePeriod(env.DB, config.id, nowSeconds() - 10, nowSeconds() + 10);
-    const daily = await env.DB.prepare("SELECT id FROM summaries WHERE kind='daily'").first<{
-      id: string;
-    }>();
-    expect((await dashboard(session, `?summary=${daily!.id}&kind=added`)).changeTotal).toBe(32);
-    expect((await request('/dashboard?repo=missing', 'GET', undefined, session)).status).toBe(404);
-    expect((await request('/dashboard?days=99', 'GET', undefined, session)).status).toBe(400);
-  });
-  it('runs scheduled summaries with no GitHub calls and reports the cron heartbeat', async () => {
-    const session = await setup();
-    const config = await add(session);
-    await signed(config, 'ping', {}, crypto.randomUUID(), at);
-    const outgoing = vi
-      .spyOn(globalThis, 'fetch')
-      .mockRejectedValue(new Error('unexpected network'));
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(end * 1000);
-    await worker.scheduled({} as ScheduledController, env, createExecutionContext());
-    clock.mockRestore();
-    expect(outgoing).not.toHaveBeenCalled();
-    expect(
-      (await env.DB.prepare("SELECT value FROM monitor_settings WHERE key='last_cron_at'").first())
-        ?.value,
-    ).toBe(String(end));
-    expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
-    const chart = await dashboard(session);
-    expect(chart.history.find((row) => row.day === localDay(end))?.total).toBe(10);
-  });
-});
-
 it('migrates legacy history and admin data, deleting all saved PATs and pending polling jobs', async () => {
   const legacy = (bindings as unknown as { LEGACY_DB: D1Database }).LEGACY_DB;
   await legacy.batch([
@@ -718,71 +576,481 @@ it('rolls back the delivery marker if recording an event fails so the same deliv
   expect(await scalar('SELECT COUNT(*) AS count FROM star_events')).toBe(1);
 });
 
-it('moving the cutoff later keeps one immutable summary per day and a continuous next window', async () => {
-  const session = await setup();
-  const config = await add(session);
-  const end = latestDue(nowSeconds(), 22);
-  const start = end - 3600;
-  await request('/settings', 'PATCH', { dailyHour: 22 }, session);
-  await signed(config, 'ping', {}, crypto.randomUUID(), start);
-  await summarizeDue(env.DB, end);
-  await request('/settings', 'PATCH', { dailyHour: 23 }, session);
-  await signed(config, 'star', {}, crypto.randomUUID(), end + 1800);
-  await summarizeDue(env.DB, end + 3600);
-  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(1);
-  await summarizeDue(env.DB, end + 86400 + 3600);
-  const list = await env.DB.prepare(
-    "SELECT * FROM summaries WHERE kind='daily' ORDER BY period_end",
-  ).all();
-  expect(list.results).toHaveLength(2);
-  expect(list.results[0]).toMatchObject({ period_start: start, period_end: end, added: 0 });
-  expect(list.results[1]).toMatchObject({
-    period_start: end,
-    period_end: end + 25 * 3600,
-    added: 1,
-  });
-  // A stale invocation cannot change the first day's stored bounds or its members.
-  await summarizePeriod(env.DB, config.id, start, end + 3600);
-  expect(
-    await env.DB.prepare('SELECT * FROM summaries WHERE period_end=?').bind(end).first(),
-  ).toMatchObject({ period_start: start, added: 0, event_count: 0 });
+const iso = (at: number) => new Date(at * 1000).toISOString();
+const item = (id = 1001, patch: Record<string, unknown> = {}) => ({
+  id,
+  number: id - 1000,
+  title: `Item ${id}`,
+  user: { id: 10, login: 'author' },
+  state: 'open',
+  draft: false,
+  labels: [{ name: 'bug' }],
+  created_at: iso(nowSeconds() - 7200),
+  updated_at: iso(nowSeconds() - 10),
+  closed_at: null,
+  ...patch,
 });
+const release = (id = 2001, patch: Record<string, unknown> = {}) => ({
+  id,
+  tag_name: `v1.${id - 2000}.0`,
+  name: `Release ${id}`,
+  author: { id: 10, login: 'author' },
+  draft: false,
+  prerelease: false,
+  created_at: iso(nowSeconds() - 120),
+  published_at: iso(nowSeconds() - 60),
+  ...patch,
+});
+async function monitor(session: string, type: string, query = '') {
+  const response = await request(`/monitoring?type=${type}${query}`, 'GET', undefined, session);
+  expect(response.status).toBe(200);
+  return response.json<MonitorData>();
+}
 
-it('bounds cron work across multiple projects and advances waiting projects on later invocations', async () => {
-  const session = await setup();
-  const end = latestDue(nowSeconds(), 23);
-  for (let i = 0; i < 7; i++) {
-    const config = await add(session, `owner/repo${i}`);
+describe('live analytics without scheduled work', () => {
+  it('updates net changes immediately by Beijing calendar date and cancels opposite actions per stable user', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const midnight = localMidnight(nowSeconds());
+    await signed(config, 'star', {}, crypto.randomUUID(), midnight - 1);
     await signed(
       config,
-      'ping',
-      { repository: { id: 100 + i, full_name: `owner/repo${i}`, stargazers_count: i } },
+      'star',
+      { action: 'deleted', starred_at: null },
       crypto.randomUUID(),
-      end - 3600,
+      midnight,
     );
-  }
-  await summarizeDue(env.DB, end);
-  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(6);
-  await summarizeDue(env.DB, end + 60);
-  expect(await scalar("SELECT COUNT(*) AS count FROM summaries WHERE kind='daily'")).toBe(7);
+    await signed(
+      config,
+      'star',
+      { sender: { id: 2, login: 'old-name' } },
+      crypto.randomUUID(),
+      midnight,
+    );
+    await signed(
+      config,
+      'star',
+      { action: 'deleted', sender: { id: 2, login: 'new-name' } },
+      crypto.randomUUID(),
+      midnight,
+    );
+    const data = await dashboard(session);
+    expect(data.history.find((r) => r.day === localDay(midnight - 1))).toMatchObject({
+      added: 1,
+      removed: 0,
+    });
+    expect(data.history.at(-1)).toMatchObject({ added: 0, removed: 1, total: 10 });
+    expect(data.eventCounts).toEqual({ added: 2, removed: 2 });
+    expect(data.summaries).toHaveLength(0);
+    expect('scheduled' in worker).toBe(false);
+    expect((await request('/settings', 'PATCH', { dailyHour: 23 }, session)).status).toBe(404);
+    expect(await (await request('/settings', 'GET', undefined, session)).json()).not.toHaveProperty(
+      'dailyHour',
+    );
+  });
+  it('carries observed totals over quiet days and uses optional counts without inventing zero', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'ping', {}, crypto.randomUUID(), nowSeconds() - 4 * 86400);
+    await signed(config, 'issues', {
+      action: 'opened',
+      issue: item(),
+      repository: { id: 100, full_name: 'owner/repo' },
+    });
+    const data = await dashboard(session);
+    expect(data.history.slice(-5).map((r) => [r.total, r.fork_total])).toEqual(
+      Array.from({ length: 5 }, () => [10, 2]),
+    );
+    expect(data.repositories[0]).toMatchObject({ current_total: 10, current_forks: 2 });
+    expect(data.repositories[0].receivedEvents).toContain('issues');
+    expect(data.summaries).toHaveLength(0);
+  });
+  it('paginates and filters the unified activity feed and star list', async () => {
+    const session = await setup();
+    const config = await add(session);
+    for (let id = 1; id <= 32; id++)
+      await signed(config, 'star', { sender: { id, login: `user-${id}` } });
+    await signed(config, 'issues', { action: 'opened', issue: item() });
+    expect((await dashboard(session)).timeline).toHaveLength(30);
+    expect((await dashboard(session, '?page=2')).timeline).toHaveLength(3);
+    expect((await dashboard(session, '?category=issue')).timelineTotal).toBe(1);
+    expect((await dashboard(session)).changeTotal).toBe(32);
+    expect((await request('/dashboard?category=push', 'GET', undefined, session)).status).toBe(400);
+  });
 });
 
-it('does not rewrite a completed summary when no new delivery can affect it', async () => {
-  const config = await add(await setup());
-  const end = latestDue(nowSeconds(), 23);
-  await signed(config, 'ping', {}, crypto.randomUUID(), end - 3600);
-  await summarizeDue(env.DB, end);
-  await env.DB.prepare("UPDATE summaries SET computed_at=1 WHERE kind='daily'").run();
-  await summarizeDue(env.DB, end + 60);
+describe('fork growth', () => {
+  it('records the fork owner and repository once and updates reported totals', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const delivery = crypto.randomUUID();
+    const payload = {
+      forkee: {
+        id: 501,
+        full_name: 'forker/project',
+        owner: { id: 50, login: 'forker' },
+        created_at: iso(nowSeconds()),
+      },
+    };
+    expect((await signed(config, 'fork', payload, delivery)).status).toBe(200);
+    await signed(config, 'fork', payload, delivery);
+    await signed(config, 'fork', payload);
+    const data = await dashboard(session);
+    const list = await monitor(session, 'forks');
+    expect(list.forks).toHaveLength(1);
+    expect(list.forks[0]).toMatchObject({ owner_login: 'forker', full_name: 'forker/project' });
+    expect(data.metrics.forks).toBe(1);
+    expect(data.history.at(-1)?.fork_new).toBe(1);
+  });
+  it('rejects invalid fork identities and unsafe links', async () => {
+    const config = await add(await setup());
+    expect(
+      (
+        await signed(config, 'fork', {
+          forkee: {
+            id: 501,
+            full_name: 'https://evil.example/a/b',
+            owner: { id: 50, login: 'forker' },
+          },
+        })
+      ).status,
+    ).toBe(400);
+    expect(await scalar('SELECT COUNT(*) AS count FROM forks')).toBe(0);
+  });
+});
+
+describe('issues and pull requests', () => {
+  it('tracks issues, labels, human first response, closing and reopening', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const issue = item();
+    expect((await signed(config, 'issues', { action: 'opened', issue })).status).toBe(200);
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue,
+      comment: { user: { id: 10, login: 'author' }, created_at: iso(nowSeconds() - 500) },
+    });
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue,
+      comment: {
+        user: { id: 20, login: 'robot[bot]', type: 'Bot' },
+        created_at: iso(nowSeconds() - 400),
+      },
+    });
+    expect((await dashboard(session)).metrics.unansweredIssues).toBe(1);
+    const replyAt = nowSeconds() - 300;
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue,
+      comment: { user: { id: 30, login: 'helper' }, created_at: iso(replyAt) },
+    });
+    expect((await dashboard(session)).metrics).toMatchObject({
+      openIssues: 1,
+      unansweredIssues: 0,
+      issuesOpened: 1,
+      avgReplySeconds: replyAt - Date.parse(issue.created_at) / 1000,
+    });
+    const list = await monitor(session, 'issues', '&label=bug');
+    expect(list.items[0].labels).toEqual(['bug']);
+    expect(list.labels).toEqual(['bug']);
+    await signed(config, 'issues', {
+      action: 'closed',
+      issue: {
+        ...issue,
+        state: 'closed',
+        updated_at: iso(nowSeconds()),
+        closed_at: iso(nowSeconds()),
+      },
+    });
+    expect((await dashboard(session)).metrics).toMatchObject({ openIssues: 0, issuesClosed: 1 });
+    expect((await monitor(session, 'issues', '&state=open')).total).toBe(0);
+    await signed(config, 'issues', {
+      action: 'reopened',
+      issue: { ...issue, updated_at: iso(nowSeconds() + 1) },
+    });
+    expect((await monitor(session, 'issues', '&state=open')).total).toBe(1);
+  });
+  it('ignores out-of-order stale item state but can capture an earlier first response', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const issue = item();
+    const replyAt = nowSeconds() - 500;
+    await signed(config, 'issues', {
+      action: 'closed',
+      issue: { ...issue, state: 'closed', updated_at: iso(nowSeconds()) },
+    });
+    await signed(config, 'issues', { action: 'opened', issue });
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue,
+      comment: { user: { id: 30, login: 'helper' }, created_at: iso(replyAt) },
+    });
+    const stored = (await monitor(session, 'issues')).items[0];
+    expect(stored.state).toBe('closed');
+    expect(stored.first_reply_at).toBe(replyAt);
+  });
+  it('distinguishes PR merging from closing and records review state, contributors and merge duration', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const pr = item(1002, { head: { sha: 'a'.repeat(40) } });
+    await signed(config, 'pull_request', { action: 'opened', pull_request: pr });
+    expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
+    await signed(config, 'pull_request_review', {
+      action: 'submitted',
+      pull_request: pr,
+      review: {
+        state: 'approved',
+        user: { id: 30, login: 'reviewer' },
+        submitted_at: iso(nowSeconds() - 5),
+      },
+    });
+    expect((await monitor(session, 'pull_requests')).items[0].review_state).toBe('approved');
+    expect((await dashboard(session)).metrics.awaitingReview).toBe(0);
+    const mergedAt = nowSeconds();
+    const merged = {
+      ...pr,
+      state: 'closed',
+      merged: true,
+      merged_at: iso(mergedAt),
+      closed_at: iso(nowSeconds()),
+      updated_at: iso(nowSeconds()),
+    };
+    await signed(config, 'pull_request', { action: 'closed', pull_request: merged });
+    // PR issue comments must not turn a known merged PR into an ordinary closed issue.
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue: { ...pr, state: 'closed', updated_at: iso(nowSeconds() + 1), pull_request: {} },
+      comment: { user: { id: 30, login: 'reviewer' }, created_at: iso(nowSeconds()) },
+    });
+    expect((await monitor(session, 'issues')).total).toBe(0);
+    const list = await monitor(session, 'pull_requests', '&state=merged');
+    expect(list.total).toBe(1);
+    expect(list.contributors[0]).toMatchObject({ login: 'author', prs: 1, merged: 1 });
+    expect((await dashboard(session)).metrics).toMatchObject({
+      prsOpened: 1,
+      prsMerged: 1,
+      openPRs: 0,
+      avgMergeSeconds: mergedAt - Date.parse(pr.created_at) / 1000,
+    });
+    await signed(config, 'pull_request', {
+      action: 'closed',
+      pull_request: item(1003, { state: 'closed', closed_at: iso(nowSeconds()) }),
+    });
+    expect((await monitor(session, 'pull_requests', '&state=closed')).total).toBe(1);
+    expect((await dashboard(session)).metrics.prsMerged).toBe(1);
+  });
+  it('clears a previous review when new code arrives and handles PR comments as PR activity', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const pr = item(1002, { head: { sha: 'a'.repeat(40) } });
+    await signed(config, 'pull_request_review', {
+      action: 'submitted',
+      pull_request: pr,
+      review: {
+        state: 'approved',
+        user: { id: 30, login: 'reviewer' },
+        submitted_at: iso(nowSeconds() - 5),
+      },
+    });
+    await signed(config, 'pull_request', {
+      action: 'synchronize',
+      pull_request: { ...pr, head: { sha: 'b'.repeat(40) }, updated_at: iso(nowSeconds()) },
+    });
+    expect((await monitor(session, 'pull_requests')).items[0].review_state).toBeNull();
+    expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
+    expect((await dashboard(session, '?category=pull_request')).timelineTotal).toBe(2);
+  });
+  it('does not count a previously existing issue first observed through a comment as a new issue', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'issue_comment', {
+      action: 'created',
+      issue: item(),
+      comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+    });
+    expect((await dashboard(session)).metrics).toMatchObject({ issuesOpened: 0, openIssues: 1 });
+  });
+});
+
+describe('release history', () => {
+  it('tracks stable and prerelease versions, release markers and publishing once', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const source = release();
+    expect((await signed(config, 'release', { action: 'published', release: source })).status).toBe(
+      200,
+    );
+    await signed(config, 'release', { action: 'released', release: source });
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2002, { prerelease: true }),
+    });
+    const data = await dashboard(session);
+    expect(data.metrics.releasesPublished).toBe(2);
+    expect(data.metrics.latestRelease?.tag_name).toBe('v1.1.0');
+    expect(data.releaseMarkers).toHaveLength(2);
+    expect((await monitor(session, 'releases', '&state=stable')).total).toBe(1);
+    expect((await monitor(session, 'releases', '&state=prerelease')).total).toBe(1);
+  });
+  it('excludes drafts, unpublished and deleted versions from the latest version and markers', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'created',
+      release: release(2001, { draft: true, published_at: null }),
+    });
+    expect((await dashboard(session)).metrics.latestRelease).toBeNull();
+    expect((await monitor(session, 'releases', '&state=draft')).total).toBe(1);
+    const version = release(2002);
+    await signed(config, 'release', { action: 'published', release: version });
+    await signed(config, 'release', { action: 'unpublished', release: version });
+    expect((await dashboard(session)).metrics.latestRelease).toBeNull();
+    await signed(config, 'release', { action: 'deleted', release: version });
+    await signed(config, 'release', { action: 'edited', release: version });
+    expect((await monitor(session, 'releases', '&state=deleted')).total).toBe(1);
+    expect((await dashboard(session)).releaseMarkers).toHaveLength(0);
+  });
+});
+
+it('pauses all supported event types without losing delivery deduplication or cascading deletion', async () => {
+  const session = await setup();
+  const config = await add(session);
+  await request(`/repositories/${config.id}`, 'PATCH', { enabled: false }, session);
+  await signed(config, 'issues', { action: 'opened', issue: item() });
+  await signed(config, 'release', { action: 'published', release: release() });
+  expect(await scalar('SELECT COUNT(*) AS count FROM work_items')).toBe(0);
+  expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
+  expect(await scalar('SELECT COUNT(*) AS count FROM project_events')).toBe(0);
+  await request(`/repositories/${config.id}`, 'PATCH', { enabled: true }, session);
+  await signed(config, 'issues', { action: 'opened', issue: item() });
+  await request(`/repositories/${config.id}`, 'DELETE', {}, session);
+  for (const table of ['work_items', 'releases', 'forks', 'project_events', 'webhook_deliveries'])
+    expect(await scalar(`SELECT COUNT(*) AS count FROM ${table}`)).toBe(0);
+});
+
+it('upgrades the webhook/nightly version preserving encrypted secrets, raw events and historical summaries', async () => {
+  const db = (bindings as unknown as { WEBHOOK_V3_DB: D1Database }).WEBHOOK_V3_DB;
+  await db.batch([
+    db.prepare('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)'),
+    ...migrations[0].map((sql) => db.prepare(sql)),
+    ...migrations[2].map((sql) => db.prepare(sql)),
+    db.prepare('INSERT INTO schema_migrations VALUES (1),(2),(3)'),
+  ]);
+  const oldEnv = { ...env, DB: db };
+  const secret = 'retained-signing-secret';
+  await db
+    .prepare(
+      "INSERT INTO projects VALUES ('old',100,'owner/repo','Old project','TypeScript',1,100)",
+    )
+    .run();
+  await secretStatement(db, 'old', await sealWebhookSecret(oldEnv, 'old', secret)).run();
+  const at = nowSeconds() - 10;
+  await db.batch([
+    db.prepare("INSERT INTO monitor_settings VALUES ('last_cron_at','123')"),
+    db
+      .prepare(
+        "INSERT INTO webhook_deliveries(project_id,delivery_id,event_name,received_at,observed_total,recorded,processed) VALUES ('old','old-delivery','star',?,42,1,1)",
+      )
+      .bind(at),
+    db
+      .prepare(
+        "INSERT INTO star_events SELECT seq,'old',1,'octocat','added',NULL,? FROM webhook_deliveries",
+      )
+      .bind(at),
+    db
+      .prepare(
+        "INSERT INTO summaries(id,project_id,kind,source,day,period_start,period_end,computed_at,total,added) VALUES ('old-summary','old','daily','webhook',?,100,200,200,40,1)",
+      )
+      .bind(localDay(at)),
+    db.prepare("INSERT INTO summary_changes VALUES ('old-summary',1,'octocat','added',NULL,200)"),
+  ]);
+  await initDB(db);
+  await initDB(db);
+  expect((await getWebhookCredentials(oldEnv, 'old'))?.secret).toBe(secret);
+  expect(await db.prepare('SELECT COUNT(*) AS count FROM star_events').first('count')).toBe(1);
+  expect(await db.prepare('SELECT total FROM summaries').first('total')).toBe(40);
   expect(
-    (await env.DB.prepare("SELECT computed_at FROM summaries WHERE kind='daily'").first())
-      ?.computed_at,
-  ).toBe(1);
-  // A later-window event must not dirty this window either.
-  await signed(config, 'star', {}, crypto.randomUUID(), end + 10);
-  await summarizeDue(env.DB, end + 120);
+    await db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM monitor_settings WHERE key IN ('daily_hour','last_cron_at')",
+      )
+      .first('count'),
+  ).toBe(0);
   expect(
-    (await env.DB.prepare("SELECT computed_at FROM summaries WHERE kind='daily'").first())
-      ?.computed_at,
-  ).toBe(1);
+    (await db.prepare('SELECT current_forks FROM webhook_connections').first())?.current_forks,
+  ).toBeNull();
+});
+
+it('never treats an approval of an old commit as a current PR approval', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const pr = item(1002, { head: { sha: 'b'.repeat(40) } });
+  await signed(config, 'pull_request', { action: 'opened', pull_request: pr });
+  await signed(config, 'pull_request_review', {
+    action: 'submitted',
+    pull_request: pr,
+    review: {
+      state: 'approved',
+      commit_id: 'a'.repeat(40),
+      user: { id: 30, login: 'reviewer' },
+      submitted_at: iso(nowSeconds()),
+    },
+  });
+  expect((await monitor(session, 'pull_requests')).items[0].review_state).toBeNull();
+  expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
+});
+
+it('scopes and paginates item lists, validates filters and generates safe GitHub links', async () => {
+  const session = await setup();
+  const config = await add(session);
+  for (let i = 1; i <= 32; i++)
+    await signed(config, 'issues', {
+      action: 'opened',
+      issue: item(1000 + i, { html_url: 'javascript:alert(1)' }),
+    });
+  const second = await add(session, 'another/project');
+  await signed(second, 'issues', {
+    action: 'opened',
+    issue: item(2001),
+    repository: { id: 101, full_name: 'another/project' },
+  });
+  expect((await monitor(session, 'issues', `&repo=${config.id}`)).total).toBe(32);
+  expect((await monitor(session, 'issues', `&repo=${config.id}&page=2`)).items).toHaveLength(2);
+  expect((await dashboard(session, `?repo=${second.id}&category=issue`)).timeline[0].url).toBe(
+    'https://github.com/another/project/issues/1001',
+  );
+  for (const query of [
+    'type=invalid',
+    'type=issues&page=0',
+    'type=releases&state=invalid',
+    'type=issues&repo=missing',
+  ])
+    expect((await request(`/monitoring?${query}`, 'GET', undefined, session)).status).toBe(
+      query.includes('missing') ? 404 : 400,
+    );
+});
+
+it('keeps a changed PR head when an older approval payload is delivered later in the same second', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const updated = iso(nowSeconds() - 5);
+  const old = item(1002, { updated_at: updated, head: { sha: 'a'.repeat(40) } });
+  await signed(config, 'pull_request', { action: 'opened', pull_request: old });
+  await signed(config, 'pull_request', {
+    action: 'synchronize',
+    pull_request: { ...old, head: { sha: 'b'.repeat(40) } },
+  });
+  await signed(config, 'pull_request_review', {
+    action: 'submitted',
+    pull_request: old,
+    review: {
+      state: 'approved',
+      commit_id: 'a'.repeat(40),
+      user: { id: 30, login: 'reviewer' },
+      submitted_at: iso(nowSeconds() - 1),
+    },
+  });
+  expect((await monitor(session, 'pull_requests')).items[0].review_state).toBeNull();
+  expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
 });

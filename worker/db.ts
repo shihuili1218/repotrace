@@ -1,4 +1,4 @@
-// Versioned, additive migrations run on first API/cron access. No deployment-time SQL step.
+// Versioned, additive migrations run on first API/webhook access. No deployment-time SQL step.
 export const migrations = [
   [
     `CREATE TABLE IF NOT EXISTS admin (id INTEGER PRIMARY KEY CHECK(id = 1), hash TEXT NOT NULL, salt TEXT NOT NULL, iterations INTEGER NOT NULL)`,
@@ -81,6 +81,44 @@ export const migrations = [
     `DROP TABLE snapshots`,
     `DROP TABLE repositories`,
   ],
+  [
+    `ALTER TABLE webhook_deliveries ADD COLUMN observed_forks INTEGER`,
+    `ALTER TABLE webhook_connections ADD COLUMN current_forks INTEGER`,
+    `ALTER TABLE webhook_connections ADD COLUMN forks_reported_at INTEGER`,
+    `CREATE TABLE project_events (
+      delivery_seq INTEGER PRIMARY KEY REFERENCES webhook_deliveries(seq) ON DELETE CASCADE,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      category TEXT NOT NULL, action TEXT NOT NULL, object_id INTEGER NOT NULL,
+      actor_id INTEGER NOT NULL, actor_login TEXT NOT NULL, title TEXT NOT NULL,
+      number INTEGER, url TEXT NOT NULL, received_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX activity_period ON project_events(project_id,received_at,category,action)`,
+    `CREATE TABLE forks (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, github_id INTEGER NOT NULL,
+      full_name TEXT NOT NULL, owner_id INTEGER NOT NULL, owner_login TEXT NOT NULL,
+      created_at INTEGER NOT NULL, received_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id,github_id)
+    )`,
+    `CREATE INDEX forks_received ON forks(project_id,received_at)`,
+    `CREATE TABLE work_items (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL, kind TEXT NOT NULL, number INTEGER NOT NULL, title TEXT NOT NULL,
+      author_id INTEGER NOT NULL, author_login TEXT NOT NULL, state TEXT NOT NULL, draft INTEGER NOT NULL DEFAULT 0,
+      labels TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, merged_at INTEGER,
+      first_seen_at INTEGER NOT NULL, first_reply_at INTEGER, review_state TEXT, reviewed_at INTEGER, head_sha TEXT,
+      last_delivery_seq INTEGER NOT NULL, PRIMARY KEY(project_id,kind,github_id), UNIQUE(project_id,kind,number)
+    )`,
+    `CREATE INDEX work_status ON work_items(project_id,kind,state,updated_at)`,
+    `CREATE TABLE releases (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, github_id INTEGER NOT NULL,
+      tag_name TEXT NOT NULL, name TEXT NOT NULL, author_login TEXT NOT NULL,
+      prerelease INTEGER NOT NULL, draft INTEGER NOT NULL, created_at INTEGER NOT NULL, published_at INTEGER,
+      published_received_at INTEGER, deleted_at INTEGER, first_seen_at INTEGER NOT NULL, last_delivery_seq INTEGER NOT NULL,
+      PRIMARY KEY(project_id,github_id)
+    )`,
+    `CREATE INDEX release_history ON releases(project_id,published_at)`,
+    `DELETE FROM monitor_settings WHERE key IN ('daily_hour','last_cron_at')`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();
@@ -91,6 +129,32 @@ export async function initDB(db: D1Database) {
       await db
         .prepare(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)`)
         .run();
+      if (
+        !(await db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin'")
+          .first())
+      ) {
+        try {
+          await db.batch([
+            ...migrations[0]
+              .filter((sql) =>
+                /^CREATE TABLE IF NOT EXISTS (admin|sessions|login_limits|monitor_settings)\b/.test(
+                  sql,
+                ),
+              )
+              .map((sql) => db.prepare(sql)),
+            ...migrations[2]
+              .filter((sql) => sql.startsWith('CREATE '))
+              .map((sql) => db.prepare(sql)),
+            ...migrations[3].map((sql) => db.prepare(sql)),
+            db.prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES (1),(2),(3),(4)'),
+          ]);
+          return;
+        } catch (error) {
+          if (await db.prepare('SELECT 1 FROM schema_migrations WHERE version=4').first()) return;
+          throw error;
+        }
+      }
       for (let index = 0; index < migrations.length; index++) {
         if (
           await db
