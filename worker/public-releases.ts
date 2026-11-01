@@ -2,7 +2,7 @@ import { object, integer, text, user, date } from './events';
 import { parseRepository } from './projects';
 import { assetSnapshotStatements, normalizeAssets } from './release-assets';
 import { AppError, nowSeconds, type Env } from './types';
-import type { AssetReport, ReleaseAsset, DownloadSummary } from '../shared/types';
+import type { AssetReport, ReleaseAsset, DownloadSummary, ReleaseDownload } from '../shared/types';
 import { readReleaseCache, cacheState, refreshInBackground, UpstreamError } from './release-cache';
 
 async function github(
@@ -226,7 +226,7 @@ export async function assetReport(
       github_id: number;
       tag_name: string;
       assets_seen_at: number | null;
-      assets_source: 'webhook' | 'github' | 'shields' | null;
+      assets_source: 'webhook' | 'github' | null;
       deleted_at: number | null;
     }>();
   if (!version) throw new AppError(404, '版本不存在。');
@@ -289,60 +289,6 @@ export async function refreshPublicAssets(
   return assetReport(env.DB, project, release);
 }
 
-async function shields(name: string, suffix: string[], signal: AbortSignal): Promise<string> {
-  const path = [...name.split('/'), ...suffix].map(encodeURIComponent).join('/');
-  const response = await fetch(
-    `https://img.shields.io/github/downloads/${path}.json?displayAssetName=false`,
-    {
-      headers: { Accept: 'application/json', 'User-Agent': 'RepoTrace' },
-      redirect: 'manual',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(6000)]),
-    },
-  );
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new AppError(502, 'Shields 下载量暂时无法刷新，已保留缓存。');
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new AppError(502, 'Shields 返回空数据。');
-  let raw = '';
-  let size = 0;
-  const decoder = new TextDecoder();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > 8192) {
-        await reader.cancel();
-        throw new AppError(502, 'Shields 返回数据异常。');
-      }
-      raw += decoder.decode(value, { stream: true });
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  let data: { message?: unknown; isError?: boolean };
-  try {
-    data = JSON.parse(raw + decoder.decode());
-  } catch {
-    throw new AppError(502, 'Shields 返回数据无效。');
-  }
-  if (
-    data.isError ||
-    typeof data.message !== 'string' ||
-    !/^\d+(?:\.\d+)?[kMGTPE]?$/i.test(data.message)
-  )
-    throw new AppError(502, 'Shields 暂无可用下载量，已保留缓存。');
-  return data.message;
-}
-async function projectName(env: Env, project: string) {
-  const row = await env.DB.prepare('SELECT full_name FROM projects WHERE id=?')
-    .bind(project)
-    .first<{ full_name: string }>();
-  if (!row) throw new AppError(404, '项目不存在。');
-  return row.full_name;
-}
 export async function cachedCatalog(
   env: Env,
   project: string,
@@ -377,70 +323,58 @@ export async function cachedDownloads(
   ctx: ExecutionContext,
 ): Promise<DownloadSummary> {
   const row = await readReleaseCache(env.DB, project, 'downloads');
-  const saved = row?.payload
-    ? (JSON.parse(row.payload) as {
-        total: string;
-        latest: string | null;
-        source?: 'github' | 'shields';
-        notice?: string;
-      })
-    : null;
+  const payload = row?.payload ? (JSON.parse(row.payload) as DownloadSummary) : null;
+  const saved = payload?.source === 'github' ? payload : null;
   const report: DownloadSummary = {
     total: saved?.total ?? null,
     latest: saved?.latest ?? null,
-    source: saved?.source ?? 'github',
-    notice: saved?.notice ?? null,
+    source: 'github',
+    releases: saved?.releases ?? [],
     cache: cacheState(row),
   };
   refreshInBackground(env, project, 'downloads', ctx, async (signal) => {
-    try {
-      const repo = await source(env, project, signal);
-      let total = 0n;
-      let versions = 0;
-      const sum = (input: unknown) => {
-        if (!Array.isArray(input)) throw new AppError(502, 'GitHub 返回的下载量清单无效。');
-        return input.reduce((value: bigint, raw: unknown) => {
-          const count = object(raw).download_count;
-          if (!Number.isSafeInteger(count) || (count as number) < 0)
-            throw new AppError(502, 'GitHub 产物下载量缺失，已保留缓存。');
-          return value + BigInt(count as number);
-        }, 0n);
-      };
-      for (let page = 1; page <= 20; page++) {
-        const result = await github(env, `${repo.path}/releases?per_page=100&page=${page}`, signal);
-        if (!Array.isArray(result.data) || result.data.length > 100)
-          throw new AppError(502, 'GitHub 返回的版本清单无效。');
-        for (const raw of result.data) {
-          const r = object(raw);
-          if (r.draft || !r.published_at) continue;
-          total += sum(r.assets);
-          versions++;
-        }
-        if (!result.next) break;
-        if (page === 20) throw new AppError(502, '版本下载量尚未完整汇总，已保留缓存。');
+    const repo = await source(env, project, signal);
+    let total = 0n;
+    const versions: ReleaseDownload[] = [];
+    const sum = (input: unknown) => {
+      if (!Array.isArray(input)) throw new AppError(502, 'GitHub 返回的下载量清单无效。');
+      return input.reduce((value: bigint, raw: unknown) => {
+        const count = object(raw).download_count;
+        if (!Number.isSafeInteger(count) || (count as number) < 0)
+          throw new AppError(502, 'GitHub 产物下载量缺失，已保留缓存。');
+        return value + BigInt(count as number);
+      }, 0n);
+    };
+    for (let page = 1; page <= 20; page++) {
+      const result = await github(env, `${repo.path}/releases?per_page=100&page=${page}`, signal);
+      if (!Array.isArray(result.data) || result.data.length > 100)
+        throw new AppError(502, 'GitHub 返回的版本清单无效。');
+      for (const raw of result.data) {
+        const r = object(raw);
+        if (r.draft || !r.published_at) continue;
+        const downloads = sum(r.assets);
+        total += downloads;
+        versions.push({
+          id: integer(r.id),
+          tag: text(r.tag_name, 255),
+          name: typeof r.name === 'string' ? r.name : text(r.tag_name, 255),
+          publishedAt: date(r.published_at)!,
+          prerelease: !!r.prerelease,
+          downloads: String(downloads),
+        });
       }
-      const latest = versions
-        ? (await github(env, `${repo.path}/releases/latest`, signal, true)).data
-        : null;
-      return {
-        total: String(total),
-        latest: latest === null ? null : String(sum(object(latest).assets)),
-        source: 'github',
-      };
-    } catch (error) {
-      if (!(error instanceof AppError) || error.status !== 502) throw error;
-      const name = await projectName(env, project);
-      const [total, latest] = await Promise.all([
-        shields(name, ['total'], signal),
-        shields(name, ['latest', 'total'], signal),
-      ]);
-      return {
-        total,
-        latest,
-        source: 'shields',
-        notice: 'GitHub 暂时无法直接刷新，本次使用 Shields 备用数据；k / M 等为缩写值。',
-      };
+      if (!result.next) break;
+      if (page === 20) throw new AppError(502, '版本下载量尚未完整汇总，已保留缓存。');
     }
+    const latest = versions.length
+      ? (await github(env, `${repo.path}/releases/latest`, signal, true)).data
+      : null;
+    return {
+      total: String(total),
+      latest: latest === null ? null : String(sum(object(latest).assets)),
+      source: 'github',
+      releases: versions,
+    };
   });
   return report;
 }
@@ -453,68 +387,10 @@ export async function cachedAssets(
   const report = await assetReport(env.DB, project, release);
   const resource = `assets:${release}`;
   const row = await readReleaseCache(env.DB, project, resource);
-  const extra = row?.payload
-    ? (JSON.parse(row.payload) as { totalDisplay?: string; notice?: string })
-    : null;
   report.cache = { ...cacheState(row), updatedAt: report.observedAt ?? row?.updated_at ?? null };
-  report.totalDisplay = extra?.totalDisplay ?? null;
-  report.notice = extra?.notice ?? null;
   refreshInBackground(env, project, resource, ctx, async (signal) => {
-    try {
-      await refreshPublicAssets(env, project, release, signal);
-      return {};
-    } catch (error) {
-      // Repository identity/privacy failures must never switch to a different source.
-      if (!(error instanceof AppError) || error.status !== 502 || report.deleted) throw error;
-      const name = await projectName(env, project);
-      const totalDisplay = await shields(name, [report.tag, 'total'], signal);
-      if (report.observedAt !== null) {
-        const updated = [];
-        for (let offset = 0; offset < report.assets.length; offset += 4) {
-          const group = await Promise.all(
-            report.assets.slice(offset, offset + 4).map(async (asset) => {
-              // Shields reserves `total` for aggregate counts; it cannot identify an asset of that name.
-              if (asset.name === 'total')
-                throw new AppError(502, '此产物需要等待 GitHub 接口恢复后刷新，已保留缓存。');
-              const display = await shields(name, [report.tag, asset.name], signal);
-              const count =
-                /^\d+$/.test(display) && Number.isSafeInteger(Number(display))
-                  ? Number(display)
-                  : null;
-              return {
-                id: asset.github_id,
-                name: asset.name,
-                size: asset.size,
-                content_type: asset.content_type,
-                state: asset.state,
-                download_count: count,
-                download_display: display,
-                download_url: asset.download_url,
-              };
-            }),
-          );
-          updated.push(...group);
-        }
-        await env.DB.batch(
-          assetSnapshotStatements(
-            env.DB,
-            project,
-            release,
-            updated,
-            nowSeconds(),
-            'shields',
-            'deleted_at IS NULL',
-          ),
-        );
-      }
-      return {
-        totalDisplay,
-        notice:
-          report.observedAt === null
-            ? '下载总量来自 Shields；产物清单尚无缓存，等待 GitHub 公开接口恢复后读取。'
-            : '下载量由 Shields 更新；文件名称和大小沿用缓存。Shields 的 k / M 等数值为缩写。',
-      };
-    }
+    await refreshPublicAssets(env, project, release, signal);
+    return {};
   });
   return report;
 }

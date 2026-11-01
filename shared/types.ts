@@ -103,7 +103,7 @@ export interface ReleaseRecord {
   first_seen_at: number;
   assets_count?: number | null;
   assets_seen_at?: number | null;
-  assets_source?: 'webhook' | 'github' | 'shields' | null;
+  assets_source?: 'webhook' | 'github' | null;
 }
 export interface MonitorMetrics {
   forks: number;
@@ -202,7 +202,6 @@ export interface ReleaseAsset {
   content_type: string;
   state: string;
   download_count: number | null;
-  download_display?: string | null;
   download_url: string | null;
   observed_at: number;
 }
@@ -210,12 +209,10 @@ export interface AssetReport {
   releaseId: number;
   tag: string;
   observedAt: number | null;
-  source: 'webhook' | 'github' | 'shields' | null;
+  source: 'webhook' | 'github' | null;
   deleted: boolean;
   assets: ReleaseAsset[];
   cache?: ReleaseCacheState;
-  totalDisplay?: string | null;
-  notice?: string | null;
 }
 
 export interface ReleaseCacheState {
@@ -227,7 +224,16 @@ export interface ReleaseCacheState {
 export interface DownloadSummary {
   total: string | null;
   latest: string | null;
-  source: 'github' | 'shields';
-  notice?: string | null;
+  source: 'github';
+  releases: ReleaseDownload[];
   cache: ReleaseCacheState;
+}
+
+export interface ReleaseDownload {
+  id: number;
+  tag: string;
+  name: string;
+  publishedAt: number;
+  prerelease: boolean;
+  downloads: string;
 }

@@ -3,6 +3,7 @@ import { Download, RefreshCw, X } from 'lucide-react';
 import type { AssetReport } from '../shared/types';
 import { api } from './api';
 import { ReleaseCacheNote } from './ReleaseCacheNote';
+import { DownloadComparison, DownloadDistribution } from './DownloadCharts';
 const when = (at: number | null) =>
   at
     ? new Intl.DateTimeFormat('zh-CN', {
@@ -62,7 +63,9 @@ export function ReleaseAssets({
   const known =
     report?.observedAt !== null &&
     (report?.assets.every((a) => a.download_count !== null) ?? false);
-  const total = known ? report!.assets.reduce((sum, a) => sum + a.download_count!, 0) : null;
+  const total = known
+    ? report!.assets.reduce((sum, a) => sum + BigInt(a.download_count!), 0n)
+    : null;
   return (
     <section className="panel asset-panel" aria-label="产物下载量">
       <div className="panel-header">
@@ -82,26 +85,18 @@ export function ReleaseAssets({
       </div>
       <div className="asset-summary">
         <span>
-          当前清单累计下载{' '}
-          <strong>{report?.totalDisplay ?? (total === null ? '—' : total.toLocaleString())}</strong>
+          当前清单累计下载 <strong>{total === null ? '—' : total.toLocaleString()}</strong>
         </span>
         <small>
           读取时间：{when(report?.observedAt ?? null)}
           {report?.source === 'webhook'
             ? ' · Webhook 快照'
-            : report?.source === 'shields'
-              ? ' · Shields 下载量'
-              : report?.source === 'github'
-                ? ' · GitHub 公开接口'
-                : ''}
+            : report?.source === 'github'
+              ? ' · GitHub 公开接口'
+              : ''}
         </small>
       </div>
       <ReleaseCacheNote cache={report?.cache} />
-      {report?.notice && (
-        <p className="field-note" role="status">
-          {report.notice}
-        </p>
-      )}
       {error && (
         <div className="error-banner" role="alert">
           <span>{error}</span>
@@ -116,55 +111,75 @@ export function ReleaseAssets({
       ) : !report.assets.length ? (
         <p className="small-empty">该版本没有上传的产物。</p>
       ) : (
-        <div className="table-scroll">
-          <table className="monitor-table asset-table">
-            <thead>
-              <tr>
-                <th>产物名称</th>
-                <th>大小</th>
-                <th>当前累计下载量</th>
-              </tr>
-            </thead>
-            <tbody>
-              {report.assets.map((asset) => (
-                <tr key={asset.github_id}>
-                  <td>
-                    {asset.download_url ? (
-                      <a
-                        className="record-title"
-                        href={asset.download_url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <Download size={14} />
-                        {asset.name}
-                      </a>
-                    ) : (
-                      <strong>{asset.name}</strong>
-                    )}
-                    <small>
-                      {asset.content_type}
-                      {asset.state === 'open' ? ' · 处理中' : ''}
-                    </small>
-                  </td>
-                  <td>{bytes(asset.size)}</td>
-                  <td>
-                    <strong>
-                      {asset.download_display ??
-                        (asset.download_count === null
-                          ? '未知'
-                          : asset.download_count.toLocaleString())}
-                    </strong>
-                  </td>
+        <>
+          <div className="download-chart-grid">
+            <DownloadComparison
+              label="产物累计下载量对比图"
+              points={[...report.assets]
+                .sort((a, b) => (b.download_count ?? -1) - (a.download_count ?? -1))
+                .map((a) => ({
+                  id: String(a.github_id),
+                  label: a.name,
+                  value: a.download_count === null ? null : String(a.download_count),
+                }))}
+            />
+            <DownloadDistribution
+              points={report.assets.map((a) => ({
+                id: String(a.github_id),
+                label: a.name,
+                value: a.download_count === null ? null : String(a.download_count),
+              }))}
+            />
+          </div>
+          <div className="table-scroll">
+            <table className="monitor-table asset-table">
+              <thead>
+                <tr>
+                  <th>产物名称</th>
+                  <th>大小</th>
+                  <th>当前累计下载量</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {report.assets.map((asset) => (
+                  <tr key={asset.github_id}>
+                    <td>
+                      {asset.download_url ? (
+                        <a
+                          className="record-title"
+                          href={asset.download_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          <Download size={14} />
+                          {asset.name}
+                        </a>
+                      ) : (
+                        <strong>{asset.name}</strong>
+                      )}
+                      <small>
+                        {asset.content_type}
+                        {asset.state === 'open' ? ' · 处理中' : ''}
+                      </small>
+                    </td>
+                    <td>{bytes(asset.size)}</td>
+                    <td>
+                      <strong>
+                        {asset.download_count === null
+                          ? '未知'
+                          : asset.download_count.toLocaleString()}
+                      </strong>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
       )}
       <div className="table-note">
-        每次读取返回 Worker 缓存，并请求后台更新；更新后再次读取可见。Shields 的 k / M 等为缩写值。
-        GitHub 自动生成的 Source code 压缩包没有下载量数据。
+        每次读取返回缓存，并请求后台更新；更新后再次读取可见。图表按当前累计下载量展示。 GitHub
+        自动生成的 Source code 压缩包没有下载量数据。
       </div>
     </section>
   );

@@ -10,7 +10,7 @@
 - **项目数据**：选择单个项目，分别查看 Star、Fork、Issue、PR、Release；Star 包含总量图、用户净变化和逐次事件名单。
 - **时间筛选**：近 7 / 30 / 90 天，或两个 Release 发布时间之间；包含起始时刻，不包含结束时刻。
 - **Issue / PR**：每日变化、标签与状态筛选、回复和评审情况、合并/关闭统计、耗时与已记录贡献者。
-- **Release 与下载量**：版本目录、逐项产物及下载量由 Worker 缓存。每次访问先返回缓存，再异步刷新；没有定时轮询，也不生成下载历史图表。Worker 直接汇总 GitHub 的总下载量与最新正式版下载量；GitHub 受限时，尝试使用 Shields 备用数据，并标明来源。
+- **Release 与下载量**：版本目录、逐项产物及下载量由 Worker 缓存。每次访问先返回缓存，再异步刷新；没有定时轮询。Worker 直接汇总 GitHub 的总下载量与最新正式版下载量，提供版本对比、产物对比与占比图；图表均使用当前累计值。获取失败会明确显示错误。
 - 统一项目动态、Webhook 签名校验、重复投递去重，保留已有历史快照。
 
 事件收到后即更新，图表按北京时间自然日统计。同一用户在区间内新增后又取消 Star，会在区间净变化中相互抵消。打开 **项目数据** 时读取 Worker 中的 Release 缓存，并请求后台刷新。可再次读取或加载更早版本，再选择版本区间；这不会补造历史 Star 或 Issue / PR 事件。Release Webhook 只记录发版动态，不修改版本目录、产物、下载量或 Star / Fork 数字。
@@ -19,7 +19,7 @@
 
 公开 Release 数据均经过 Worker，不需要 GitHub 访问凭据。缓存首次为空时会在后台建立，稍后再次读取即可；刷新失败保留旧数据并显示缓存时间与状态。GitHub 返回限流或拒绝访问时会退避，避免每次打开都重复触发失败请求。
 
-Worker 从 GitHub 分页读取各 Release 的产物计数，自己汇总所有版本和最新正式版的精确下载量；不会仅汇总已缓存的部分版本。GitHub 不可用时才使用 Shields 备用数据，展示参考 [Shields Total Downloads](https://img.shields.io/github/downloads/rssh-org/rssh/total) 和 [Latest Downloads](https://img.shields.io/github/downloads/rssh-org/rssh/latest/total)。`8.5k` 等缩写按原样展示，不伪造精确数字。下载量是当前累计值，不代表历史区间增量；GitHub 自动生成的 Source code 压缩包不提供下载量。私有仓库无法通过公开接口刷新。
+Worker 从 GitHub 分页读取各 Release 的产物计数，自己汇总所有版本和最新正式版的精确下载量；不会仅汇总已缓存的部分版本。下载量是当前累计值，不代表历史区间增量；GitHub 自动生成的 Source code 压缩包不提供下载量。私有仓库无法通过公开接口刷新。
 
 ## 部署到 Cloudflare
 

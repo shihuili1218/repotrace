@@ -3,10 +3,12 @@ import { RefreshCw } from 'lucide-react';
 import type { DownloadSummary } from '../shared/types';
 import { api } from './api';
 import { ReleaseCacheNote } from './ReleaseCacheNote';
+import { DownloadComparison, downloadNumber } from './DownloadCharts';
 export function ReleaseDownloads({ repo }: { repo: string }) {
   const [data, setData] = useState<DownloadSummary | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [sort, setSort] = useState<'downloads' | 'published'>('downloads');
   const fence = useRef(0);
   const read = useCallback(async () => {
     const id = ++fence.current;
@@ -34,11 +36,7 @@ export function ReleaseDownloads({ repo }: { repo: string }) {
       <div className="panel-header">
         <div>
           <h2>项目下载量</h2>
-          <p>
-            {data?.source === 'shields'
-              ? 'Shields 备用数据 · 保留 k / M 等缩写'
-              : 'Worker 汇总 GitHub 各产物下载量 · 当前累计值'}
-          </p>
+          <p>GitHub 各产物下载量汇总 · 当前累计值</p>
         </div>
         <button className="button secondary" disabled={busy} onClick={() => void read()}>
           <RefreshCw size={14} className={busy ? 'spin' : ''} />
@@ -48,21 +46,46 @@ export function ReleaseDownloads({ repo }: { repo: string }) {
       <div className="module-metrics pair">
         <article className="module-metric">
           <span>所有版本下载量</span>
-          <strong>{data?.total ?? '—'}</strong>
+          <strong>{downloadNumber(data?.total)}</strong>
           <small>Total Downloads</small>
         </article>
         <article className="module-metric">
           <span>最新正式版下载量</span>
-          <strong>{data?.latest ?? '—'}</strong>
+          <strong>{downloadNumber(data?.latest)}</strong>
           <small>Latest Downloads</small>
         </article>
       </div>
+      <div className="download-chart-toolbar">
+        <span>各版本累计下载量</span>
+        <select
+          aria-label="下载量图表排序"
+          value={sort}
+          onChange={(e) => setSort(e.target.value as 'downloads' | 'published')}
+        >
+          <option value="downloads">按下载量排序</option>
+          <option value="published">按发布时间排序</option>
+        </select>
+      </div>
+      <DownloadComparison
+        label="各版本累计下载量对比图"
+        limit={10}
+        points={[...(data?.releases ?? [])]
+          .sort((a, b) =>
+            sort === 'published'
+              ? b.publishedAt - a.publishedAt
+              : BigInt(a.downloads) === BigInt(b.downloads)
+                ? b.publishedAt - a.publishedAt
+                : BigInt(a.downloads) > BigInt(b.downloads)
+                  ? -1
+                  : 1,
+          )
+          .map((r) => ({
+            id: String(r.id),
+            label: r.tag + (r.prerelease ? '（预发布）' : ''),
+            value: r.downloads,
+          }))}
+      />
       <ReleaseCacheNote cache={data?.cache} />
-      {data?.notice && (
-        <p className="field-note" role="status">
-          {data.notice}
-        </p>
-      )}
       {error && (
         <p className="field-note" role="alert">
           {error}

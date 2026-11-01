@@ -1424,62 +1424,91 @@ describe('Worker Release cache and background refresh', () => {
     expect(warm.source).toBe('github');
     expect(warm.assets.reduce((s, a) => s + a.download_count, 0)).toBe(5151);
   });
-  it('uses Shields for cached assets when GitHub returns 403 and preserves rounded values as text', async () => {
+  it('surfaces GitHub errors while preserving the last successful asset cache without contacting another host', async () => {
     const session = await setup();
     const config = await add(session);
     await seedPublicRelease(config, { release: release(2001, { assets: [artifact(1, 42)] }) });
     const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init);
-      expect(req.headers.has('Authorization')).toBe(false);
-      if (req.url.startsWith('https://api.github.com'))
-        return new Response('rate limited', {
-          status: 403,
-          headers: { 'X-RateLimit-Remaining': '0' },
-        });
-      expect(req.url.startsWith('https://img.shields.io/github/downloads/owner/repo/')).toBe(true);
-      return Response.json({ message: req.url.includes('/total.json') ? '8.5k' : '1.2k' });
+      expect(new URL(req.url).hostname).toBe('api.github.com');
+      return new Response('limited', { status: 403, headers: { 'X-RateLimit-Remaining': '0' } });
     });
-    const first = await (
-      await assets(session, config)
-    ).json<{ assets: { download_count: number }[] }>();
-    expect(first.assets[0].download_count).toBe(42);
+    await assets(session, config);
     const cached = await (await assets(session, config)).json();
     expect(cached).toMatchObject({
-      source: 'shields',
-      totalDisplay: '8.5k',
-      assets: [{ download_count: null, download_display: '1.2k' }],
+      source: 'github',
+      assets: [{ download_count: 42 }],
+      cache: { error: expect.stringContaining('限流') },
     });
-    expect(
-      outgoing.mock.calls.filter(([url]) => String(url).startsWith('https://api.github.com')),
-    ).toHaveLength(1);
+    expect(outgoing).toHaveBeenCalledTimes(1);
   });
-  it('returns cached Shields total/latest downloads and never treats an error badge as zero', async () => {
+  it('reports summary failures and keeps unknown totals distinct from zero', async () => {
     const session = await setup();
     const config = await add(session);
-    const outgoing = vi
-      .spyOn(globalThis, 'fetch')
-      .mockImplementation(async (input) =>
-        String(input).startsWith('https://api.github.com')
-          ? new Response('limited', { status: 403, headers: { 'X-RateLimit-Remaining': '0' } })
-          : Response.json({ message: String(input).includes('/latest/') ? '210' : '8.5k' }),
-      );
+    await env.DB.prepare(
+      'INSERT INTO release_refresh(project_id,resource,payload,updated_at) VALUES (?,?,?,?)',
+    )
+      .bind(
+        config.id,
+        'downloads',
+        JSON.stringify({ total: '15', latest: '10', source: 'github', releases: [] }),
+        nowSeconds(),
+      )
+      .run();
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      expect(new URL(String(input)).hostname).toBe('api.github.com');
+      return new Response('forbidden', { status: 403 });
+    });
     const path = `/repositories/${config.id}/releases/downloads`;
+    await request(path, 'GET', undefined, session);
     expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
+      total: '15',
+      latest: '10',
+      source: 'github',
+      cache: { error: expect.stringContaining('403') },
+    });
+    const empty = await add(session, 'another/project');
+    const emptyPath = `/repositories/${empty.id}/releases/downloads`;
+    await request(emptyPath, 'GET', undefined, session);
+    expect(await (await request(emptyPath, 'GET', undefined, session)).json()).toMatchObject({
       total: null,
       latest: null,
-    });
-    outgoing.mockImplementation(async () =>
-      Response.json({ isError: true, message: 'inaccessible' }),
-    );
-    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
-      total: '8.5k',
-      latest: '210',
-    });
-    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
-      total: '8.5k',
-      latest: '210',
       cache: { error: expect.any(String) },
     });
+    expect(outgoing).toHaveBeenCalledTimes(1);
+  });
+  it('cleans retired third-party cached counts while preserving GitHub data and release metadata', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await seedPublicRelease(config, { release: release(2001, { assets: [artifact(1, 42)] }) });
+    await env.DB.prepare('ALTER TABLE release_assets ADD COLUMN download_display TEXT').run();
+    await env.DB.prepare("UPDATE releases SET assets_source='shields' WHERE project_id=?")
+      .bind(config.id)
+      .run();
+    await env.DB.prepare('INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)')
+      .bind(config.id, 'downloads', JSON.stringify({ source: 'shields', total: '8.5k' }))
+      .run();
+    await env.DB.prepare('INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)')
+      .bind(config.id, 'assets:2001', '{}')
+      .run();
+    const other = await add(session, 'another/project');
+    await env.DB.prepare('INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)')
+      .bind(other.id, 'downloads', JSON.stringify({ source: 'github', total: '42' }))
+      .run();
+    await env.DB.batch(migrations[6].map((sql) => env.DB.prepare(sql)));
+    expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(1);
+    expect(await scalar('SELECT COUNT(*) AS count FROM release_assets')).toBe(1);
+    expect(
+      await env.DB.prepare('SELECT download_count FROM release_assets WHERE project_id=?')
+        .bind(config.id)
+        .first(),
+    ).toEqual({ download_count: null });
+    expect(
+      await scalar('SELECT COUNT(*) AS count FROM release_refresh WHERE project_id=?', config.id),
+    ).toBe(0);
+    expect(
+      await scalar('SELECT COUNT(*) AS count FROM release_refresh WHERE project_id=?', other.id),
+    ).toBe(1);
   });
   it('calculates exact total and latest downloads itself across all GitHub pages', async () => {
     const session = await setup();
@@ -1490,8 +1519,20 @@ describe('Worker Release cache and background refresh', () => {
       if (url.endsWith('page=1'))
         return Response.json(
           [
-            { draft: false, published_at: iso(nowSeconds()), assets: [{ download_count: 10 }] },
-            { prerelease: true, published_at: iso(nowSeconds()), assets: [{ download_count: 3 }] },
+            {
+              id: 1,
+              tag_name: 'v1',
+              draft: false,
+              published_at: iso(nowSeconds()),
+              assets: [{ download_count: 10 }],
+            },
+            {
+              id: 2,
+              tag_name: 'v2',
+              prerelease: true,
+              published_at: iso(nowSeconds()),
+              assets: [{ download_count: 3 }],
+            },
           ],
           {
             headers: {
@@ -1499,7 +1540,9 @@ describe('Worker Release cache and background refresh', () => {
             },
           },
         );
-      return Response.json([{ published_at: iso(nowSeconds()), assets: [{ download_count: 2 }] }]);
+      return Response.json([
+        { id: 3, tag_name: 'v3', published_at: iso(nowSeconds()), assets: [{ download_count: 2 }] },
+      ]);
     });
     const path = `/repositories/${config.id}/releases/downloads`;
     expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
@@ -1510,7 +1553,11 @@ describe('Worker Release cache and background refresh', () => {
       total: '15',
       latest: '10',
       source: 'github',
-      notice: null,
+      releases: [
+        { id: 1, tag: 'v1', downloads: '10' },
+        { id: 2, tag: 'v2', downloads: '3' },
+        { id: 3, tag: 'v3', downloads: '2' },
+      ],
     });
   });
   it('rejects redirects and changed repository identity without overwriting data', async () => {

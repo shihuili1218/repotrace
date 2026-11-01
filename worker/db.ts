@@ -147,6 +147,14 @@ export const migrations = [
     )`,
     `CREATE TABLE public_api_backoff (host TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, error TEXT NOT NULL)`,
   ],
+  [
+    // Retire third-party counts without deleting project or release metadata.
+    `DELETE FROM release_refresh WHERE resource='downloads' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.source') END='shields'`,
+    `DELETE FROM release_refresh WHERE EXISTS(SELECT 1 FROM releases r WHERE r.project_id=release_refresh.project_id AND release_refresh.resource='assets:'||r.github_id AND r.assets_source='shields')`,
+    `UPDATE release_assets SET download_count=NULL WHERE EXISTS(SELECT 1 FROM releases r WHERE r.project_id=release_assets.project_id AND r.github_id=release_assets.release_id AND r.assets_source='shields')`,
+    `UPDATE releases SET assets_seen_at=NULL,assets_source=NULL,assets_snapshot_id=NULL WHERE assets_source='shields'`,
+    `ALTER TABLE release_assets DROP COLUMN download_display`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

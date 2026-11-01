@@ -8,9 +8,27 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/repositories/*/releases/downloads', (route) =>
     route.fulfill({
       json: {
-        total: '8.5k',
-        latest: '210',
-        source: 'shields',
+        total: '1000',
+        latest: '400',
+        source: 'github',
+        releases: [
+          {
+            id: 401,
+            tag: 'v1.1.0',
+            name: 'First',
+            publishedAt: Math.floor(Date.now() / 1000) - 86460,
+            prerelease: false,
+            downloads: '600',
+          },
+          {
+            id: 402,
+            tag: 'v1.2.0',
+            name: 'Latest',
+            publishedAt: Math.floor(Date.now() / 1000) - 60,
+            prerelease: false,
+            downloads: '400',
+          },
+        ],
         cache: {
           updatedAt: Math.floor(Date.now() / 1000),
           error: null,
@@ -338,6 +356,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(page.getByRole('link', { name: 'v1.2.0', exact: true })).toBeVisible();
   await expect(page.locator('tbody')).toContainText('正式版');
   await expect(page.locator('tbody')).toContainText('1.0 天');
+  let assetMode: 'normal' | 'unknown' | 'zero' = 'normal';
   await page.route(`**/api/repositories/${id}/releases/402/assets`, async (route) => {
     expect(route.request().method()).toBe('GET');
     return route.fulfill({
@@ -356,7 +375,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
             size: 2048,
             content_type: 'application/zip',
             state: 'uploaded',
-            download_count: 150,
+            download_count: assetMode === 'unknown' ? null : assetMode === 'zero' ? 0 : 150,
             download_url: 'https://github.com/owner/repo/releases/download/v1.2.0/rssh-linux.zip',
             observed_at: now,
           },
@@ -368,7 +387,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
             size: 4096,
             content_type: 'application/zip',
             state: 'uploaded',
-            download_count: 250,
+            download_count: assetMode === 'zero' ? 0 : 250,
             download_url: 'https://github.com/owner/repo/releases/download/v1.2.0/rssh-windows.zip',
             observed_at: now,
           },
@@ -382,7 +401,17 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(panel.locator('tbody')).toContainText('150');
   await expect(panel.locator('tbody')).toContainText('250');
   await expect(panel).toContainText('400');
-  await expect(panel.getByRole('img', { name: /趋势图|柱状图|历史|变化图/ })).toHaveCount(0);
+  const versionChart = page.getByRole('figure', { name: '各版本累计下载量对比图' });
+  await expect(versionChart.getByRole('button').first()).toContainText('v1.1.0');
+  await page.getByLabel('下载量图表排序').selectOption('published');
+  await expect(versionChart.getByRole('button').first()).toContainText('v1.2.0');
+  await versionChart.getByRole('button').first().click();
+  await expect(versionChart.locator('.download-chart-detail')).toContainText('400 次下载');
+  await expect(panel.getByRole('figure', { name: '产物累计下载量对比图' })).toBeVisible();
+  await expect(panel.getByRole('img', { name: '产物下载量占比图' })).toBeVisible();
+  const distribution = panel.getByRole('figure', { name: '产物下载量占比分布' });
+  await distribution.getByRole('button').filter({ hasText: 'rssh-linux.zip' }).click();
+  await expect(distribution.locator('.download-chart-detail')).toContainText('150 次下载');
 
   await page.screenshot({ path: 'test-results/releases-desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -391,9 +420,37 @@ test('shows signed fork, issue, PR and release events in modules and the unified
     .toBeLessThanOrEqual(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await panel.getByRole('link', { name: 'rssh-linux.zip', exact: true }).scrollIntoViewIfNeeded();
-  await expect(panel.getByText('150', { exact: true })).toBeInViewport();
+  await expect(panel.locator('tbody').getByText('150', { exact: true })).toBeInViewport();
   await expect(panel.getByRole('link', { name: 'rssh-linux.zip', exact: true })).toBeInViewport();
   await page.screenshot({ path: 'test-results/releases-mobile.png', fullPage: true });
+  assetMode = 'unknown';
+  await panel.getByRole('button', { name: '刷新下载量' }).click();
+  await expect(panel.locator('tbody')).toContainText('未知');
+  await expect(panel.getByRole('img', { name: '产物下载量占比图' })).toHaveCount(0);
+  assetMode = 'zero';
+  await panel.getByRole('button', { name: '刷新下载量' }).click();
+  await expect(panel.locator('.asset-summary strong')).toHaveText('0');
+  await expect(panel.getByRole('img', { name: '产物下载量占比图' })).toBeVisible();
+  await page.route(`**/api/repositories/${id}/releases/downloads`, (route) =>
+    route.fulfill({
+      json: {
+        total: '1000',
+        latest: '400',
+        source: 'github',
+        releases: [],
+        cache: {
+          updatedAt: now,
+          error: 'GitHub 公开接口读取失败（HTTP 403）。',
+          retryAt: now + 600,
+          refreshRequested: false,
+        },
+      },
+    }),
+  );
+  const summary = page.getByRole('region', { name: '项目下载量' });
+  await summary.getByRole('button', { name: '读取下载量缓存' }).click();
+  await expect(summary.getByRole('alert')).toContainText('HTTP 403');
+  await expect(summary).toContainText('上次成功读取的缓存');
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '项目动态', exact: true }).click();
   await expect(page.getByRole('heading', { name: '项目动态', exact: true })).toBeVisible();
