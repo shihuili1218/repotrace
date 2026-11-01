@@ -31,6 +31,15 @@ const historySQL = `WITH RECURSIVE
       AND NOT EXISTS(SELECT 1 FROM star_events e WHERE e.project_id=s.project_id AND date(e.received_at,'unixepoch','+8 hours')=s.day)
   ),
   daily_changes AS (SELECT day,SUM(added) AS added,SUM(removed) AS removed FROM(SELECT * FROM net UNION ALL SELECT * FROM old_changes) GROUP BY day),
+  daily_activity AS (
+    SELECT date(received_at,'unixepoch','+8 hours') AS day,
+      COUNT(DISTINCT CASE WHEN category='issue' AND action='opened' THEN project_id||':'||object_id END) AS issue_opened,
+      COUNT(DISTINCT CASE WHEN category='issue' AND action='closed' THEN project_id||':'||object_id END) AS issue_closed,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='opened' THEN project_id||':'||object_id END) AS pr_opened,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='merged' THEN project_id||':'||object_id END) AS pr_merged,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||object_id END) AS pr_closed
+    FROM project_events WHERE project_id IN(SELECT id FROM chosen) AND received_at>=(SELECT since FROM params) AND received_at<(SELECT until FROM params) GROUP BY day
+  ),
   observed AS (
     SELECT d.day,p.id,COALESCE(
       (SELECT observed_total FROM webhook_deliveries w WHERE w.project_id=p.id AND recorded=1 AND observed_total>=0 AND received_at<MIN(unixepoch(d.day,'+1 day','-8 hours'),(SELECT until FROM params)) ORDER BY received_at DESC,seq DESC LIMIT 1),
@@ -41,8 +50,10 @@ const historySQL = `WITH RECURSIVE
   )
   SELECT d.day,COALESCE(SUM(o.stars),0) AS total,COUNT(o.stars) AS repos,COALESCE(SUM(o.forks),0) AS fork_total,COUNT(o.forks) AS fork_repos,
     COALESCE(c.added,0) AS added,COALESCE(c.removed,0) AS removed,
+    COALESCE(a.issue_opened,0) AS issue_opened,COALESCE(a.issue_closed,0) AS issue_closed,
+    COALESCE(a.pr_opened,0) AS pr_opened,COALESCE(a.pr_merged,0) AS pr_merged,COALESCE(a.pr_closed,0) AS pr_closed,
     (SELECT COUNT(*) FROM forks f WHERE project_id IN(SELECT id FROM chosen) AND date(received_at,'unixepoch','+8 hours')=d.day AND received_at<(SELECT until FROM params)) AS fork_new
-  FROM days d LEFT JOIN observed o ON o.day=d.day LEFT JOIN daily_changes c ON c.day=d.day GROUP BY d.day ORDER BY d.day`;
+  FROM days d LEFT JOIN observed o ON o.day=d.day LEFT JOIN daily_changes c ON c.day=d.day LEFT JOIN daily_activity a ON a.day=d.day GROUP BY d.day ORDER BY d.day`;
 
 export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
   const project = url.searchParams.get('repo') || null;

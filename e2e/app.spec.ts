@@ -262,6 +262,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(page.getByRole('img', { name: '每日新增 Fork 趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'forker/repo', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: 'Issue', exact: true }).click();
+  await expect(page.getByRole('img', { name: 'Issue 每日变化图' })).toBeVisible();
   await expect(page.getByRole('link', { name: '#7 安装失败', exact: true })).toBeVisible();
   await expect(page.locator('.module-metrics')).toContainText('1.0 小时');
   await page.getByLabel('筛选状态').selectOption('unanswered');
@@ -271,6 +272,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await page.getByLabel('筛选标签').selectOption('bug');
   await expect(page.getByRole('link', { name: '#7 安装失败', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: 'Pull Request', exact: true }).click();
+  await expect(page.getByRole('img', { name: 'PR 每日变化图' })).toBeVisible();
   await expect(page.locator('tbody')).toContainText('已合并');
   await expect(page.locator('tbody')).toContainText('2.0 小时');
   await expect(page.locator('.contributors-list')).toContainText('2 个 PR · 1 个已合并');
@@ -321,6 +323,7 @@ const metricFixture = {
   issuesClosed: 4,
   prsOpened: 5,
   prsMerged: 3,
+  prsClosed: 1,
   releasesPublished: 2,
   openIssues: 5,
   unansweredIssues: 2,
@@ -366,6 +369,11 @@ test('renders live charts and release markers on desktop and mobile', async ({ p
       fork_total: 50 + i,
       fork_repos: 1,
       fork_new: i % 3,
+      issue_opened: i % 4,
+      issue_closed: i % 3,
+      pr_opened: i % 2,
+      pr_merged: i % 3,
+      pr_closed: i % 4 === 0 ? 1 : 0,
     })),
     summaries: [],
     changes: [

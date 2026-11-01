@@ -20,7 +20,7 @@ import type {
 } from '../shared/types';
 import { categoryLabels, type Category } from '../shared/monitors';
 import { api } from './api';
-import { ForkChart } from './Charts';
+import { ForkChart, WorkChart } from './Charts';
 
 export const duration = (seconds: number | null) =>
   seconds === null
@@ -316,9 +316,9 @@ export function Monitoring({
               note="非草稿且尚无有效的已记录评审"
             />
             <Metric
-              label={`近 ${days} 天新建 / 合并`}
-              value={`${metrics.prsOpened} / ${metrics.prsMerged}`}
-              note="直接关闭不会计入合并数"
+              label={`近 ${days} 天新建 / 合并 / 关闭`}
+              value={`${metrics.prsOpened} / ${metrics.prsMerged} / ${metrics.prsClosed}`}
+              note="关闭不含合并；按发生过对应操作的条目去重"
             />
             <Metric
               label="平均合并耗时"
@@ -350,6 +350,17 @@ export function Monitoring({
             </div>
           </div>
           <ForkChart history={history} />
+        </section>
+      )}
+      {(type === 'issues' || type === 'pull_requests') && (
+        <section className="panel module-chart">
+          <div className="panel-header">
+            <div>
+              <h2>{type === 'issues' ? 'Issue 每日变化' : 'PR 每日变化'}</h2>
+              <p>北京时间自然日 · 统计当天发生过对应操作的条目</p>
+            </div>
+          </div>
+          <WorkChart history={history} mode={type} />
         </section>
       )}
       <section className="panel">

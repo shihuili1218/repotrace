@@ -108,6 +108,7 @@ export interface MonitorMetrics {
   issuesClosed: number;
   prsOpened: number;
   prsMerged: number;
+  prsClosed: number;
   releasesPublished: number;
   openIssues: number;
   unansweredIssues: number;
@@ -129,6 +130,11 @@ export interface Dashboard {
     fork_total: number;
     fork_repos: number;
     fork_new: number;
+    issue_opened: number;
+    issue_closed: number;
+    pr_opened: number;
+    pr_merged: number;
+    pr_closed: number;
   }[];
   summaries: Summary[];
   changes: StarChange[];

@@ -1054,3 +1054,62 @@ it('keeps a changed PR head when an older approval payload is delivered later in
   expect((await monitor(session, 'pull_requests')).items[0].review_state).toBeNull();
   expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
 });
+
+it('computes Issue and PR daily changes immediately and counts direct PR closure separately from merge', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const midnight = localMidnight(nowSeconds());
+  const issue = item();
+  await signed(config, 'issues', { action: 'opened', issue }, crypto.randomUUID(), midnight - 1);
+  await signed(
+    config,
+    'issues',
+    { action: 'closed', issue: { ...issue, state: 'closed', closed_at: iso(nowSeconds()) } },
+    crypto.randomUUID(),
+    midnight,
+  );
+  await signed(
+    config,
+    'pull_request',
+    { action: 'opened', pull_request: item(1002) },
+    crypto.randomUUID(),
+    midnight,
+  );
+  const merged = { ...item(1002), state: 'closed', merged: true, merged_at: iso(nowSeconds()) };
+  await signed(
+    config,
+    'pull_request',
+    { action: 'closed', pull_request: merged },
+    crypto.randomUUID(),
+    midnight,
+  );
+  await signed(
+    config,
+    'pull_request',
+    {
+      action: 'closed',
+      pull_request: item(1003, { state: 'closed', closed_at: iso(nowSeconds()) }),
+    },
+    crypto.randomUUID(),
+    midnight,
+  );
+  const data = await dashboard(session);
+  expect(data.history.find((r) => r.day === localDay(midnight - 1))).toMatchObject({
+    issue_opened: 1,
+    issue_closed: 0,
+  });
+  expect(data.history.at(-1)).toMatchObject({
+    issue_opened: 0,
+    issue_closed: 1,
+    pr_opened: 1,
+    pr_merged: 1,
+    pr_closed: 1,
+  });
+  expect(data.metrics).toMatchObject({
+    issuesOpened: 1,
+    issuesClosed: 1,
+    prsOpened: 1,
+    prsMerged: 1,
+    prsClosed: 1,
+  });
+});

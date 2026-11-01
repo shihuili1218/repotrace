@@ -221,3 +221,97 @@ export function ForkChart({ history }: { history: Dashboard['history'] }) {
     </svg>
   );
 }
+
+export function WorkChart({
+  history,
+  mode,
+}: {
+  history: Dashboard['history'];
+  mode: 'issues' | 'pull_requests';
+}) {
+  const series =
+    mode === 'issues'
+      ? [
+          { key: 'issue_opened' as const, label: '新建', color: '#8291e4' },
+          { key: 'issue_closed' as const, label: '关闭', color: '#3bab86' },
+        ]
+      : [
+          { key: 'pr_opened' as const, label: '新建', color: '#8291e4' },
+          { key: 'pr_merged' as const, label: '合并', color: '#3bab86' },
+          { key: 'pr_closed' as const, label: '直接关闭', color: '#b4bdcf' },
+        ];
+  const ceiling =
+    Math.ceil(Math.max(4, ...history.flatMap((p) => series.map((s) => p[s.key]))) / 4) * 4;
+  const step = 696 / Math.max(1, history.length);
+  const width = Math.min(14, (step * 0.75) / series.length);
+  return (
+    <>
+      <svg
+        className="trend-svg"
+        viewBox="0 0 800 242"
+        role="img"
+        aria-label={`${mode === 'issues' ? 'Issue' : 'PR'} 每日变化图`}
+      >
+        {[0, 1, 2, 3, 4].map((i) => (
+          <g key={i}>
+            <line x1="64" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
+            <text x="48" y={201 - i * 41} textAnchor="end" className="axis-label">
+              {(ceiling * i) / 4}
+            </text>
+          </g>
+        ))}
+        {history.flatMap((p, i) =>
+          series.map((s, j) => (
+            <rect
+              key={`${p.day}:${s.key}`}
+              x={64 + (i + 0.5) * step + (j - series.length / 2) * width}
+              y={196 - (p[s.key] / ceiling) * 164}
+              width={Math.max(1, width - 1)}
+              height={(p[s.key] / ceiling) * 164}
+              fill={s.color}
+              rx="2"
+            >
+              <title>
+                {p.day} · {s.label} {p[s.key]}
+              </title>
+            </rect>
+          )),
+        )}
+        {[...new Set([0, Math.floor((history.length - 1) / 2), history.length - 1])]
+          .filter((i) => i >= 0)
+          .map((i) => (
+            <text
+              key={i}
+              x={64 + (i + 0.5) * step}
+              y="229"
+              textAnchor="middle"
+              className="axis-label"
+            >
+              {history[i]?.day.slice(5).replace('-', '/')}
+            </text>
+          ))}
+        {!history.some((p) => series.some((s) => p[s.key])) && (
+          <text x="415" y="95" textAnchor="middle" className="axis-label">
+            所选时间内暂无对应变化
+          </text>
+        )}
+      </svg>
+      <div className="chart-legend">
+        <span>
+          <i className="legend-dot blue" />
+          新建
+        </span>
+        <span>
+          <i className="legend-dot green" />
+          {mode === 'issues' ? '关闭' : '合并'}
+        </span>
+        {mode === 'pull_requests' && (
+          <span>
+            <i className="legend-dot gray" />
+            直接关闭
+          </span>
+        )}
+      </div>
+    </>
+  );
+}

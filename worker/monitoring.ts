@@ -43,11 +43,17 @@ export async function monitorMetrics(
         `SELECT COUNT(DISTINCT CASE WHEN category='issue' AND action='opened' THEN project_id||':'||object_id END) AS issuesOpened,
       COUNT(DISTINCT CASE WHEN category='issue' AND action='closed' THEN project_id||':'||object_id END) AS issuesClosed,
       COUNT(DISTINCT CASE WHEN category='pull_request' AND action='opened' THEN project_id||':'||object_id END) AS prsOpened,
-      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='merged' THEN project_id||':'||object_id END) AS prsMerged
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='merged' THEN project_id||':'||object_id END) AS prsMerged,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||object_id END) AS prsClosed
       FROM project_events WHERE received_at>=? AND (? IS NULL OR project_id=?)`,
       )
       .bind(since, project, project)
-      .first<Pick<MonitorMetrics, 'issuesOpened' | 'issuesClosed' | 'prsOpened' | 'prsMerged'>>(),
+      .first<
+        Pick<
+          MonitorMetrics,
+          'issuesOpened' | 'issuesClosed' | 'prsOpened' | 'prsMerged' | 'prsClosed'
+        >
+      >(),
     db
       .prepare(
         'SELECT COUNT(*) AS count FROM forks WHERE received_at>=? AND (? IS NULL OR project_id=?)',
