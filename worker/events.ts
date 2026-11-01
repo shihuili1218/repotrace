@@ -1,5 +1,6 @@
 import { AppError } from './types';
 import { parseRepository } from './projects';
+import { normalizeAssets, assetSnapshotStatements } from './release-assets';
 import type { Category } from '../shared/monitors';
 
 export type ObjectData = Record<string, unknown>;
@@ -133,6 +134,7 @@ export function normalizeEvent(
     const id = integer(release.id);
     const tag = text(release.tag_name, 255);
     const author = user(release.author);
+    const assets = normalizeAssets(release.assets, repoName);
     const published = date(release.published_at);
     const deleted = action === 'deleted' ? at : null;
     const draft = action === 'unpublished' ? 1 : Number(!!release.draft);
@@ -154,11 +156,11 @@ export function normalizeEvent(
       statements: (db, project, delivery) => [
         db
           .prepare(
-            `INSERT INTO releases(project_id,github_id,tag_name,name,author_login,prerelease,draft,created_at,published_at,published_received_at,deleted_at,first_seen_at,last_delivery_seq)
-        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,seq FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1
+            `INSERT INTO releases(project_id,github_id,tag_name,name,author_login,prerelease,draft,created_at,published_at,published_received_at,deleted_at,first_seen_at,last_delivery_seq,metadata_observed_at)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,seq,? FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1
         ON CONFLICT(project_id,github_id) DO UPDATE SET tag_name=excluded.tag_name,name=excluded.name,author_login=excluded.author_login,prerelease=excluded.prerelease,
-        draft=excluded.draft,published_at=excluded.published_at,published_received_at=COALESCE(releases.published_received_at,excluded.published_received_at),deleted_at=excluded.deleted_at,last_delivery_seq=excluded.last_delivery_seq
-        WHERE releases.deleted_at IS NULL AND excluded.last_delivery_seq>releases.last_delivery_seq`,
+        draft=excluded.draft,published_at=excluded.published_at,published_received_at=COALESCE(releases.published_received_at,excluded.published_received_at),deleted_at=excluded.deleted_at,last_delivery_seq=excluded.last_delivery_seq,metadata_observed_at=excluded.metadata_observed_at
+        WHERE releases.deleted_at IS NULL AND excluded.last_delivery_seq>releases.last_delivery_seq AND releases.metadata_observed_at<=excluded.metadata_observed_at`,
           )
           .bind(
             project,
@@ -173,9 +175,20 @@ export function normalizeEvent(
             publication,
             deleted,
             at,
+            at,
             project,
             delivery,
           ),
+        ...assetSnapshotStatements(
+          db,
+          project,
+          id,
+          assets,
+          at,
+          'webhook',
+          'last_delivery_seq=(SELECT seq FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1)',
+          [project, delivery],
+        ),
       ],
     };
   }

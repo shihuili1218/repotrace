@@ -109,8 +109,16 @@ export function TrendChart({
   );
 }
 
-export function ChangesChart({ history }: { history: Dashboard['history'] }) {
-  const data = history.slice(-14);
+export function ChangesChart({
+  history,
+  fullRange = false,
+}: {
+  history: Dashboard['history'];
+  fullRange?: boolean;
+}) {
+  const data = fullRange ? history : history.slice(-14);
+  const step = 320 / Math.max(1, data.length);
+  const barWidth = Math.min(10, step * 0.65);
   if (!data.some((p) => p.repos > 0))
     return (
       <div className="chart-empty compact">
@@ -125,7 +133,7 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
       className="changes-svg"
       viewBox="0 0 360 232"
       role="img"
-      aria-label="近 14 天 Star 新增与取消柱状图"
+      aria-label={fullRange ? '区间 Star 新增与取消柱状图' : '近 14 天 Star 新增与取消柱状图'}
     >
       {[42, 112, 182].map((y) => (
         <line key={y} x1="20" x2="340" y1={y} y2={y} className="grid-line" />
@@ -133,9 +141,9 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
       {data.map((p, i) => (
         <g key={p.day}>
           <rect
-            x={25 + i * 23}
+            x={20 + (i + 0.5) * step - barWidth / 2}
             y={112 - (p.added / max) * 66}
-            width="10"
+            width={barWidth}
             height={Math.max(p.added ? 2 : 0, (p.added / max) * 66)}
             rx="3"
             fill="#3bab86"
@@ -145,9 +153,9 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
             </title>
           </rect>
           <rect
-            x={25 + i * 23}
+            x={20 + (i + 0.5) * step - barWidth / 2}
             y="115"
-            width="10"
+            width={barWidth}
             height={Math.max(p.removed ? 2 : 0, (p.removed / max) * 66)}
             rx="3"
             fill="#f18d8d"
@@ -156,8 +164,8 @@ export function ChangesChart({ history }: { history: Dashboard['history'] }) {
               {p.day} · 取消 {p.removed}
             </title>
           </rect>
-          {(i === 0 || i === 6 || i === 13) && (
-            <text x={30 + i * 23} y="215" textAnchor="middle" className="axis-label">
+          {(i === 0 || i === Math.floor((data.length - 1) / 2) || i === data.length - 1) && (
+            <text x={20 + (i + 0.5) * step} y="215" textAnchor="middle" className="axis-label">
               {p.day.slice(5).replace('-', '/')}
             </text>
           )}

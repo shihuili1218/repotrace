@@ -101,6 +101,9 @@ export interface ReleaseRecord {
   published_received_at: number | null;
   deleted_at: number | null;
   first_seen_at: number;
+  assets_count?: number | null;
+  assets_seen_at?: number | null;
+  assets_source?: 'webhook' | 'github' | null;
 }
 export interface MonitorMetrics {
   forks: number;
@@ -121,6 +124,10 @@ export interface MonitorMetrics {
 }
 export interface Dashboard {
   repositories: RepoSummary[];
+  range: StatisticsRange;
+  releaseChoices: ReleaseBoundary[];
+  releaseCatalog: { nextPage: number | null; updatedAt: number | null };
+  starNet: { added: number; removed: number };
   history: {
     day: string;
     total: number;
@@ -146,9 +153,10 @@ export interface Dashboard {
   metrics: MonitorMetrics;
   releaseMarkers: ReleaseRecord[];
 }
-export type MonitorType = 'forks' | 'issues' | 'pull_requests' | 'releases';
+export type MonitorType = 'stars' | 'forks' | 'issues' | 'pull_requests' | 'releases';
 export interface MonitorData {
   type: MonitorType;
+  stars: StarChange[];
   forks: ForkRecord[];
   items: WorkItem[];
   releases: ReleaseRecord[];
@@ -163,4 +171,45 @@ export interface WebhookConfig {
   url: string;
   secret?: string;
   settingsUrl: string;
+}
+
+export interface ReleaseBoundary {
+  github_id: number;
+  tag_name: string;
+  published_at: number;
+  prerelease: number;
+}
+export interface StatisticsRange {
+  mode: 'days' | 'releases';
+  since: number;
+  until: number;
+  bucketDays: number;
+  days: number;
+  label: string;
+  fromRelease: ReleaseBoundary | null;
+  toRelease: ReleaseBoundary | null;
+  coverageStart: number | null;
+  partial: boolean;
+  startDay: string;
+  endDay: string;
+}
+export interface ReleaseAsset {
+  project_id: string;
+  release_id: number;
+  github_id: number;
+  name: string;
+  size: number;
+  content_type: string;
+  state: string;
+  download_count: number | null;
+  download_url: string | null;
+  observed_at: number;
+}
+export interface AssetReport {
+  releaseId: number;
+  tag: string;
+  observedAt: number | null;
+  source: 'webhook' | 'github' | null;
+  deleted: boolean;
+  assets: ReleaseAsset[];
 }

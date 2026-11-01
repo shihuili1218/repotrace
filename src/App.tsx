@@ -38,7 +38,8 @@ import {
 import type { Dashboard, RepoSummary, WebhookConfig } from '../shared/types';
 import { api } from './api';
 import { ChangesChart, TrendChart } from './Charts';
-import { Monitoring, ActivityFeed } from './Monitoring';
+import { ActivityFeed } from './Monitoring';
+import { ProjectData } from './ProjectData';
 import { webhookEvents } from '../shared/monitors';
 
 type AuthStatus = { initialized: boolean; authenticated: boolean; setupProtected: boolean };
@@ -317,6 +318,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [mobileNav, setMobileNav] = useState(false);
   const [data, setData] = useState<Dashboard | null>(null);
   const [repo, setRepo] = useState('');
+  const [projectRepo, setProjectRepo] = useState('');
   const [summary, setSummary] = useState('');
   const [days, setDays] = useState(30);
   const [kind, setKind] = useState('all');
@@ -416,6 +418,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               className={`nav-item ${view === item.view ? 'active' : ''}`}
               aria-current={view === item.view ? 'page' : undefined}
               onClick={() => {
+                if (item.view === 'data' && !projectRepo && repo) setProjectRepo(repo);
                 setView(item.view);
                 setPage(1);
                 setMobileNav(false);
@@ -553,7 +556,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               </button>
             </div>
           )}
-          {view !== 'settings' && (
+          {view !== 'settings' && view !== 'data' && (
             <div className="filterbar">
               <div className="filterbar-controls">
                 <div className="select-wrap">
@@ -667,10 +670,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       tone="blue"
                     />
                     <Stat
-                      title="最近记录的正式版"
-                      value={data.metrics.latestRelease?.tag_name ?? '—'}
-                      icon={<Tag size={20} />}
-                      note={data.metrics.latestRelease?.full_name ?? '收到发布事件后显示'}
+                      title="当前已记录未关闭 Issue"
+                      value={number(data.metrics.openIssues)}
+                      icon={<MessageCircle size={20} />}
+                      note="所选项目当前已记录的反馈队列"
                       tone="purple"
                     />
                   </section>
@@ -696,13 +699,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                           ))}
                         </div>
                       </div>
-                      <TrendChart history={data.history} markers={data.releaseMarkers} />
-                      <div className="chart-legend">
-                        <span>
-                          <i className="legend-dot purple" />
-                          版本发布（含预发布）
-                        </span>
-                      </div>
+                      <TrendChart history={data.history} />
                     </section>
                     <section className="panel">
                       <div className="panel-header">
@@ -736,7 +733,15 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       </div>
                       <div className="repo-grid">
                         {shown.map((r) => (
-                          <RepoCard key={r.id} project={r} onConfigure={() => void configure(r)} />
+                          <RepoCard
+                            key={r.id}
+                            project={r}
+                            onConfigure={() => void configure(r)}
+                            onView={() => {
+                              setProjectRepo(r.id);
+                              setView('data');
+                            }}
+                          />
                         ))}
                       </div>
                     </>
@@ -751,7 +756,14 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                     <div className="repo-management">
                       {shown.map((r) => (
                         <div className="panel" key={r.id}>
-                          <RepoCard project={r} onConfigure={() => void configure(r)} />
+                          <RepoCard
+                            project={r}
+                            onConfigure={() => void configure(r)}
+                            onView={() => {
+                              setProjectRepo(r.id);
+                              setView('data');
+                            }}
+                          />
                           <div className="repo-actions">
                             <button
                               className="text-button"
@@ -785,12 +797,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                   </>
                 ))}
               {view === 'data' && (
-                <Monitoring
-                  repo={repo}
-                  days={days}
-                  metrics={data.metrics}
-                  history={data.history}
+                <ProjectData
                   repositories={repositories}
+                  projectId={projectRepo}
+                  onProjectChange={setProjectRepo}
                 />
               )}
               {view === 'activity' && (
@@ -1223,7 +1233,15 @@ function WebhookDialog({
     </Dialog>
   );
 }
-function RepoCard({ project: r, onConfigure }: { project: RepoSummary; onConfigure: () => void }) {
+function RepoCard({
+  project: r,
+  onConfigure,
+  onView,
+}: {
+  project: RepoSummary;
+  onConfigure: () => void;
+  onView: () => void;
+}) {
   const state = !r.enabled ? '已暂停' : r.last_received_at ? '已连接' : '待连接';
   return (
     <article className="repo-card panel">
@@ -1270,6 +1288,9 @@ function RepoCard({ project: r, onConfigure }: { project: RepoSummary; onConfigu
           <span className="status-dot" />
           {r.webhookConfigured ? '签名密钥已生成' : '等待配置 Webhook'}
         </span>
+        <button className="text-button" onClick={onView}>
+          查看数据
+        </button>
         <button className="text-button" onClick={onConfigure}>
           配置 Webhook <ArrowRight size={14} />
         </button>

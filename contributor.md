@@ -28,7 +28,9 @@ npm run test:e2e
 
 ```text
 src/                       React 网页、响应式样式、SVG 图表
-src/Monitoring.tsx         Fork / Issue / PR / Release 与统一动态
+src/ProjectData.tsx        单项目选择、Release 区间和版本目录同步
+src/Monitoring.tsx         Star / Fork / Issue / PR / Release 与统一动态
+src/ReleaseAssets.tsx      当前产物下载量与按需刷新
 shared/types.ts            前后端接口约定
 shared/monitors.ts         支持的事件与模块名称
 worker/index.ts            管理 API、鉴权、安全响应头
@@ -40,7 +42,10 @@ worker/events.ts           事件验证、归一化和各模块状态更新
 worker/webhook-secrets.ts  签名密钥加密；主密钥保存在 WEBHOOK_KEYS KV
 worker/time.ts             北京时间日期与自然日边界
 worker/dashboard.ts        实时 Star 净变化、总量趋势、统一动态
-worker/monitoring.ts       Fork / Issue / PR / Release 的统计、筛选及分页
+worker/monitoring.ts       单项目指标的统计、筛选及分页
+worker/range.ts            版本边界校验、半开区间与图表分组
+worker/release-assets.ts   产物验证与原子快照替换
+worker/public-releases.ts  免认证读取公开 Release 目录与完整产物清单
 tests/                     Workers + D1 集成测试
 e2e/                       Chromium 浏览器验证
 ```
@@ -55,10 +60,18 @@ Fork 按仓库 ID 去重，计数采用首次收到时间；GitHub 没有完整�
 
 Release 保存正式版、预发布、草稿、撤回和删除状态。相同版本只计一次首次收到的发布，编辑已有历史版本不会伪造新发布；删除的版本不会被延迟编辑事件恢复。图表的版本节点使用已记录的上游发布时间，不据此推断发版导致了 Star 增长。
 
-暂停期间仍验证并确认投递，但不记录业务事件或更新总量；已确认投递不会在恢复后因重投而补入。所有列表、状态和指标仅覆盖已收到的数据，不主动访问 GitHub，也不补齐历史积压。事件时间、接收时间和上游更新时间各自用于对应口径，不假定所有 GitHub 事件都带完整发生时间。
+暂停期间仍验证并确认投递，但不记录业务事件或更新总量；已确认投递不会在恢复后因重投而补入。事件列表、状态和指标只覆盖已收到的事件，不补齐历史积压。公开 Release 目录和产物下载量是独立的数据来源，按需匿名读取 GitHub 官方接口，不请求 Star 用户名单。事件时间、接收时间和上游更新时间各自用于对应口径，不假定所有 GitHub 事件都带完整发生时间。
 
 ## 数据迁移与新增指标
 
-迁移版本 1–3 用于兼容旧拉取和夜间汇总版本；版本 4 增加新模块并清除旧定时设置。新安装直接创建当前模型，避免建立再删除旧采集表。`wrangler.jsonc` 显式配置空 Cron 列表，以清除之前部署的计划。
+迁移版本 1–3 用于兼容旧拉取和夜间汇总版本；版本 4 增加新模块并清除旧定时设置；版本 5 添加产物快照和公开版本目录同步状态，保留管理员、签名密钥及原有事件。新安装直接创建当前模型，避免建立再删除旧采集表。`wrangler.jsonc` 显式配置空 Cron 列表，以清除之前部署的计划。
 
 新增指标时在 `shared/monitors.ts` 注册事件，为 `worker/events.ts` 添加独立处理逻辑，并在 `worker/db.ts` 追加迁移。复用签名验证、仓库身份和事务去重；不要为未支持的事件建立假统计。
+
+## 项目范围、Release 区间与下载量
+
+总览默认汇总所有项目，可按项目筛选；版本信息与发布标记只出现在单项目数据。`scope=project` 的 Dashboard 和 `/api/monitoring` 需要项目 ID。Release 区间使用该项目两个已发布版本的 `published_at`，验证身份、先后顺序和非未来时间，并将同一 `[since,until)` 应用于事件计数、图表、Star 净变化与列表。长区间自动按多天分组，最多约 90 个图表点；对监控启用前的时间显示覆盖不足提示。Issue / PR 仅筛出区间内有事件的条目，显示其当前已记录状态，不将其当成历史状态快照。
+
+`同步公开 Release` 每次读取一页 30 条，可继续加载更早版本。导入只更新版本目录，不插入业务事件、不计为新发版，也不更改 Webhook 连接状态。产物刷新先确认 GitHub 仓库稳定 ID，再分页读取目标 Release 的完整资产清单。请求固定使用 GitHub 官方 HTTPS API 的 JSON 响应，不发送认证信息，也不读取文件二进制；自动生成的源码压缩包不作为有下载计数的产物。
+
+产物快照包含每项累计 `download_count` 和实际读取时间，只保存当前清单。缺失计数保留为未知；空清单和数值 0 都是有效数据。Webhook 中的完整产物数组也可保存快照；较旧或已拒绝的投递不能覆盖新数据。公开接口失败或清单未读完时不改动旧快照，删除状态不会被迟到的公开响应恢复。打开列表时读取，页面可见时每 5 分钟更新；30 秒内复用已读取的公开快照。下载量不按历史区间切分，不推算历史增量，也没有下载量历史图表。

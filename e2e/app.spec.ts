@@ -250,6 +250,28 @@ test('shows signed fork, issue, PR and release events in modules and the unified
           prerelease: false,
           created_at: iso(now - 120),
           published_at: iso(now - 60),
+          assets: [
+            {
+              id: 701,
+              name: 'rssh-linux.zip',
+              size: 2048,
+              content_type: 'application/zip',
+              state: 'uploaded',
+              download_count: 100,
+              browser_download_url:
+                'https://github.com/owner/repo/releases/download/v1.2.0/rssh-linux.zip',
+            },
+            {
+              id: 702,
+              name: 'rssh-windows.zip',
+              size: 4096,
+              content_type: 'application/zip',
+              state: 'uploaded',
+              download_count: 200,
+              browser_download_url:
+                'https://github.com/owner/repo/releases/download/v1.2.0/rssh-windows.zip',
+            },
+          ],
         },
       },
     ],
@@ -257,8 +279,15 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   for (const [event, payload] of events)
     expect((await deliver(request, config.url, config.secret, event, payload)).status()).toBe(200);
   await page.goto('/');
-  await expect(page.locator('[aria-label="更多项目统计"]')).toContainText('v1.2.0');
+  await expect(page.getByText('v1.2.0', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('最近记录的正式版', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '项目数据', exact: true }).click();
+  await expect(page.getByRole('tab', { name: 'Star', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(page.getByRole('heading', { name: '项目 Star 总量', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: 'Fork', exact: true }).click();
   await expect(page.getByRole('img', { name: '每日新增 Fork 趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'forker/repo', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: 'Issue', exact: true }).click();
@@ -282,12 +311,61 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(page.getByRole('link', { name: 'v1.2.0', exact: true })).toBeVisible();
   await expect(page.locator('tbody')).toContainText('正式版');
   await expect(page.locator('tbody')).toContainText('1.0 天');
+  await page.route(`**/api/repositories/${id}/releases/402/assets`, async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    return route.fulfill({
+      json: {
+        releaseId: 402,
+        tag: 'v1.2.0',
+        source: 'github',
+        observedAt: now,
+        deleted: false,
+        assets: [
+          {
+            project_id: id,
+            release_id: 402,
+            github_id: 701,
+            name: 'rssh-linux.zip',
+            size: 2048,
+            content_type: 'application/zip',
+            state: 'uploaded',
+            download_count: 150,
+            download_url: 'https://github.com/owner/repo/releases/download/v1.2.0/rssh-linux.zip',
+            observed_at: now,
+          },
+          {
+            project_id: id,
+            release_id: 402,
+            github_id: 702,
+            name: 'rssh-windows.zip',
+            size: 4096,
+            content_type: 'application/zip',
+            state: 'uploaded',
+            download_count: 250,
+            download_url: 'https://github.com/owner/repo/releases/download/v1.2.0/rssh-windows.zip',
+            observed_at: now,
+          },
+        ],
+      },
+    });
+  });
+  await page.getByRole('button', { name: 'v1.2.0 产物下载量', exact: true }).click();
+  const panel = page.getByRole('region', { name: '产物下载量' });
+  await expect(panel.locator('tbody tr')).toHaveCount(2);
+  await expect(panel.locator('tbody')).toContainText('150');
+  await expect(panel.locator('tbody')).toContainText('250');
+  await expect(panel).toContainText('400');
+  await expect(panel.getByRole('img', { name: /趋势图|柱状图|历史|变化图/ })).toHaveCount(0);
+
   await page.screenshot({ path: 'test-results/releases-desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect
     .poll(() => page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().right))
     .toBeLessThanOrEqual(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await panel.getByRole('link', { name: 'rssh-linux.zip', exact: true }).scrollIntoViewIfNeeded();
+  await expect(panel.getByText('150', { exact: true })).toBeInViewport();
+  await expect(panel.getByRole('link', { name: 'rssh-linux.zip', exact: true })).toBeInViewport();
   await page.screenshot({ path: 'test-results/releases-mobile.png', fullPage: true });
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '项目动态', exact: true }).click();
@@ -355,7 +433,9 @@ async function fixture(page: import('@playwright/test').Page, data: unknown) {
   await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data }));
 }
 
-test('renders live charts and release markers on desktop and mobile', async ({ page }) => {
+test('renders aggregate overview charts without release details on desktop and mobile', async ({
+  page,
+}) => {
   const day = (offset: number) =>
     new Date((now + 8 * 3600 - offset * 86400) * 1000).toISOString().slice(0, 10);
   await fixture(page, {
@@ -460,4 +540,136 @@ test('guides a migrated project through first-time signing setup and lists the n
   await page.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
   await expect(page.locator('#hook-secret')).toHaveCount(0);
+});
+
+test('keeps overview aggregated and shows project Star statistics between two Release publication times', async ({
+  page,
+  request,
+}) => {
+  await page.request.post('/api/auth/login', { headers: { Origin: origin }, data: { password } });
+  const config = await (
+    await page.request.post('/api/repositories', {
+      headers: { Origin: origin },
+      data: { repository: 'owner/interval' },
+    })
+  ).json();
+  const repo = (total: number) => ({
+    id: 102,
+    full_name: 'owner/interval',
+    stargazers_count: total,
+    forks_count: 0,
+  });
+  const now = Math.floor(Date.now() / 1000);
+  const base = {
+    author: { id: 1, login: 'octocat' },
+    draft: false,
+    prerelease: false,
+    created_at: new Date((now - 1) * 1000).toISOString(),
+  };
+  await deliver(request, config.url, config.secret, 'release', {
+    repository: repo(0),
+    action: 'published',
+    release: {
+      ...base,
+      id: 801,
+      tag_name: 'vA',
+      name: 'A',
+      published_at: new Date((now - 1) * 1000).toISOString(),
+    },
+  });
+  await deliver(request, config.url, config.secret, 'star', {
+    repository: repo(1),
+    sender: { id: 90, login: 'version-user' },
+  });
+  const snapshot = await (
+    await page.request.get(`/api/dashboard?repo=${config.id}&scope=project`)
+  ).json();
+  const cutoff =
+    snapshot.timeline.find((e: { category: string }) => e.category === 'star').received_at + 1;
+  await expect.poll(() => Math.floor(Date.now() / 1000) >= cutoff).toBe(true);
+  await deliver(request, config.url, config.secret, 'release', {
+    repository: repo(1),
+    action: 'published',
+    release: {
+      ...base,
+      id: 802,
+      tag_name: 'vB',
+      name: 'B',
+      published_at: new Date(cutoff * 1000).toISOString(),
+    },
+  });
+  await deliver(request, config.url, config.secret, 'star', {
+    repository: repo(0),
+    action: 'deleted',
+    sender: { id: 90, login: 'version-user' },
+    starred_at: null,
+  });
+  await page.goto('/');
+  await expect(page.getByLabel('选择项目')).toHaveValue('');
+  await expect(page.getByText('vB', { exact: true })).toHaveCount(0);
+  await page
+    .locator('.repo-card')
+    .filter({ hasText: 'owner/interval' })
+    .getByRole('button', { name: '查看数据', exact: true })
+    .click();
+  await expect(page.getByLabel('项目数据选择项目')).toHaveValue(config.id);
+  await expect(page.getByLabel('选择项目', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('tab', { name: 'Star', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await page.getByLabel('项目统计时间').selectOption('releases');
+  await expect(page.getByLabel('起始 Release')).toHaveValue('801');
+  await expect(page.getByLabel('结束 Release')).toHaveValue('802');
+  await expect(page.locator('.range-description')).toContainText('vA → vB');
+  await expect(
+    page.locator('.module-metric').filter({ hasText: '截至区间末 Stars' }).locator('strong'),
+  ).toHaveText('1');
+  await expect(
+    page.locator('.module-metric').filter({ hasText: '区间净新增用户' }).locator('strong'),
+  ).toHaveText('1');
+  await expect(page.getByRole('link', { name: 'version-user', exact: true })).toBeVisible();
+  await page.getByLabel('Star 记录方式').selectOption('events');
+  await expect(page.getByRole('link', { name: 'version-user', exact: true })).toBeVisible();
+  await page.screenshot({ path: 'test-results/project-star-interval-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: 'test-results/project-star-interval-mobile.png', fullPage: true });
+});
+
+test('switching projects during a public Release sync cannot replace the newly selected project data', async ({
+  page,
+}) => {
+  await page.request.post('/api/auth/login', { headers: { Origin: origin }, data: { password } });
+  const list = await (await page.request.get('/api/dashboard')).json();
+  const first = list.repositories.find((r: { full_name: string }) => r.full_name === 'owner/repo');
+  const second = list.repositories.find(
+    (r: { full_name: string }) => r.full_name === 'owner/interval',
+  );
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  let entered = false;
+  await page.route(`**/api/repositories/${first.id}/releases/sync`, async (route) => {
+    entered = true;
+    await gate;
+    await route.fulfill({
+      json: { nextPage: null, count: 0, updatedAt: Math.floor(Date.now() / 1000) },
+    });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: '项目数据', exact: true }).click();
+  await expect(page.getByLabel('项目数据选择项目')).toHaveValue(first.id);
+  await page.getByRole('button', { name: '同步公开 Release', exact: true }).click();
+  await expect.poll(() => entered).toBe(true);
+  await page.getByLabel('项目数据选择项目').selectOption(second.id);
+  await expect(page.locator('.range-description')).toContainText('owner/interval');
+  await expect(page.getByRole('heading', { name: '项目 Star 总量', exact: true })).toBeVisible();
+  releaseGate();
+  await expect(page.getByLabel('项目数据选择项目')).toHaveValue(second.id);
+  await expect(page.locator('.range-description')).toContainText('owner/interval');
 });

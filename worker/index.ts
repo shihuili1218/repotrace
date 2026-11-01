@@ -15,6 +15,7 @@ import { parseRepository } from './projects';
 import { sealWebhookSecret, secretStatement } from './webhook-secrets';
 import { newWebhookSecret, receiveWebhook } from './webhooks';
 import { monitoring } from './monitoring';
+import { syncPublicReleases, refreshPublicAssets, assetReport } from './public-releases';
 import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
 
@@ -149,6 +150,26 @@ async function api(request: Request, env: Env) {
       throw error;
     }
     return json(webhookConfig(url.origin, id, name, secret), 201);
+  }
+  const releasePath = path.match(
+    /^\/api\/repositories\/([^/]+)\/releases\/(sync|([1-9][0-9]*)\/assets)$/,
+  );
+  if (releasePath) {
+    const project = releasePath[1];
+    if (!(await env.DB.prepare('SELECT 1 FROM projects WHERE id=?').bind(project).first()))
+      throw new AppError(404, '项目不存在。');
+    if (releasePath[2] === 'sync' && method === 'POST') {
+      const data = await body(request);
+      return json(
+        await syncPublicReleases(env, project, data.page === undefined ? 1 : (data.page as number)),
+      );
+    }
+    if (releasePath[3]) {
+      const id = Number(releasePath[3]);
+      if (!Number.isSafeInteger(id)) throw new AppError(400, '版本 ID 无效。');
+      if (method === 'GET') return json(await assetReport(env.DB, project, id));
+      if (method === 'POST') return json(await refreshPublicAssets(env, project, id));
+    }
   }
   const repository = path.match(/^\/api\/repositories\/([^/]+)(?:\/(webhook))?$/);
   if (repository) {

@@ -119,6 +119,24 @@ export const migrations = [
     `CREATE INDEX release_history ON releases(project_id,published_at)`,
     `DELETE FROM monitor_settings WHERE key IN ('daily_hour','last_cron_at')`,
   ],
+  [
+    `ALTER TABLE releases ADD COLUMN metadata_observed_at INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE releases ADD COLUMN assets_seen_at INTEGER`,
+    `ALTER TABLE releases ADD COLUMN assets_source TEXT`,
+    `ALTER TABLE releases ADD COLUMN assets_snapshot_id TEXT`,
+    `UPDATE releases SET metadata_observed_at=COALESCE((SELECT received_at FROM webhook_deliveries WHERE seq=releases.last_delivery_seq),first_seen_at)`,
+    `CREATE TABLE release_assets (
+      project_id TEXT NOT NULL, release_id INTEGER NOT NULL, github_id INTEGER NOT NULL,
+      name TEXT NOT NULL, size INTEGER NOT NULL, content_type TEXT NOT NULL, state TEXT NOT NULL,
+      download_count INTEGER, download_url TEXT, observed_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id,release_id,github_id),
+      FOREIGN KEY(project_id,release_id) REFERENCES releases(project_id,github_id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE release_catalog_sync (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+      last_page INTEGER NOT NULL, next_page INTEGER, updated_at INTEGER NOT NULL
+    )`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();
@@ -146,12 +164,23 @@ export async function initDB(db: D1Database) {
             ...migrations[2]
               .filter((sql) => sql.startsWith('CREATE '))
               .map((sql) => db.prepare(sql)),
-            ...migrations[3].map((sql) => db.prepare(sql)),
-            db.prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES (1),(2),(3),(4)'),
+            ...migrations
+              .slice(3)
+              .flat()
+              .map((sql) => db.prepare(sql)),
+            db.prepare(
+              `INSERT OR IGNORE INTO schema_migrations(version) VALUES ${migrations.map((_, i) => `(${i + 1})`).join(',')}`,
+            ),
           ]);
           return;
         } catch (error) {
-          if (await db.prepare('SELECT 1 FROM schema_migrations WHERE version=4').first()) return;
+          if (
+            await db
+              .prepare('SELECT 1 FROM schema_migrations WHERE version=?')
+              .bind(migrations.length)
+              .first()
+          )
+            return;
           throw error;
         }
       }

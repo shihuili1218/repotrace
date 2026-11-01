@@ -9,6 +9,7 @@ import {
   MessageCircle,
   RefreshCw,
   Tag,
+  Star,
 } from 'lucide-react';
 import type {
   Dashboard,
@@ -20,7 +21,8 @@ import type {
 } from '../shared/types';
 import { categoryLabels, type Category } from '../shared/monitors';
 import { api } from './api';
-import { ForkChart, WorkChart } from './Charts';
+import { ForkChart, WorkChart, TrendChart, ChangesChart } from './Charts';
+import { ReleaseAssets } from './ReleaseAssets';
 
 export const duration = (seconds: number | null) =>
   seconds === null
@@ -166,15 +168,22 @@ export function Monitoring({
   metrics,
   history,
   repositories,
+  dashboard,
+  rangeQuery,
 }: {
   repo: string;
   days: number;
   metrics: MonitorMetrics;
   history: Dashboard['history'];
   repositories: RepoSummary[];
+  dashboard: Dashboard;
+  rangeQuery: string;
 }) {
-  const [type, setType] = useState<MonitorType>('forks');
+  const [type, setType] = useState<MonitorType>('stars');
   const [state, setState] = useState('all');
+  const [starMode, setStarMode] = useState('net');
+  const [starKind, setStarKind] = useState('all');
+  const [assetId, setAssetId] = useState<number | null>(null);
   const [label, setLabel] = useState('');
   const [page, setPage] = useState(1);
   const [data, setData] = useState<MonitorData | null>(null);
@@ -185,9 +194,18 @@ export function Monitoring({
     const id = ++requestId.current;
     setLoading(true);
     try {
-      const next = await api<MonitorData>(
-        `/monitoring?${new URLSearchParams({ repo, type, state, label, page: String(page) })}`,
-      );
+      const parameters = new URLSearchParams(rangeQuery);
+      for (const [key, value] of Object.entries({
+        repo,
+        type,
+        state,
+        label,
+        page: String(page),
+        starMode,
+        starKind,
+      }))
+        parameters.set(key, value);
+      const next = await api<MonitorData>(`/monitoring?${parameters}`);
       if (id === requestId.current) {
         setData(next);
         setError('');
@@ -197,7 +215,7 @@ export function Monitoring({
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [repo, type, state, label, page]);
+  }, [repo, type, state, label, page, rangeQuery, starMode, starKind]);
   useEffect(() => {
     setData(null);
     void load();
@@ -237,45 +255,76 @@ export function Monitoring({
   const knownForks = repositories.filter(
     (r) => (!repo || r.id === repo) && r.current_forks !== null,
   );
+  const period = dashboard.range.label;
+  const grouping =
+    dashboard.range.bucketDays === 1 ? '北京时间自然日' : `每 ${dashboard.range.bucketDays} 天分组`;
   const tabs = [
+    { id: 'stars' as const, label: 'Star', icon: <Star size={16} /> },
     { id: 'forks' as const, label: 'Fork', icon: <GitFork size={16} /> },
     { id: 'issues' as const, label: 'Issue', icon: <MessageCircle size={16} /> },
     { id: 'pull_requests' as const, label: 'Pull Request', icon: <GitPullRequest size={16} /> },
     { id: 'releases' as const, label: 'Release', icon: <Tag size={16} /> },
   ];
+  const tabBar = (
+    <div className="monitor-tabs" role="tablist" aria-label="监控维度">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          role="tab"
+          aria-selected={type === tab.id}
+          className={type === tab.id ? 'active' : ''}
+          onClick={() => {
+            setType(tab.id);
+            setState('all');
+            setLabel('');
+            setPage(1);
+          }}
+        >
+          {tab.icon}
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  );
+  if (type === 'stars')
+    return (
+      <div className="monitor-view">
+        {tabBar}
+        <StarStatistics
+          dashboard={dashboard}
+          data={data}
+          loading={loading}
+          error={error}
+          mode={starMode}
+          kind={starKind}
+          onMode={(value) => {
+            setStarMode(value);
+            setPage(1);
+          }}
+          onKind={(value) => {
+            setStarKind(value);
+            setPage(1);
+          }}
+          onPage={setPage}
+          onRefresh={() => void load()}
+        />
+      </div>
+    );
   return (
     <div className="monitor-view">
-      <div className="monitor-tabs" role="tablist" aria-label="监控维度">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            role="tab"
-            aria-selected={type === tab.id}
-            className={type === tab.id ? 'active' : ''}
-            onClick={() => {
-              setType(tab.id);
-              setState('all');
-              setLabel('');
-              setPage(1);
-            }}
-          >
-            {tab.icon}
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      {tabBar}
       <div className={`module-metrics ${type === 'forks' || type === 'releases' ? 'pair' : ''}`}>
         {type === 'forks' ? (
           <>
             <Metric
-              label="最近上报 Forks"
+              label="截至区间末 Forks"
               value={
-                knownForks.length ? knownForks.reduce((sum, r) => sum + r.current_forks!, 0) : '—'
+                dashboard.history.at(-1)?.fork_repos ? dashboard.history.at(-1)!.fork_total : '—'
               }
               note="来自最近收到的仓库信息"
             />
             <Metric
-              label={`近 ${days} 天新增 Fork`}
+              label={`${period}新增 Fork`}
               value={metrics.forks}
               note="按首次收到该 Fork 的时间统计"
             />
@@ -283,9 +332,9 @@ export function Monitoring({
         ) : type === 'issues' ? (
           <>
             <Metric
-              label="已记录未关闭 Issue"
+              label="区间活跃 Issue 当前未关闭"
               value={metrics.openIssues}
-              note="仅含启用后收到过事件的条目"
+              note="所选期间有活动的条目，显示当前状态"
             />
             <Metric
               label="其中未回复"
@@ -293,7 +342,7 @@ export function Monitoring({
               note="没有收到其他人的人工回复"
             />
             <Metric
-              label={`近 ${days} 天新建 / 关闭`}
+              label={`${period}新建 / 关闭`}
               value={`${metrics.issuesOpened} / ${metrics.issuesClosed}`}
               note="分别统计发生过对应操作的 Issue"
             />
@@ -306,9 +355,9 @@ export function Monitoring({
         ) : type === 'pull_requests' ? (
           <>
             <Metric
-              label="已记录未关闭 PR"
+              label="区间活跃 PR 当前未关闭"
               value={metrics.openPRs}
-              note="仅含启用后收到过事件的 PR"
+              note="所选期间有活动的 PR，显示当前状态"
             />
             <Metric
               label="其中待评审"
@@ -316,7 +365,7 @@ export function Monitoring({
               note="非草稿且尚无有效的已记录评审"
             />
             <Metric
-              label={`近 ${days} 天新建 / 合并 / 关闭`}
+              label={`${period}新建 / 合并 / 关闭`}
               value={`${metrics.prsOpened} / ${metrics.prsMerged} / ${metrics.prsClosed}`}
               note="关闭不含合并；按发生过对应操作的条目去重"
             />
@@ -334,7 +383,7 @@ export function Monitoring({
               note={metrics.latestRelease?.full_name ?? '收到正式发布事件后显示'}
             />
             <Metric
-              label={`近 ${days} 天发布版本`}
+              label={`${period}发布版本`}
               value={metrics.releasesPublished}
               note="包括正式版与预发布，同一版本只计一次"
             />
@@ -346,7 +395,9 @@ export function Monitoring({
           <div className="panel-header">
             <div>
               <h2>Fork 新增趋势</h2>
-              <p>北京时间自然日 · 最近 {days} 天</p>
+              <p>
+                {grouping} · {period}
+              </p>
             </div>
           </div>
           <ForkChart history={history} />
@@ -357,7 +408,7 @@ export function Monitoring({
           <div className="panel-header">
             <div>
               <h2>{type === 'issues' ? 'Issue 每日变化' : 'PR 每日变化'}</h2>
-              <p>北京时间自然日 · 统计当天发生过对应操作的条目</p>
+              <p>{grouping} · 统计发生过对应操作的条目</p>
             </div>
           </div>
           <WorkChart history={history} mode={type} />
@@ -369,6 +420,7 @@ export function Monitoring({
             <h2>
               {
                 {
+                  stars: 'Star 名单',
                   forks: 'Fork 名单',
                   issues: 'Issue 跟踪',
                   pull_requests: 'PR 跟踪',
@@ -380,8 +432,8 @@ export function Monitoring({
               {type === 'forks'
                 ? 'GitHub 只通知新增 Fork，无法据此追踪删除。'
                 : type === 'releases'
-                  ? '相邻已记录发布之间的间隔；版本节点同步显示在 Star 图上。'
-                  : '只展示收到过事件的条目，可能不包含仓库原有的全部待办。'}
+                  ? '版本与产物属于当前项目。下载量为当前累计值，不按历史区间切分。'
+                  : '只展示所选期间有事件的条目，状态为当前已记录状态。'}
             </p>
           </div>
           <div className="module-filters">
@@ -458,6 +510,7 @@ export function Monitoring({
                         <th>发布者</th>
                         <th>发布时间</th>
                         <th>距上次发布</th>
+                        <th>产物下载量</th>
                       </>
                     ) : (
                       <>
@@ -537,6 +590,18 @@ export function Monitoring({
                               {r.published_at && r.previous_published_at
                                 ? duration(r.published_at - r.previous_published_at)
                                 : '—'}
+                            </td>
+                            <td>
+                              <button
+                                className="text-button"
+                                aria-label={`${r.tag_name} 产物下载量`}
+                                onClick={() => setAssetId(r.github_id)}
+                              >
+                                查看产物
+                                {r.assets_count === undefined || r.assets_count === null
+                                  ? ''
+                                  : `（${r.assets_count}）`}
+                              </button>
                             </td>
                           </tr>
                         ))
@@ -623,6 +688,14 @@ export function Monitoring({
             ))}
           </div>
         </section>
+      )}
+      {type === 'releases' && assetId !== null && (
+        <ReleaseAssets
+          key={`${repo}:${assetId}`}
+          repo={repo}
+          releaseId={assetId}
+          onClose={() => setAssetId(null)}
+        />
       )}
     </div>
   );
@@ -711,5 +784,166 @@ export function ActivityFeed({
         <Empty>配置对应的 GitHub Webhook 事件后，这里会持续记录项目的变化。</Empty>
       )}
     </section>
+  );
+}
+
+function StarStatistics({
+  dashboard,
+  data,
+  loading,
+  error,
+  mode,
+  kind,
+  onMode,
+  onKind,
+  onPage,
+  onRefresh,
+}: {
+  dashboard: Dashboard;
+  data: MonitorData | null;
+  loading: boolean;
+  error: string;
+  mode: string;
+  kind: string;
+  onMode: (value: string) => void;
+  onKind: (value: string) => void;
+  onPage: (value: number) => void;
+  onRefresh: () => void;
+}) {
+  const last = dashboard.history.at(-1);
+  const net = dashboard.starNet;
+  return (
+    <>
+      <div className="module-metrics">
+        <Metric
+          label="截至区间末 Stars"
+          value={last?.repos ? last.total : '—'}
+          note="结束时刻之前最近一次上报值"
+        />
+        <Metric label="区间净新增用户" value={net.added} note="同一用户区间内相反操作相互抵消" />
+        <Metric label="区间净取消用户" value={net.removed} note="按 GitHub 稳定用户 ID 识别" />
+        <Metric
+          label="区间用户净变化"
+          value={`${net.added - net.removed > 0 ? '+' : ''}${net.added - net.removed}`}
+          note={`共收到 ${dashboard.eventCounts.added} 次新增、${dashboard.eventCounts.removed} 次取消事件`}
+        />
+      </div>
+      <div className="chart-grid">
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h2>项目 Star 总量</h2>
+              <p>{dashboard.range.label} · 结束时刻之前最近上报值</p>
+            </div>
+          </div>
+          <TrendChart history={dashboard.history} markers={dashboard.releaseMarkers} />
+          <div className="chart-legend">
+            <span>
+              <i className="legend-dot purple" />
+              当前项目版本发布
+            </span>
+          </div>
+        </section>
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h2>区间 Star 净变化</h2>
+              <p>
+                {dashboard.range.bucketDays === 1
+                  ? '按自然日'
+                  : `每 ${dashboard.range.bucketDays} 天分组`}{' '}
+                · 同一用户反向操作相互抵消
+              </p>
+            </div>
+          </div>
+          <ChangesChart history={dashboard.history} fullRange />
+          <div className="chart-legend">
+            <span>
+              <i className="legend-dot green" />
+              新增
+            </span>
+            <span>
+              <i className="legend-dot red" />
+              取消
+            </span>
+          </div>
+        </section>
+      </div>
+      <section className="panel">
+        <div className="panel-header">
+          <div>
+            <h2>Star 用户记录</h2>
+            <p>按所选区间内收到的事件统计</p>
+          </div>
+          <div className="module-filters">
+            <select
+              aria-label="Star 记录方式"
+              value={mode}
+              onChange={(e) => onMode(e.target.value)}
+            >
+              <option value="net">区间用户净变化</option>
+              <option value="events">逐次 Star 事件</option>
+            </select>
+            <select
+              aria-label="Star 变化类型"
+              value={kind}
+              onChange={(e) => onKind(e.target.value)}
+            >
+              <option value="all">全部变化</option>
+              <option value="added">新增 Star</option>
+              <option value="removed">取消 Star</option>
+            </select>
+            <button
+              className="icon-button"
+              aria-label="刷新 Star 数据"
+              disabled={loading}
+              onClick={onRefresh}
+            >
+              <RefreshCw size={15} className={loading ? 'spin' : ''} />
+            </button>
+          </div>
+        </div>
+        {error && (
+          <div className="error-banner" role="alert">
+            {error}
+          </div>
+        )}
+        {!data ? (
+          <p className="small-empty">正在读取 Star 记录…</p>
+        ) : !data.total ? (
+          <Empty>所选时间和筛选条件内暂无 Star 用户变化。</Empty>
+        ) : (
+          <>
+            <div className="table-scroll">
+              <table className="monitor-table">
+                <thead>
+                  <tr>
+                    <th>GitHub 用户</th>
+                    <th>变化</th>
+                    <th>收到时间 · 北京时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.stars.map((item) => (
+                    <tr key={item.id}>
+                      <td>
+                        <User login={item.login} id={item.user_id} />
+                      </td>
+                      <td>
+                        <span className={`pill ${item.kind === 'added' ? 'green' : 'red'}`}>
+                          {item.kind === 'added' ? '新增 Star' : '取消 Star'}
+                        </span>
+                      </td>
+                      <td>{when(item.observed_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <PageButtons page={data.page} total={data.total} onPage={onPage} />
+          </>
+        )}
+      </section>
+    </>
   );
 }

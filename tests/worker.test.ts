@@ -602,7 +602,11 @@ const release = (id = 2001, patch: Record<string, unknown> = {}) => ({
   ...patch,
 });
 async function monitor(session: string, type: string, query = '') {
-  const response = await request(`/monitoring?type=${type}${query}`, 'GET', undefined, session);
+  const project = await env.DB.prepare(
+    'SELECT id FROM projects ORDER BY created_at,id LIMIT 1',
+  ).first<{ id: string }>();
+  const scoped = query.includes('&repo=') ? query : `${query}&repo=${project!.id}`;
+  const response = await request(`/monitoring?type=${type}${scoped}`, 'GET', undefined, session);
   expect(response.status).toBe(200);
   return response.json<MonitorData>();
 }
@@ -886,7 +890,7 @@ describe('release history', () => {
       action: 'published',
       release: release(2002, { prerelease: true }),
     });
-    const data = await dashboard(session);
+    const data = await dashboard(session, `?repo=${config.id}&scope=project`);
     expect(data.metrics.releasesPublished).toBe(2);
     expect(data.metrics.latestRelease?.tag_name).toBe('v1.1.0');
     expect(data.releaseMarkers).toHaveLength(2);
@@ -900,16 +904,22 @@ describe('release history', () => {
       action: 'created',
       release: release(2001, { draft: true, published_at: null }),
     });
-    expect((await dashboard(session)).metrics.latestRelease).toBeNull();
+    expect(
+      (await dashboard(session, `?repo=${config.id}&scope=project`)).metrics.latestRelease,
+    ).toBeNull();
     expect((await monitor(session, 'releases', '&state=draft')).total).toBe(1);
     const version = release(2002);
     await signed(config, 'release', { action: 'published', release: version });
     await signed(config, 'release', { action: 'unpublished', release: version });
-    expect((await dashboard(session)).metrics.latestRelease).toBeNull();
+    expect(
+      (await dashboard(session, `?repo=${config.id}&scope=project`)).metrics.latestRelease,
+    ).toBeNull();
     await signed(config, 'release', { action: 'deleted', release: version });
     await signed(config, 'release', { action: 'edited', release: version });
     expect((await monitor(session, 'releases', '&state=deleted')).total).toBe(1);
-    expect((await dashboard(session)).releaseMarkers).toHaveLength(0);
+    expect(
+      (await dashboard(session, `?repo=${config.id}&scope=project`)).releaseMarkers,
+    ).toHaveLength(0);
   });
 });
 
@@ -1111,5 +1121,293 @@ it('computes Issue and PR daily changes immediately and counts direct PR closure
     prsOpened: 1,
     prsMerged: 1,
     prsClosed: 1,
+  });
+});
+
+const artifact = (id = 1, count: number | null = 20) => ({
+  id,
+  name: `artifact-${id}.zip`,
+  size: 2048,
+  content_type: 'application/zip',
+  state: 'uploaded',
+  download_count: count,
+  browser_download_url: `https://github.com/owner/repo/releases/download/v1.1.0/artifact-${id}.zip`,
+});
+async function assets(session: string, config: WebhookConfig, releaseId = 2001, method = 'GET') {
+  return request(`/repositories/${config.id}/releases/${releaseId}/assets`, method, {}, session);
+}
+function publicGitHub(handler: (url: string) => Response | Promise<Response>) {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = String(input);
+    expect(url.startsWith('https://api.github.com/repos/owner/repo')).toBe(true);
+    expect(new Headers(init?.headers).has('Authorization')).toBe(false);
+    expect(new Headers(init?.headers).get('Accept')).toBe('application/vnd.github+json');
+    if (url === 'https://api.github.com/repos/owner/repo')
+      return Response.json({ id: 100, full_name: 'owner/repo', private: false });
+    return handler(url);
+  });
+}
+
+describe('project scope and Release intervals', () => {
+  it('keeps overview release-free while single-project data has its own releases and Star net changes', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', { action: 'published', release: release() });
+    const overview = await dashboard(session);
+    expect(overview.metrics.latestRelease).toBeNull();
+    expect(overview.releaseMarkers).toEqual([]);
+    expect(overview.releaseChoices).toEqual([]);
+    const data = await dashboard(session, `?repo=${config.id}&scope=project`);
+    expect(data.releaseChoices).toHaveLength(1);
+    expect(data.metrics.latestRelease?.tag_name).toBe('v1.1.0');
+    expect((await request('/monitoring?type=stars', 'GET', undefined, session)).status).toBe(400);
+  });
+  it('clips all event statistics to [first release, second release) including partial calendar days', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const start = nowSeconds() - 3600;
+    const end = nowSeconds() - 1800;
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { published_at: iso(start) }),
+    });
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2002, { published_at: iso(end) }),
+    });
+    for (const [at, id, action, total] of [
+      [start - 1, 9, 'created', 50],
+      [start, 1, 'created', 51],
+      [start + 10, 2, 'created', 52],
+      [start + 20, 2, 'deleted', 51],
+      [end - 1, 3, 'deleted', 50],
+      [end, 4, 'created', 999],
+    ] as const)
+      await signed(
+        config,
+        'star',
+        {
+          action,
+          sender: { id, login: `user-${id}` },
+          repository: { id: 100, full_name: 'owner/repo', stargazers_count: total },
+        },
+        crypto.randomUUID(),
+        at,
+      );
+    await signed(config, 'issues', { action: 'opened', issue: item() }, crypto.randomUUID(), start);
+    await signed(
+      config,
+      'issues',
+      { action: 'opened', issue: item(1002) },
+      crypto.randomUUID(),
+      end,
+    );
+    const query = `&repo=${config.id}&range=releases&fromRelease=2001&toRelease=2002`;
+    const data = await dashboard(session, `?scope=project${query}`);
+    expect(data.range).toMatchObject({ since: start, until: end });
+    expect(data.eventCounts).toEqual({ added: 2, removed: 2 });
+    expect(data.starNet).toEqual({ added: 1, removed: 1 });
+    expect(data.history.at(-1)).toMatchObject({ total: 50, issue_opened: 1 });
+    expect(data.metrics.issuesOpened).toBe(1);
+    expect(data.releaseMarkers.map((r) => r.github_id)).toEqual([2001]);
+    const net = await monitor(session, 'stars', query);
+    expect(net.stars.map((r) => r.user_id).sort()).toEqual([1, 3]);
+    expect((await monitor(session, 'stars', `${query}&starMode=events`)).total).toBe(4);
+    expect((await monitor(session, 'issues', query)).items.map((r) => r.github_id)).toEqual([1001]);
+  });
+  it('rejects reversed, missing, cross-project and unpublished release boundaries', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const other = await add(session, 'another/project');
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { published_at: iso(nowSeconds() - 100) }),
+    });
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2002, { published_at: iso(nowSeconds() - 50) }),
+    });
+    await signed(other, 'release', {
+      action: 'published',
+      release: release(3001),
+      repository: { id: 101, full_name: 'another/project' },
+    });
+    for (const [from, to] of [
+      [2002, 2001],
+      [2001, 2001],
+      [2001, 9999],
+      [2001, 3001],
+    ])
+      expect(
+        (
+          await request(
+            `/dashboard?scope=project&repo=${config.id}&range=releases&fromRelease=${from}&toRelease=${to}`,
+            'GET',
+            undefined,
+            session,
+          )
+        ).status,
+      ).toBe(400);
+    expect(
+      (
+        await request(
+          '/dashboard?range=releases&fromRelease=2001&toRelease=2002',
+          'GET',
+          undefined,
+          session,
+        )
+      ).status,
+    ).toBe(400);
+  });
+  it('bounds long release intervals to at most 90 chart buckets and reports missing historical coverage', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { published_at: iso(nowSeconds() - 800 * 86400) }),
+    });
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2002, { published_at: iso(nowSeconds() - 10) }),
+    });
+    const data = await dashboard(
+      session,
+      `?scope=project&repo=${config.id}&range=releases&fromRelease=2001&toRelease=2002`,
+    );
+    expect(data.range.bucketDays).toBeGreaterThan(1);
+    expect(data.range.partial).toBe(true);
+    expect(data.history.length).toBeLessThanOrEqual(90);
+    expect(data.range.days).toBeGreaterThan(790);
+  });
+});
+
+describe('current Release artifact downloads', () => {
+  it('stores per-artifact webhook snapshots, preserves unknown counts and accepts an empty current list', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { assets: [artifact(1, 12), artifact(2, null)] }),
+    });
+    let report = await (
+      await assets(session, config)
+    ).json<{ assets: { name: string; download_count: number | null }[]; source: string }>();
+    expect(report.source).toBe('webhook');
+    expect(report.assets.map((r) => r.download_count)).toEqual([12, null]);
+    await signed(config, 'release', { action: 'edited', release: release(2001, { assets: [] }) });
+    report = await (await assets(session, config)).json<typeof report>();
+    expect(report.assets).toEqual([]);
+  });
+  it('imports public release metadata without inventing webhook events or resetting signing secrets', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const outgoing = publicGitHub((url) => {
+      expect(url).toContain('/releases?per_page=30&page=1');
+      return Response.json(
+        [release(2001), release(2002, { published_at: iso(nowSeconds() - 10) })],
+        {
+          headers: {
+            Link: '<https://api.github.com/repos/owner/repo/releases?per_page=30&page=2>; rel="next"',
+          },
+        },
+      );
+    });
+    const response = await request(
+      `/repositories/${config.id}/releases/sync`,
+      'POST',
+      { page: 1 },
+      session,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ count: 2, nextPage: 2 });
+    const data = await dashboard(session, `?repo=${config.id}&scope=project`);
+    expect(data.releaseChoices).toHaveLength(2);
+    expect(data.metrics.releasesPublished).toBe(0);
+    expect(data.repositories[0].last_received_at).toBeNull();
+    expect(await scalar('SELECT COUNT(*) AS count FROM project_events')).toBe(0);
+    expect((await getWebhookCredentials(env, config.id))?.secret).toBe(config.secret);
+    await request(`/repositories/${config.id}/releases/sync`, 'POST', { page: 1 }, session);
+    expect(outgoing).toHaveBeenCalledTimes(2);
+  });
+  it('refreshes every page of asset metadata, sends no credential, and reuses a short-lived current snapshot', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', { action: 'published', release: release() });
+    const outgoing = publicGitHub((url) => {
+      if (url.endsWith('/releases/2001')) return Response.json(release());
+      if (url.endsWith('assets?per_page=100&page=1'))
+        return Response.json(
+          Array.from({ length: 100 }, (_, i) => artifact(i + 1, i + 1)),
+          {
+            headers: {
+              Link: '<https://api.github.com/repos/owner/repo/releases/2001/assets?per_page=100&page=2>; rel="next"',
+            },
+          },
+        );
+      if (url.endsWith('assets?per_page=100&page=2')) return Response.json([artifact(101, 101)]);
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    const response = await assets(session, config, 2001, 'POST');
+    expect(response.status).toBe(200);
+    const report = await response.json<{
+      assets: { download_count: number }[];
+      source: string;
+      observedAt: number;
+    }>();
+    expect(report.assets).toHaveLength(101);
+    expect(report.assets.reduce((sum, a) => sum + a.download_count, 0)).toBe(5151);
+    expect(report.source).toBe('github');
+    expect(report.observedAt).toBeTypeOf('number');
+    await assets(session, config, 2001, 'POST');
+    expect(outgoing).toHaveBeenCalledTimes(4);
+  });
+  it('keeps existing counts when a refresh fails, and does not expose an unsafe asset link', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, {
+        assets: [{ ...artifact(1, 42), browser_download_url: 'javascript:alert(1)' }],
+      }),
+    });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('unavailable', { status: 403 }));
+    expect((await assets(session, config, 2001, 'POST')).status).toBe(502);
+    const report = await (
+      await assets(session, config)
+    ).json<{ assets: { download_count: number; download_url: string | null }[]; source: string }>();
+    expect(report.assets[0]).toMatchObject({ download_count: 42, download_url: null });
+    expect(report.source).toBe('webhook');
+  });
+  it('rejects changed repository identities and private refreshes without overwriting retained webhook data', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { assets: [artifact()] }),
+    });
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(Response.json({ id: 101, full_name: 'owner/repo', private: false }));
+    expect((await assets(session, config, 2001, 'POST')).status).toBe(409);
+    outgoing.mockResolvedValue(Response.json({ id: 100, full_name: 'owner/repo', private: true }));
+    expect((await assets(session, config, 2001, 'POST')).status).toBe(409);
+    expect(
+      (await (await assets(session, config)).json<{ assets: unknown[] }>()).assets,
+    ).toHaveLength(1);
+  });
+  it('requires administrator access and deletes all artifact rows when their project is removed', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { assets: [artifact()] }),
+    });
+    expect((await assets('', config)).status).toBe(401);
+    expect((await assets('', config, 2001, 'POST')).status).toBe(401);
+    expect(
+      (await request(`/repositories/${config.id}/releases/sync`, 'POST', { page: 1 })).status,
+    ).toBe(401);
+    await request(`/repositories/${config.id}`, 'DELETE', {}, session);
+    expect(await scalar('SELECT COUNT(*) AS count FROM release_assets')).toBe(0);
   });
 });
