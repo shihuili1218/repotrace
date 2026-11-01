@@ -22,6 +22,8 @@ npm run test:e2e
 
 已有 Chromium 可用 `CHROMIUM_PATH=/usr/bin/chromium npm run test:e2e`。后端在 Workers / D1 中测试鉴权、原始报文 HMAC、原子去重、多种事件、乱序状态、实时日历统计和旧数据迁移。浏览器测试通过本地签名事件验证完整流程；图表展示测试使用明确的 fixture，不依赖外部 GitHub。
 
+`e2e/connection.spec.ts` 模拟启动时断线、响应正文超时、重新连接及异常响应，并验证登录请求不会自动重复提交。只读 API 请求每次 10 秒超时，连接失败最多重试两次；写入请求最多等待 120 秒，不自动重试。登录状态必须包含完整布尔字段，异常响应不会进入首次初始化。
+
 本地接收真实 GitHub 投递需要可公开访问的 HTTPS 地址。也可对原始 JSON 的 UTF-8 字节计算 HMAC-SHA256，设置 `X-Hub-Signature-256: sha256=<hex>`、`X-GitHub-Event` 和唯一 `X-GitHub-Delivery`，POST 到 `/hooks/github/<project-id>`。不要把管理员会话或签名密钥写进仓库。
 
 ## 代码结构与扩展

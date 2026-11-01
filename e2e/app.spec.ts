@@ -428,7 +428,7 @@ const metricFixture = {
 };
 async function fixture(page: import('@playwright/test').Page, data: unknown) {
   await page.route('**/api/auth/status', (r) =>
-    r.fulfill({ json: { initialized: true, authenticated: true } }),
+    r.fulfill({ json: { initialized: true, authenticated: true, setupProtected: false } }),
   );
   await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data }));
 }

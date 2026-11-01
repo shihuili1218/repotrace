@@ -280,7 +280,15 @@ export default function App() {
   const checkAuth = useCallback(async () => {
     setBootError('');
     try {
-      setAuth(await api<AuthStatus>('/auth/status'));
+      const status = await api<AuthStatus>('/auth/status');
+      if (
+        !status ||
+        typeof status.initialized !== 'boolean' ||
+        typeof status.authenticated !== 'boolean' ||
+        typeof status.setupProtected !== 'boolean'
+      )
+        throw new Error('无法确认观测站登录状态，请刷新页面后重试。');
+      setAuth(status);
     } catch (e) {
       setBootError(errorText(e));
     }
