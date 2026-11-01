@@ -37,6 +37,7 @@ export function ProjectData({
   const requestId = useRef(0);
   const syncId = useRef(0);
   const syncBusy = useRef(false);
+  const pendingRange = useRef(false);
   const selected = repositories.find((r) => r.id === projectId);
   useEffect(() => {
     if (!selected && repositories.length) onProjectChange(repositories[0].id);
@@ -50,15 +51,18 @@ export function ProjectData({
     ...(mode === 'releases' ? { fromRelease: from, toRelease: to } : {}),
   }).toString();
   const refresh = useCallback(async () => {
-    if (!projectId || !valid || syncBusy.current) return;
+    if (!projectId || !valid) return;
     const id = ++requestId.current;
+    const catalogRequest = syncId.current;
     setBusy(true);
     try {
       const next = await api<Dashboard>(`/dashboard?${query}`);
       if (id === requestId.current) {
         setData(next);
-        setChoices(next.releaseChoices);
-        setNextPage(next.releaseCatalog.nextPage);
+        if (catalogRequest === syncId.current && !syncBusy.current) {
+          setChoices(next.releaseChoices);
+          setNextPage(next.releaseCatalog.nextPage);
+        }
         setError('');
       }
     } catch (e) {
@@ -69,6 +73,8 @@ export function ProjectData({
   }, [projectId, valid, query, refreshVersion]);
   useEffect(() => {
     setData(null);
+  }, [projectId, query]);
+  useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 15000);
     return () => {
@@ -76,42 +82,59 @@ export function ProjectData({
       window.clearInterval(timer);
     };
   }, [refresh]);
-  useEffect(
-    () => () => {
-      syncId.current++;
-    },
-    [],
-  );
-  async function sync(page = 1) {
-    const id = ++syncId.current;
-    syncBusy.current = true;
-    requestId.current++;
-    setSyncing(true);
-    setSyncError('');
-    try {
-      const result = await api<{ nextPage: number | null }>(
-        `/repositories/${projectId}/releases/sync`,
-        { method: 'POST', body: { page } },
-      );
-      if (id !== syncId.current) return;
-      const catalog = await api<Dashboard>(
-        `/dashboard?${new URLSearchParams({ repo: projectId, scope: 'project', days: String(days) })}`,
-      );
-      if (id !== syncId.current) return;
-      setChoices(catalog.releaseChoices);
-      setNextPage(result.nextPage);
-    } catch (e) {
-      if (id === syncId.current)
-        setSyncError(e instanceof Error ? e.message : '同步失败，请稍后重试。');
-    } finally {
-      if (id === syncId.current) {
-        syncBusy.current = false;
-        setSyncing(false);
-        setRefreshVersion((value) => value + 1);
+  const sync = useCallback(
+    async (page = 1) => {
+      if (!projectId || syncBusy.current) return;
+      const id = ++syncId.current;
+      syncBusy.current = true;
+      setSyncing(true);
+      setSyncError('');
+      try {
+        const result = await api<{ nextPage: number | null }>(
+          `/repositories/${projectId}/releases/sync`,
+          { method: 'POST', body: { page } },
+        );
+        if (id !== syncId.current) return;
+        const catalog = await api<Dashboard>(
+          `/dashboard?${new URLSearchParams({ repo: projectId, scope: 'project', days: '30' })}`,
+        );
+        if (id !== syncId.current) return;
+        setChoices(catalog.releaseChoices);
+        setNextPage(result.nextPage);
+      } catch (e) {
+        if (id === syncId.current)
+          setSyncError(e instanceof Error ? e.message : '同步失败，请稍后重试。');
+      } finally {
+        if (id === syncId.current) {
+          syncBusy.current = false;
+          setSyncing(false);
+          setRefreshVersion((value) => value + 1);
+        }
       }
+    },
+    [projectId],
+  );
+  useEffect(() => {
+    setChoices([]);
+    setNextPage(null);
+    void sync();
+    return () => {
+      syncId.current++;
+      syncBusy.current = false;
+    };
+  }, [sync]);
+  useEffect(() => {
+    if (mode !== 'releases' || !pendingRange.current) return;
+    const end = choices[0];
+    const start = end ? choices.find((r) => r.published_at < end.published_at) : undefined;
+    if (start && end) {
+      pendingRange.current = false;
+      setFrom(String(start.github_id));
+      setTo(String(end.github_id));
     }
-  }
+  }, [mode, choices]);
   function switchMode(value: string) {
+    pendingRange.current = false;
     if (value !== 'releases') {
       setMode('days');
       setDays(Number(value));
@@ -120,6 +143,7 @@ export function ProjectData({
     setMode('releases');
     const end = choices[0];
     const start = end ? choices.find((r) => r.published_at < end.published_at) : undefined;
+    pendingRange.current = !start;
     setFrom(start ? String(start.github_id) : '');
     setTo(end ? String(end.github_id) : '');
   }
@@ -147,6 +171,7 @@ export function ProjectData({
                 setMode('days');
                 setFrom('');
                 setTo('');
+                pendingRange.current = false;
                 setChoices([]);
                 setNextPage(null);
                 setError('');
@@ -180,7 +205,7 @@ export function ProjectData({
             onClick={() => void sync()}
           >
             <RefreshCw size={14} className={syncing ? 'spin' : ''} />
-            {syncing ? '正在读取公开 Release…' : '同步公开 Release'}
+            {syncing ? '正在读取公开 Release…' : '刷新公开 Release'}
           </button>
           {nextPage !== null && (
             <button className="text-button" disabled={syncing} onClick={() => void sync(nextPage)}>
@@ -196,7 +221,10 @@ export function ProjectData({
             <select
               aria-label="起始 Release"
               value={from}
-              onChange={(e) => setFrom(e.target.value)}
+              onChange={(e) => {
+                pendingRange.current = false;
+                setFrom(e.target.value);
+              }}
             >
               <option value="">选择起始版本</option>
               {choices.map((r) => (
@@ -210,7 +238,14 @@ export function ProjectData({
           <span className="range-arrow">→</span>
           <label>
             结束 Release
-            <select aria-label="结束 Release" value={to} onChange={(e) => setTo(e.target.value)}>
+            <select
+              aria-label="结束 Release"
+              value={to}
+              onChange={(e) => {
+                pendingRange.current = false;
+                setTo(e.target.value);
+              }}
+            >
               <option value="">选择结束版本</option>
               {choices.map((r) => (
                 <option key={r.github_id} value={r.github_id}>
@@ -221,7 +256,7 @@ export function ProjectData({
             </select>
           </label>
           <p>
-            按发布时间统计：包含起始时刻，不含结束时刻。若没有足够的版本，可先同步公开
+            按发布时间统计：包含起始时刻，不含结束时刻。版本在打开页面时读取，可刷新或加载更早
             Release；历史事件只能覆盖已经收到的数据。
           </p>
         </div>
@@ -268,6 +303,9 @@ export function ProjectData({
             repositories={repositories}
             dashboard={data}
             rangeQuery={query}
+            refreshVersion={refreshVersion}
+            syncingReleases={syncing}
+            onRefreshReleases={() => sync()}
           />
         </>
       )}

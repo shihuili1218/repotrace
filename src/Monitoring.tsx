@@ -170,6 +170,9 @@ export function Monitoring({
   repositories,
   dashboard,
   rangeQuery,
+  refreshVersion,
+  syncingReleases,
+  onRefreshReleases,
 }: {
   repo: string;
   days: number;
@@ -178,6 +181,9 @@ export function Monitoring({
   repositories: RepoSummary[];
   dashboard: Dashboard;
   rangeQuery: string;
+  refreshVersion: number;
+  syncingReleases: boolean;
+  onRefreshReleases: () => Promise<void>;
 }) {
   const [type, setType] = useState<MonitorType>('stars');
   const [state, setState] = useState('all');
@@ -215,13 +221,13 @@ export function Monitoring({
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [repo, type, state, label, page, rangeQuery, starMode, starKind]);
+  }, [repo, type, state, label, page, rangeQuery, starMode, starKind, refreshVersion]);
   useEffect(() => {
     setData(null);
     void load();
-    const interval = window.setInterval(() => void load(), 15000);
+    const interval = type === 'releases' ? null : window.setInterval(() => void load(), 15000);
     return () => {
-      window.clearInterval(interval);
+      if (interval !== null) window.clearInterval(interval);
       requestId.current++;
     };
   }, [load]);
@@ -313,83 +319,72 @@ export function Monitoring({
   return (
     <div className="monitor-view">
       {tabBar}
-      <div className={`module-metrics ${type === 'forks' || type === 'releases' ? 'pair' : ''}`}>
-        {type === 'forks' ? (
-          <>
-            <Metric
-              label="截至区间末 Forks"
-              value={
-                dashboard.history.at(-1)?.fork_repos ? dashboard.history.at(-1)!.fork_total : '—'
-              }
-              note="来自最近收到的仓库信息"
-            />
-            <Metric
-              label={`${period}新增 Fork`}
-              value={metrics.forks}
-              note="按首次收到该 Fork 的时间统计"
-            />
-          </>
-        ) : type === 'issues' ? (
-          <>
-            <Metric
-              label="区间活跃 Issue 当前未关闭"
-              value={metrics.openIssues}
-              note="所选期间有活动的条目，显示当前状态"
-            />
-            <Metric
-              label="其中未回复"
-              value={metrics.unansweredIssues}
-              note="没有收到其他人的人工回复"
-            />
-            <Metric
-              label={`${period}新建 / 关闭`}
-              value={`${metrics.issuesOpened} / ${metrics.issuesClosed}`}
-              note="分别统计发生过对应操作的 Issue"
-            />
-            <Metric
-              label="平均首条回复耗时"
-              value={duration(metrics.avgReplySeconds)}
-              note="已记录 Issue · 不含作者和机器人回复"
-            />
-          </>
-        ) : type === 'pull_requests' ? (
-          <>
-            <Metric
-              label="区间活跃 PR 当前未关闭"
-              value={metrics.openPRs}
-              note="所选期间有活动的 PR，显示当前状态"
-            />
-            <Metric
-              label="其中待评审"
-              value={metrics.awaitingReview}
-              note="非草稿且尚无有效的已记录评审"
-            />
-            <Metric
-              label={`${period}新建 / 合并 / 关闭`}
-              value={`${metrics.prsOpened} / ${metrics.prsMerged} / ${metrics.prsClosed}`}
-              note="关闭不含合并；按发生过对应操作的条目去重"
-            />
-            <Metric
-              label="平均合并耗时"
-              value={duration(metrics.avgMergeSeconds)}
-              note="已记录 PR · 从创建到合并"
-            />
-          </>
-        ) : (
-          <>
-            <Metric
-              label="最近记录的正式版"
-              value={metrics.latestRelease?.tag_name ?? '—'}
-              note={metrics.latestRelease?.full_name ?? '收到正式发布事件后显示'}
-            />
-            <Metric
-              label={`${period}发布版本`}
-              value={metrics.releasesPublished}
-              note="包括正式版与预发布，同一版本只计一次"
-            />
-          </>
-        )}
-      </div>
+      {type !== 'releases' && (
+        <div className={`module-metrics ${type === 'forks' ? 'pair' : ''}`}>
+          {type === 'forks' ? (
+            <>
+              <Metric
+                label="截至区间末 Forks"
+                value={
+                  dashboard.history.at(-1)?.fork_repos ? dashboard.history.at(-1)!.fork_total : '—'
+                }
+                note="来自最近收到的仓库信息"
+              />
+              <Metric
+                label={`${period}新增 Fork`}
+                value={metrics.forks}
+                note="按首次收到该 Fork 的时间统计"
+              />
+            </>
+          ) : type === 'issues' ? (
+            <>
+              <Metric
+                label="区间活跃 Issue 当前未关闭"
+                value={metrics.openIssues}
+                note="所选期间有活动的条目，显示当前状态"
+              />
+              <Metric
+                label="其中未回复"
+                value={metrics.unansweredIssues}
+                note="没有收到其他人的人工回复"
+              />
+              <Metric
+                label={`${period}新建 / 关闭`}
+                value={`${metrics.issuesOpened} / ${metrics.issuesClosed}`}
+                note="分别统计发生过对应操作的 Issue"
+              />
+              <Metric
+                label="平均首条回复耗时"
+                value={duration(metrics.avgReplySeconds)}
+                note="已记录 Issue · 不含作者和机器人回复"
+              />
+            </>
+          ) : (
+            <>
+              <Metric
+                label="区间活跃 PR 当前未关闭"
+                value={metrics.openPRs}
+                note="所选期间有活动的 PR，显示当前状态"
+              />
+              <Metric
+                label="其中待评审"
+                value={metrics.awaitingReview}
+                note="非草稿且尚无有效的已记录评审"
+              />
+              <Metric
+                label={`${period}新建 / 合并 / 关闭`}
+                value={`${metrics.prsOpened} / ${metrics.prsMerged} / ${metrics.prsClosed}`}
+                note="关闭不含合并；按发生过对应操作的条目去重"
+              />
+              <Metric
+                label="平均合并耗时"
+                value={duration(metrics.avgMergeSeconds)}
+                note="已记录 PR · 从创建到合并"
+              />
+            </>
+          )}
+        </div>
+      )}
       {type === 'forks' && (
         <section className="panel module-chart">
           <div className="panel-header">
@@ -424,7 +419,7 @@ export function Monitoring({
                   forks: 'Fork 名单',
                   issues: 'Issue 跟踪',
                   pull_requests: 'PR 跟踪',
-                  releases: '版本时间线',
+                  releases: 'Release 版本',
                 }[type]
               }
             </h2>
@@ -432,7 +427,7 @@ export function Monitoring({
               {type === 'forks'
                 ? 'GitHub 只通知新增 Fork，无法据此追踪删除。'
                 : type === 'releases'
-                  ? '版本与产物属于当前项目。下载量为当前累计值，不按历史区间切分。'
+                  ? '打开项目数据时读取公开版本目录，也可手动刷新；下载量为当前累计值。'
                   : '只展示所选期间有事件的条目，状态为当前已记录状态。'}
             </p>
           </div>
@@ -472,9 +467,9 @@ export function Monitoring({
             )}
             <button
               className="icon-button"
-              aria-label="刷新监控数据"
-              disabled={loading}
-              onClick={() => void load()}
+              aria-label={type === 'releases' ? '刷新版本列表' : '刷新监控数据'}
+              disabled={loading || (type === 'releases' && syncingReleases)}
+              onClick={() => void (type === 'releases' ? onRefreshReleases() : load())}
             >
               <RefreshCw size={15} className={loading ? 'spin' : ''} />
             </button>
@@ -489,7 +484,11 @@ export function Monitoring({
         {!data ? (
           <p className="small-empty">正在读取记录…</p>
         ) : !data.total ? (
-          <Empty>在 GitHub Webhook 中勾选对应事件，收到新事件后会出现在这里。</Empty>
+          <Empty>
+            {type === 'releases'
+              ? '暂无已读取的公开 Release，可刷新版本列表或加载更早版本。'
+              : '在 GitHub Webhook 中勾选对应事件，收到新事件后会出现在这里。'}
+          </Empty>
         ) : (
           <>
             <div className="table-scroll">

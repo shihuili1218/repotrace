@@ -56,12 +56,8 @@ export function ReleaseAssets({
   useEffect(() => {
     setReport(null);
     void load();
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void load();
-    }, 300000);
     return () => {
       fence.current++;
-      window.clearInterval(timer);
     };
   }, [load]);
   const known =
@@ -156,8 +152,7 @@ export function ReleaseAssets({
         </div>
       )}
       <div className="table-note">
-        打开此列表时读取，保持页面可见时每 5 分钟更新。GitHub 自动生成的 Source code
-        压缩包没有下载量数据。
+        打开此列表时读取，也可手动刷新。GitHub 自动生成的 Source code 压缩包没有下载量数据。
       </div>
     </section>
   );

@@ -60,7 +60,13 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
   if (!(await crypto.subtle.verify('HMAC', key, signed, raw)))
     throw new AppError(401, 'Webhook 签名无效。');
   const event = request.headers.get('X-GitHub-Event');
-  if (event !== 'ping' && !webhookEvents.some((item) => item.event === event))
+  // Existing installations may still deliver Release events. Accept those for
+  // compatibility; new setups read the public catalog on demand instead.
+  if (
+    event !== 'ping' &&
+    event !== 'release' &&
+    !webhookEvents.some((item) => item.event === event)
+  )
     return json({ ok: true, ignored: true });
   const delivery = request.headers.get('X-GitHub-Delivery') ?? '';
   if (!/^[a-zA-Z0-9-]{1,128}$/.test(delivery)) throw new AppError(400, '缺少有效的 Delivery ID。');

@@ -5,7 +5,6 @@ export const webhookEvents = [
   { event: 'issue_comment', label: 'Issue comments', feature: 'Issue / PR 回复' },
   { event: 'pull_request', label: 'Pull requests', feature: 'PR 进度' },
   { event: 'pull_request_review', label: 'Pull request reviews', feature: 'PR 评审' },
-  { event: 'release', label: 'Releases', feature: '版本发布' },
 ] as const;
 export type Category = 'star' | 'fork' | 'issue' | 'pull_request' | 'release';
 export const categoryLabels: Record<Category, string> = {

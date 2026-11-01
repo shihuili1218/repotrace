@@ -1,7 +1,15 @@
 import { createHmac } from 'node:crypto';
 import { expect, test, type APIRequestContext } from '@playwright/test';
+import type { AssetReport, Dashboard, ReleaseRecord } from '../shared/types';
 const password = 'browser-test-password-2026';
 const origin = 'http://127.0.0.1:8788';
+test.beforeEach(async ({ page }) => {
+  // Public API traffic stays deterministic in browser tests. Tests exercising
+  // catalog loading override this route with their own public Release fixtures.
+  await page.route('**/api/repositories/*/releases/sync', (route) =>
+    route.fulfill({ json: { nextPage: null, count: 0, updatedAt: Math.floor(Date.now() / 1000) } }),
+  );
+});
 async function deliver(
   request: APIRequestContext,
   url: string,
@@ -53,7 +61,8 @@ test('sets up admin, connects a webhook, rotates secrets and removes the nightly
   await page.getByRole('button', { name: '生成 Webhook 配置' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toContainText('Pull request reviews');
-  await expect(dialog).toContainText('Releases');
+  await expect(dialog.getByLabel('支持的 Webhook 事件')).not.toContainText('Releases');
+  await expect(dialog).toContainText('无需订阅 Releases 事件');
   const url = await page.getByLabel('Payload URL', { exact: true }).inputValue();
   const secret = await page.getByLabel('Secret（签名密钥）', { exact: true }).inputValue();
   expect(secret).toMatch(/^[a-f0-9]{64}$/);
@@ -536,7 +545,7 @@ test('guides a migrated project through first-time signing setup and lists the n
   await page.getByRole('button', { name: '生成签名密钥', exact: true }).click();
   await page.getByRole('button', { name: '确认生成新密钥' }).click();
   await expect(page.getByLabel('Secret（签名密钥）', { exact: true })).toHaveValue('a'.repeat(64));
-  await expect(page.getByLabel('支持的 Webhook 事件').locator(':scope > div')).toHaveCount(7);
+  await expect(page.getByLabel('支持的 Webhook 事件').locator(':scope > div')).toHaveCount(6);
   await page.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
   await expect(page.locator('#hook-secret')).toHaveCount(0);
@@ -664,7 +673,6 @@ test('switching projects during a public Release sync cannot replace the newly s
   await page.goto('/');
   await page.getByRole('button', { name: '项目数据', exact: true }).click();
   await expect(page.getByLabel('项目数据选择项目')).toHaveValue(first.id);
-  await page.getByRole('button', { name: '同步公开 Release', exact: true }).click();
   await expect.poll(() => entered).toBe(true);
   await page.getByLabel('项目数据选择项目').selectOption(second.id);
   await expect(page.locator('.range-description')).toContainText('owner/interval');
@@ -672,4 +680,145 @@ test('switching projects during a public Release sync cannot replace the newly s
   releaseGate();
   await expect(page.getByLabel('项目数据选择项目')).toHaveValue(second.id);
   await expect(page.locator('.range-description')).toContainText('owner/interval');
+});
+
+test('reads public Releases and downloads on opening without polling or requiring Release webhooks', async ({
+  page,
+}) => {
+  await page.request.post('/api/auth/login', { headers: { Origin: origin }, data: { password } });
+  const project = await (
+    await page.request.post('/api/repositories', {
+      headers: { Origin: origin },
+      data: { repository: 'owner/public-on-demand' },
+    })
+  ).json();
+  const initial: Dashboard = await (
+    await page.request.get(`/api/dashboard?scope=project&repo=${project.id}`)
+  ).json();
+  expect(initial.releaseChoices).toEqual([]);
+  expect(initial.repositories.find((r) => r.id === project.id)?.last_received_at).toBeNull();
+  const versions: ReleaseRecord[] = [9002, 9001].map((id, i) => ({
+    project_id: project.id,
+    github_id: id,
+    full_name: 'owner/public-on-demand',
+    tag_name: i === 0 ? 'public-v2' : 'public-v1',
+    name: 'Public release',
+    author_login: 'octocat',
+    prerelease: 0,
+    draft: 0,
+    created_at: now - 3600 * (i + 1),
+    published_at: now - 3600 * (i + 1),
+    published_received_at: null,
+    deleted_at: null,
+    first_seen_at: now,
+  }));
+  let catalogReads = 0;
+  let releaseLists = 0;
+  let assetReads = 0;
+  let downloadReads = 0;
+  await page.clock.install();
+  await page.route(`**/api/repositories/${project.id}/releases/sync`, (route) => {
+    catalogReads++;
+    return route.fulfill({ json: { count: 2, nextPage: null, updatedAt: now } });
+  });
+  await page.route('**/api/dashboard?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('scope') !== 'project' || url.searchParams.get('repo') !== project.id)
+      return route.continue();
+    return route.fulfill({
+      json: {
+        ...initial,
+        releaseChoices: catalogReads ? versions : [],
+        releaseCatalog: { nextPage: null, updatedAt: catalogReads ? now : null },
+        releaseMarkers: catalogReads ? versions : [],
+      },
+    });
+  });
+  await page.route('**/api/monitoring?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('repo') !== project.id || url.searchParams.get('type') !== 'releases')
+      return route.continue();
+    releaseLists++;
+    return route.fulfill({
+      json: {
+        type: 'releases',
+        stars: [],
+        forks: [],
+        items: [],
+        releases: versions,
+        total: 2,
+        page: 1,
+        labels: [],
+        contributors: [],
+      },
+    });
+  });
+  const snapshot = (): AssetReport => ({
+    releaseId: 9002,
+    tag: 'public-v2',
+    observedAt: downloadReads ? now : null,
+    source: downloadReads ? 'github' : null,
+    deleted: false,
+    assets: downloadReads
+      ? [
+          {
+            project_id: project.id,
+            release_id: 9002,
+            github_id: 1,
+            name: 'public.zip',
+            size: 2048,
+            content_type: 'application/zip',
+            state: 'uploaded',
+            download_count: downloadReads * 100,
+            download_url:
+              'https://github.com/owner/public-on-demand/releases/download/public-v2/public.zip',
+            observed_at: now,
+          },
+        ]
+      : [],
+  });
+  await page.route(`**/api/repositories/${project.id}/releases/9002/assets`, (route) => {
+    if (route.request().method() === 'POST') downloadReads++;
+    else assetReads++;
+    return route.fulfill({ json: snapshot() });
+  });
+  await page.goto('/');
+  await page
+    .locator('.repo-card')
+    .filter({ hasText: 'owner/public-on-demand' })
+    .getByRole('button', { name: '查看数据', exact: true })
+    .click();
+  await expect(page.getByRole('button', { name: '刷新公开 Release', exact: true })).toBeEnabled();
+  expect(catalogReads).toBe(1);
+  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(page.getByRole('link', { name: 'public-v2', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'public-v2 产物下载量' }).click();
+  const panel = page.getByRole('region', { name: '产物下载量' });
+  await expect(panel.locator('.asset-summary strong')).toHaveText('100');
+  await page.waitForLoadState('networkidle');
+  const before = { catalogReads, releaseLists, assetReads, downloadReads };
+  await page.clock.fastForward(600000);
+  await page.waitForLoadState('networkidle');
+  expect({ catalogReads, releaseLists, assetReads, downloadReads }).toEqual(before);
+  await panel.getByRole('button', { name: '刷新下载量' }).click();
+  await expect(panel.locator('.asset-summary strong')).toHaveText('200');
+  await panel.getByRole('button', { name: '关闭产物下载量' }).click();
+  await page.getByRole('button', { name: 'public-v2 产物下载量' }).click();
+  await expect(panel.locator('.asset-summary strong')).toHaveText('300');
+  await page.getByRole('button', { name: '刷新公开 Release', exact: true }).click();
+  await expect(page.getByRole('button', { name: '刷新公开 Release', exact: true })).toBeEnabled();
+  expect(catalogReads).toBe(2);
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  expect(downloadReads).toBe(3);
+  await page.getByRole('button', { name: '项目总览', exact: true }).click();
+  await page
+    .locator('.repo-card')
+    .filter({ hasText: 'owner/public-on-demand' })
+    .getByRole('button', { name: '查看数据', exact: true })
+    .click();
+  await expect(page.getByRole('button', { name: '刷新公开 Release', exact: true })).toBeEnabled();
+  expect(catalogReads).toBe(3);
 });
