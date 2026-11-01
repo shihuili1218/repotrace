@@ -1138,10 +1138,13 @@ async function assets(session: string, config: WebhookConfig, releaseId = 2001, 
 }
 function publicGitHub(handler: (url: string) => Response | Promise<Response>) {
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-    const url = String(input);
+    // Use the native Workers parser before mocking the transport: unsupported
+    // fetch options (such as redirect: 'error') must fail as they do in production.
+    const outgoing = new Request(input, init);
+    const url = outgoing.url;
     expect(url.startsWith('https://api.github.com/repos/owner/repo')).toBe(true);
-    expect(new Headers(init?.headers).has('Authorization')).toBe(false);
-    expect(new Headers(init?.headers).get('Accept')).toBe('application/vnd.github+json');
+    expect(outgoing.headers.has('Authorization')).toBe(false);
+    expect(outgoing.headers.get('Accept')).toBe('application/vnd.github+json');
     if (url === 'https://api.github.com/repos/owner/repo')
       return Response.json({ id: 100, full_name: 'owner/repo', private: false });
     return handler(url);
@@ -1377,6 +1380,35 @@ describe('current Release artifact downloads', () => {
     ).json<{ assets: { download_count: number; download_url: string | null }[]; source: string }>();
     expect(report.assets[0]).toMatchObject({ download_count: 42, download_url: null });
     expect(report.source).toBe('webhook');
+  });
+  it('rejects upstream redirects without following them or replacing the saved snapshot', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await signed(config, 'release', {
+      action: 'published',
+      release: release(2001, { assets: [artifact(1, 42)] }),
+    });
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const req = new Request(input, init);
+      expect(req.url).toBe('https://api.github.com/repos/owner/repo');
+      expect(req.redirect).toBe('manual');
+      return new Response(null, {
+        status: 301,
+        headers: { Location: 'https://example.invalid/redirected' },
+      });
+    });
+    const response = await assets(session, config, 2001, 'POST');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining('重定向') });
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    const report = await (
+      await assets(session, config)
+    ).json<{
+      source: string;
+      assets: { download_count: number }[];
+    }>();
+    expect(report.source).toBe('webhook');
+    expect(report.assets[0].download_count).toBe(42);
   });
   it('rejects changed repository identities and private refreshes without overwriting retained webhook data', async () => {
     const session = await setup();

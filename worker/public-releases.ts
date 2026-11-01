@@ -13,7 +13,9 @@ async function github(path: string): Promise<{ data: unknown; next: boolean }> {
         'User-Agent': 'RepoTrace',
         'X-GitHub-Api-Version': '2026-03-10',
       },
-      redirect: 'error',
+      // Workers supports only "follow" and "manual". Reject redirects below
+      // rather than following an upstream Location outside the GitHub API.
+      redirect: 'manual',
       signal: AbortSignal.timeout(15000),
     });
   } catch {
@@ -23,7 +25,9 @@ async function github(path: string): Promise<{ data: unknown; next: boolean }> {
     await response.body?.cancel();
     throw new AppError(
       502,
-      `公开 Release 数据读取失败（HTTP ${response.status}）。请确认仓库和版本公开可访问，已有快照会保留。`,
+      response.status >= 300 && response.status < 400
+        ? `GitHub 仓库地址发生重定向（HTTP ${response.status}）。请检查仓库是否更名或转移，已有快照会保留。`
+        : `公开 Release 数据读取失败（HTTP ${response.status}）。请确认仓库和版本公开可访问，已有快照会保留。`,
     );
   }
   const reader = response.body?.getReader();
