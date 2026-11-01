@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
 // Every browser run gets its own disposable D1 database, never the developer's state.
-const state = mkdtempSync(join(tmpdir(), 'repotrace-browser-'));
+const state = process.env.REPOTRACE_E2E_STATE || mkdtempSync(join(tmpdir(), 'repotrace-browser-'));
 const child = spawn(
   process.execPath,
   ['node_modules/wrangler/bin/wrangler.js', 'dev', '--port', '8788', '--persist-to', state],

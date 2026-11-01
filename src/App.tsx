@@ -1183,7 +1183,8 @@ function WebhookDialog({
         ))}
       </div>
       <p className="field-note">
-        Release 版本和产物下载量通过公开接口在打开页面时读取，无需订阅 Releases 事件。
+        Releases 只用于记录发版动态。版本目录和下载量由 Worker
+        独立缓存，每次访问返回缓存并请求后台刷新。
       </p>
       <div className="dialog-tip">
         <HelpCircle size={16} />
@@ -1634,7 +1635,8 @@ function SettingsView({
           <p className="field-note">
             Fork 只记录新增；Issue / PR 待办仅覆盖已收到的条目。新模块请在 GitHub 编辑现有
             Webhook，增加勾选 Forks、Issues、Issue comments、Pull requests、Pull request
-            reviews。Release 版本和产物下载量在打开对应页面时通过公开接口读取，也可手动刷新。
+            reviews、Releases。Release 事件只记录动态；版本目录和产物下载量通过 Worker
+            缓存读取并后台更新。
           </p>
         </section>
       </div>

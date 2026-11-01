@@ -23,6 +23,7 @@ import { categoryLabels, type Category } from '../shared/monitors';
 import { api } from './api';
 import { ForkChart, WorkChart, TrendChart, ChangesChart } from './Charts';
 import { ReleaseAssets } from './ReleaseAssets';
+import { ReleaseDownloads } from './ReleaseDownloads';
 
 export const duration = (seconds: number | null) =>
   seconds === null
@@ -319,6 +320,7 @@ export function Monitoring({
   return (
     <div className="monitor-view">
       {tabBar}
+      {type === 'releases' && <ReleaseDownloads repo={repo} />}
       {type !== 'releases' && (
         <div className={`module-metrics ${type === 'forks' ? 'pair' : ''}`}>
           {type === 'forks' ? (

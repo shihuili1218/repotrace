@@ -1,4 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.REPOTRACE_E2E_STATE ??= mkdtempSync(join(tmpdir(), 'repotrace-browser-'));
 
 export default defineConfig({
   testDir: './e2e',

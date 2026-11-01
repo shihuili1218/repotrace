@@ -6,6 +6,7 @@ export interface AssetInput {
   content_type: string;
   state: string;
   download_count: number | null;
+  download_display?: string | null;
   download_url: string | null;
 }
 export function normalizeAssets(input: unknown, name: string): AssetInput[] | null {
@@ -78,7 +79,7 @@ export function assetSnapshotStatements(
   release: number,
   assets: AssetInput[] | null,
   at: number,
-  source: 'webhook' | 'github',
+  source: 'webhook' | 'github' | 'shields',
   guard = '1',
   params: (string | number | null)[] = [],
 ): D1PreparedStatement[] {
@@ -97,8 +98,8 @@ export function assetSnapshotStatements(
       .bind(project, release, project, release, snapshot),
     db
       .prepare(
-        `INSERT INTO release_assets(project_id,release_id,github_id,name,size,content_type,state,download_count,download_url,observed_at)
-      SELECT ?,?,json_extract(value,'$.id'),json_extract(value,'$.name'),json_extract(value,'$.size'),json_extract(value,'$.content_type'),json_extract(value,'$.state'),json_extract(value,'$.download_count'),json_extract(value,'$.download_url'),?
+        `INSERT INTO release_assets(project_id,release_id,github_id,name,size,content_type,state,download_count,download_display,download_url,observed_at)
+      SELECT ?,?,json_extract(value,'$.id'),json_extract(value,'$.name'),json_extract(value,'$.size'),json_extract(value,'$.content_type'),json_extract(value,'$.state'),json_extract(value,'$.download_count'),json_extract(value,'$.download_display'),json_extract(value,'$.download_url'),?
       FROM json_each(?) WHERE EXISTS(SELECT 1 FROM releases WHERE project_id=? AND github_id=? AND assets_snapshot_id=?)`,
       )
       .bind(project, release, at, JSON.stringify(assets), project, release, snapshot),

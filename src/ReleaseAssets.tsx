@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Download, RefreshCw, X } from 'lucide-react';
 import type { AssetReport } from '../shared/types';
 import { api } from './api';
+import { ReleaseCacheNote } from './ReleaseCacheNote';
 const when = (at: number | null) =>
   at
     ? new Intl.DateTimeFormat('zh-CN', {
@@ -44,8 +45,6 @@ export function ReleaseAssets({
       const saved = await api<AssetReport>(path);
       if (id !== fence.current) return;
       setReport(saved);
-      const latest = await api<AssetReport>(path, { method: 'POST' });
-      if (id === fence.current) setReport(latest);
     } catch (e) {
       if (id === fence.current)
         setError(e instanceof Error ? e.message : '下载量读取失败，请稍后刷新。');
@@ -83,17 +82,26 @@ export function ReleaseAssets({
       </div>
       <div className="asset-summary">
         <span>
-          当前清单累计下载 <strong>{total === null ? '—' : total.toLocaleString()}</strong>
+          当前清单累计下载{' '}
+          <strong>{report?.totalDisplay ?? (total === null ? '—' : total.toLocaleString())}</strong>
         </span>
         <small>
           读取时间：{when(report?.observedAt ?? null)}
           {report?.source === 'webhook'
             ? ' · Webhook 快照'
-            : report?.source === 'github'
-              ? ' · GitHub 公开接口'
-              : ''}
+            : report?.source === 'shields'
+              ? ' · Shields 下载量'
+              : report?.source === 'github'
+                ? ' · GitHub 公开接口'
+                : ''}
         </small>
       </div>
+      <ReleaseCacheNote cache={report?.cache} />
+      {report?.notice && (
+        <p className="field-note" role="status">
+          {report.notice}
+        </p>
+      )}
       {error && (
         <div className="error-banner" role="alert">
           <span>{error}</span>
@@ -102,7 +110,9 @@ export function ReleaseAssets({
       {!report ? (
         <p className="small-empty">正在读取产物…</p>
       ) : report.observedAt === null ? (
-        <p className="small-empty">暂无可读取的产物快照；公开仓库可点击刷新。</p>
+        <p className="small-empty">
+          产物清单尚无缓存，已请求后台读取。稍后刷新可查看已完成的缓存。
+        </p>
       ) : !report.assets.length ? (
         <p className="small-empty">该版本没有上传的产物。</p>
       ) : (
@@ -140,9 +150,10 @@ export function ReleaseAssets({
                   <td>{bytes(asset.size)}</td>
                   <td>
                     <strong>
-                      {asset.download_count === null
-                        ? '未知'
-                        : asset.download_count.toLocaleString()}
+                      {asset.download_display ??
+                        (asset.download_count === null
+                          ? '未知'
+                          : asset.download_count.toLocaleString())}
                     </strong>
                   </td>
                 </tr>
@@ -152,7 +163,8 @@ export function ReleaseAssets({
         </div>
       )}
       <div className="table-note">
-        打开此列表时读取，也可手动刷新。GitHub 自动生成的 Source code 压缩包没有下载量数据。
+        每次读取返回 Worker 缓存，并请求后台更新；更新后再次读取可见。Shields 的 k / M 等为缩写值。
+        GitHub 自动生成的 Source code 压缩包没有下载量数据。
       </div>
     </section>
   );

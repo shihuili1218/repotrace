@@ -10,14 +10,16 @@
 - **项目数据**：选择单个项目，分别查看 Star、Fork、Issue、PR、Release；Star 包含总量图、用户净变化和逐次事件名单。
 - **时间筛选**：近 7 / 30 / 90 天，或两个 Release 发布时间之间；包含起始时刻，不包含结束时刻。
 - **Issue / PR**：每日变化、标签与状态筛选、回复和评审情况、合并/关闭统计、耗时与已记录贡献者。
-- **Release 产物**：逐项显示文件名、大小、当前累计下载量和读取时间。打开产物列表时读取，也可手动刷新；不定时轮询，不生成下载历史图表。
+- **Release 与下载量**：版本目录、逐项产物及下载量由 Worker 缓存。每次访问先返回缓存，再异步刷新；没有定时轮询，也不生成下载历史图表。Worker 直接汇总 GitHub 的总下载量与最新正式版下载量；GitHub 受限时，尝试使用 Shields 备用数据，并标明来源。
 - 统一项目动态、Webhook 签名校验、重复投递去重，保留已有历史快照。
 
-事件收到后即更新，图表按北京时间自然日统计。同一用户在区间内新增后又取消 Star，会在区间净变化中相互抵消。打开 **项目数据** 时自动读取公开 Release 目录，也可点击 **刷新公开 Release** 或加载更早版本，再选择版本区间；这不会补造历史 Star 或 Issue / PR 事件。
+事件收到后即更新，图表按北京时间自然日统计。同一用户在区间内新增后又取消 Star，会在区间净变化中相互抵消。打开 **项目数据** 时读取 Worker 中的 Release 缓存，并请求后台刷新。可再次读取或加载更早版本，再选择版本区间；这不会补造历史 Star 或 Issue / PR 事件。Release Webhook 只记录发版动态，不修改版本目录、产物、下载量或 Star / Fork 数字。
 
 需要仓库的 Webhook 管理权限。事件统计仅覆盖启用后实际收到的数据，区间内的 Issue / PR 列表显示这些条目的当前已记录状态。Fork 只能可靠记录新增。
 
-公开仓库的 Release 目录及产物下载量通过 GitHub 公开接口在打开对应页面时读取，无需访问凭据或订阅 Release Webhook；私有仓库无法通过公开接口读取，已有历史快照可继续查看。下载量始终是读取时的累计值，不代表所选历史区间的增量；GitHub 自动生成的 Source code 压缩包不提供下载量。读取失败会保留上次快照。
+公开 Release 数据均经过 Worker，不需要 GitHub 访问凭据。缓存首次为空时会在后台建立，稍后再次读取即可；刷新失败保留旧数据并显示缓存时间与状态。GitHub 返回限流或拒绝访问时会退避，避免每次打开都重复触发失败请求。
+
+Worker 从 GitHub 分页读取各 Release 的产物计数，自己汇总所有版本和最新正式版的精确下载量；不会仅汇总已缓存的部分版本。GitHub 不可用时才使用 Shields 备用数据，展示参考 [Shields Total Downloads](https://img.shields.io/github/downloads/rssh-org/rssh/total) 和 [Latest Downloads](https://img.shields.io/github/downloads/rssh-org/rssh/latest/total)。`8.5k` 等缩写按原样展示，不伪造精确数字。下载量是当前累计值，不代表历史区间增量；GitHub 自动生成的 Source code 压缩包不提供下载量。私有仓库无法通过公开接口刷新。
 
 ## 部署到 Cloudflare
 
@@ -46,7 +48,7 @@ Cloudflare 自动创建并绑定 D1 数据库 `DB`、KV 命名空间 `WEBHOOK_KE
 2. 复制弹窗中的 **Payload URL** 和 **Secret**；每个项目有独立密钥，仅生成时显示一次。
 3. 打开被监控仓库的 **Settings → Webhooks → Add webhook**。
 4. 填入 **Payload URL**；**Content type** 选 `application/json`；**Secret** 填入刚复制的密钥，保留 **Enable SSL verification**。
-5. 选择 **Let me select individual events**，按需要勾选：**Stars、Forks、Issues、Issue comments、Pull requests、Pull request reviews**。Release 直接通过公开接口读取，无需勾选 **Releases**。勾选 **Active**，保存。
+5. 选择 **Let me select individual events**，按需要勾选：**Stars、Forks、Issues、Issue comments、Pull requests、Pull request reviews、Releases**。Releases 仅用于发版动态。勾选 **Active**，保存。
 6. GitHub 会发送 Ping，RepoTrace 显示 **已连接** 后即可记录后续变化。弹窗也会显示哪些事件已收到；若未连接，检查 **Recent Deliveries** 的响应。
 
 已有 Webhook 可直接编辑，增加勾选新事件，**原 Payload URL 和 Secret 继续使用**。只有更换签名密钥时才需要同步更新 GitHub Secret，并重新投递 Ping。无需创建 GitHub 访问凭据，也无需为项目配置 Cloudflare Secret。

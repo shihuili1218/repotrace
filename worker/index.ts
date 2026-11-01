@@ -15,7 +15,7 @@ import { parseRepository } from './projects';
 import { sealWebhookSecret, secretStatement } from './webhook-secrets';
 import { newWebhookSecret, receiveWebhook } from './webhooks';
 import { monitoring } from './monitoring';
-import { syncPublicReleases, refreshPublicAssets, assetReport } from './public-releases';
+import { cachedCatalog, cachedAssets, cachedDownloads } from './public-releases';
 import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
 
@@ -57,7 +57,7 @@ async function body(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function api(request: Request, env: Env) {
+async function api(request: Request, env: Env, ctx: ExecutionContext) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -123,7 +123,11 @@ async function api(request: Request, env: Env) {
     return json({ ok: true }, 200, { 'Set-Cookie': await createSession(env.DB, request) });
   }
   if (path === '/api/dashboard' && method === 'GET') return json(await dashboard(env.DB, url));
-  if (path === '/api/monitoring' && method === 'GET') return json(await monitoring(env.DB, url));
+  if (path === '/api/monitoring' && method === 'GET') {
+    const cached = await monitoring(env.DB, url);
+    if (cached.type === 'releases') await cachedCatalog(env, url.searchParams.get('repo')!, 1, ctx);
+    return json(cached);
+  }
   if (path === '/api/settings' && method === 'GET')
     return json({ timezone: 'Asia/Shanghai', monitors: webhookEvents });
   if (path === '/api/repositories' && method === 'POST') {
@@ -152,23 +156,27 @@ async function api(request: Request, env: Env) {
     return json(webhookConfig(url.origin, id, name, secret), 201);
   }
   const releasePath = path.match(
-    /^\/api\/repositories\/([^/]+)\/releases\/(sync|([1-9][0-9]*)\/assets)$/,
+    /^\/api\/repositories\/([^/]+)\/releases\/(sync|downloads|([1-9][0-9]*)\/assets)$/,
   );
   if (releasePath) {
     const project = releasePath[1];
     if (!(await env.DB.prepare('SELECT 1 FROM projects WHERE id=?').bind(project).first()))
       throw new AppError(404, '项目不存在。');
-    if (releasePath[2] === 'sync' && method === 'POST') {
-      const data = await body(request);
+    if (releasePath[2] === 'downloads' && method === 'GET')
+      return json(await cachedDownloads(env, project, ctx));
+    if (releasePath[2] === 'sync' && ['GET', 'POST'].includes(method)) {
+      const data =
+        method === 'POST'
+          ? await body(request)
+          : { page: Number(url.searchParams.get('page') || 1) };
       return json(
-        await syncPublicReleases(env, project, data.page === undefined ? 1 : (data.page as number)),
+        await cachedCatalog(env, project, data.page === undefined ? 1 : (data.page as number), ctx),
       );
     }
     if (releasePath[3]) {
       const id = Number(releasePath[3]);
       if (!Number.isSafeInteger(id)) throw new AppError(400, '版本 ID 无效。');
-      if (method === 'GET') return json(await assetReport(env.DB, project, id));
-      if (method === 'POST') return json(await refreshPublicAssets(env, project, id));
+      if (['GET', 'POST'].includes(method)) return json(await cachedAssets(env, project, id, ctx));
     }
   }
   const repository = path.match(/^\/api\/repositories\/([^/]+)(?:\/(webhook))?$/);
@@ -222,7 +230,7 @@ export default {
       response = hook
         ? await receiveWebhook(request, env, hook[1])
         : path.startsWith('/api/')
-          ? await api(request, env)
+          ? await api(request, env, ctx)
           : await env.ASSETS.fetch(request);
     } catch (error) {
       if (error instanceof AppError) response = json({ error: error.message }, error.status);

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FolderGit2, RefreshCw } from 'lucide-react';
-import type { Dashboard, RepoSummary, ReleaseBoundary } from '../shared/types';
+import type { Dashboard, RepoSummary, ReleaseBoundary, ReleaseCacheState } from '../shared/types';
 import { api } from './api';
 import { Monitoring } from './Monitoring';
+import { ReleaseCacheNote } from './ReleaseCacheNote';
 const when = (at: number) =>
   new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -30,6 +31,7 @@ export function ProjectData({
   const [choices, setChoices] = useState<ReleaseBoundary[]>([]);
   const [error, setError] = useState('');
   const [syncError, setSyncError] = useState('');
+  const [catalogCache, setCatalogCache] = useState<ReleaseCacheState | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -90,11 +92,12 @@ export function ProjectData({
       setSyncing(true);
       setSyncError('');
       try {
-        const result = await api<{ nextPage: number | null }>(
+        const result = await api<{ nextPage: number | null; cache?: ReleaseCacheState }>(
           `/repositories/${projectId}/releases/sync`,
           { method: 'POST', body: { page } },
         );
         if (id !== syncId.current) return;
+        setCatalogCache(result.cache ?? null);
         const catalog = await api<Dashboard>(
           `/dashboard?${new URLSearchParams({ repo: projectId, scope: 'project', days: '30' })}`,
         );
@@ -116,6 +119,7 @@ export function ProjectData({
   );
   useEffect(() => {
     setChoices([]);
+    setCatalogCache(null);
     setNextPage(null);
     void sync();
     return () => {
@@ -214,6 +218,7 @@ export function ProjectData({
           )}
         </div>
       </div>
+      <ReleaseCacheNote cache={catalogCache} />
       {mode === 'releases' && (
         <div className="release-range panel">
           <label>

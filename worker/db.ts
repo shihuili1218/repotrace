@@ -137,6 +137,16 @@ export const migrations = [
       last_page INTEGER NOT NULL, next_page INTEGER, updated_at INTEGER NOT NULL
     )`,
   ],
+  [
+    `ALTER TABLE release_assets ADD COLUMN download_display TEXT`,
+    `CREATE TABLE release_refresh (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, resource TEXT NOT NULL,
+      updated_at INTEGER, error TEXT, retry_at INTEGER NOT NULL DEFAULT 0,
+      lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0, payload TEXT,
+      PRIMARY KEY(project_id,resource)
+    )`,
+    `CREATE TABLE public_api_backoff (host TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, error TEXT NOT NULL)`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

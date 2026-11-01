@@ -1,9 +1,25 @@
 import { createHmac } from 'node:crypto';
+import { seedPublicCache } from './public-cache-fixture';
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import type { AssetReport, Dashboard, ReleaseRecord } from '../shared/types';
 const password = 'browser-test-password-2026';
 const origin = 'http://127.0.0.1:8788';
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/repositories/*/releases/downloads', (route) =>
+    route.fulfill({
+      json: {
+        total: '8.5k',
+        latest: '210',
+        source: 'shields',
+        cache: {
+          updatedAt: Math.floor(Date.now() / 1000),
+          error: null,
+          retryAt: null,
+          refreshRequested: true,
+        },
+      },
+    }),
+  );
   // Public API traffic stays deterministic in browser tests. Tests exercising
   // catalog loading override this route with their own public Release fixtures.
   await page.route('**/api/repositories/*/releases/sync', (route) =>
@@ -61,8 +77,8 @@ test('sets up admin, connects a webhook, rotates secrets and removes the nightly
   await page.getByRole('button', { name: '生成 Webhook 配置' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toContainText('Pull request reviews');
-  await expect(dialog.getByLabel('支持的 Webhook 事件')).not.toContainText('Releases');
-  await expect(dialog).toContainText('无需订阅 Releases 事件');
+  await expect(dialog.getByLabel('支持的 Webhook 事件')).toContainText('Releases');
+  await expect(dialog).toContainText('Releases 只用于记录发版动态');
   const url = await page.getByLabel('Payload URL', { exact: true }).inputValue();
   const secret = await page.getByLabel('Secret（签名密钥）', { exact: true }).inputValue();
   expect(secret).toMatch(/^[a-f0-9]{64}$/);
@@ -287,6 +303,8 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   ];
   for (const [event, payload] of events)
     expect((await deliver(request, config.url, config.secret, event, payload)).status()).toBe(200);
+  for (const [event, payload] of events)
+    if (event === 'release') seedPublicCache(id, payload.release as Record<string, unknown>);
   await page.goto('/');
   await expect(page.getByText('v1.2.0', { exact: true })).toHaveCount(0);
   await expect(page.getByText('最近记录的正式版', { exact: true })).toHaveCount(0);
@@ -321,7 +339,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(page.locator('tbody')).toContainText('正式版');
   await expect(page.locator('tbody')).toContainText('1.0 天');
   await page.route(`**/api/repositories/${id}/releases/402/assets`, async (route) => {
-    if (route.request().method() !== 'POST') return route.continue();
+    expect(route.request().method()).toBe('GET');
     return route.fulfill({
       json: {
         releaseId: 402,
@@ -545,7 +563,7 @@ test('guides a migrated project through first-time signing setup and lists the n
   await page.getByRole('button', { name: '生成签名密钥', exact: true }).click();
   await page.getByRole('button', { name: '确认生成新密钥' }).click();
   await expect(page.getByLabel('Secret（签名密钥）', { exact: true })).toHaveValue('a'.repeat(64));
-  await expect(page.getByLabel('支持的 Webhook 事件').locator(':scope > div')).toHaveCount(6);
+  await expect(page.getByLabel('支持的 Webhook 事件').locator(':scope > div')).toHaveCount(7);
   await page.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
   await expect(page.locator('#hook-secret')).toHaveCount(0);
@@ -612,6 +630,20 @@ test('keeps overview aggregated and shows project Star statistics between two Re
     action: 'deleted',
     sender: { id: 90, login: 'version-user' },
     starred_at: null,
+  });
+  seedPublicCache(config.id, {
+    ...base,
+    id: 801,
+    tag_name: 'vA',
+    name: 'A',
+    published_at: new Date((now - 1) * 1000).toISOString(),
+  });
+  seedPublicCache(config.id, {
+    ...base,
+    id: 802,
+    tag_name: 'vB',
+    name: 'B',
+    published_at: new Date(cutoff * 1000).toISOString(),
   });
   await page.goto('/');
   await expect(page.getByLabel('选择项目')).toHaveValue('');
@@ -778,8 +810,9 @@ test('reads public Releases and downloads on opening without polling or requirin
       : [],
   });
   await page.route(`**/api/repositories/${project.id}/releases/9002/assets`, (route) => {
-    if (route.request().method() === 'POST') downloadReads++;
-    else assetReads++;
+    expect(route.request().method()).toBe('GET');
+    downloadReads++;
+    assetReads++;
     return route.fulfill({ json: snapshot() });
   });
   await page.goto('/');
