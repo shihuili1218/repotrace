@@ -22,6 +22,23 @@
 
 Worker 从 GitHub 分页读取各 Release 的产物计数，自己汇总所有版本和最新正式版的精确下载量；不会仅汇总已缓存的部分版本。下载量是当前累计值，不代表历史区间增量；GitHub 自动生成的 Source code 压缩包不提供下载量。私有仓库无法通过公开接口刷新。
 
+## 界面预览
+
+以下截图使用演示数据。
+
+**项目总览**：汇总各项目指标、Star 趋势和最近 5 条项目动态。
+
+![RepoTrace 项目总览：统计卡片、Star 趋势与最近项目动态](docs/images/overview.png)
+
+<details>
+<summary>Release 与产物下载量（移动端）</summary>
+
+查看版本列表、累计下载量，以及各产物的下载量对比和占比。
+
+<img src="docs/images/release-downloads-mobile.png" alt="RepoTrace 移动端 Release 面板：版本列表、产物下载量对比图和占比图" width="390" />
+
+</details>
+
 ## 部署到 Cloudflare
 
 ### 1. Fork 仓库
