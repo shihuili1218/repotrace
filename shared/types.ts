@@ -149,6 +149,7 @@ export interface Dashboard {
   page: number;
   eventCounts: { added: number; removed: number };
   timeline: ActivityRecord[];
+  recentEvents: ActivityRecord[];
   timelineTotal: number;
   metrics: MonitorMetrics;
   releaseMarkers: ReleaseRecord[];

@@ -352,10 +352,6 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(page.locator('.contributors-list')).toContainText('2 个 PR · 1 个已合并');
   await page.getByLabel('筛选状态').selectOption('awaiting_review');
   await expect(page.getByRole('link', { name: '#9 优化终端体验', exact: true })).toBeVisible();
-  await page.getByRole('tab', { name: 'Release', exact: true }).click();
-  await expect(page.getByRole('link', { name: 'v1.2.0', exact: true })).toBeVisible();
-  await expect(page.locator('tbody')).toContainText('正式版');
-  await expect(page.locator('tbody')).toContainText('1.0 天');
   let assetMode: 'normal' | 'unknown' | 'zero' = 'normal';
   await page.route(`**/api/repositories/${id}/releases/402/assets`, async (route) => {
     expect(route.request().method()).toBe('GET');
@@ -395,18 +391,21 @@ test('shows signed fork, issue, PR and release events in modules and the unified
       },
     });
   });
-  await page.getByRole('button', { name: 'v1.2.0 产物下载量', exact: true }).click();
+  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  const releaseList = page.getByRole('region', { name: 'Release 版本', exact: true });
+  await expect(releaseList.getByRole('link', { name: 'v1.2.0', exact: true })).toBeVisible();
+  await expect(releaseList.locator('tbody')).toContainText('正式版');
+  await expect(releaseList.locator('tbody')).toContainText('1.0 天');
+  await expect(
+    page.getByRole('heading', { name: 'v1.2.0 的产物下载量', exact: true }),
+  ).toBeVisible();
   const panel = page.getByRole('region', { name: '产物下载量' });
   await expect(panel.locator('tbody tr')).toHaveCount(2);
   await expect(panel.locator('tbody')).toContainText('150');
   await expect(panel.locator('tbody')).toContainText('250');
   await expect(panel).toContainText('400');
-  const versionChart = page.getByRole('figure', { name: '各版本累计下载量对比图' });
-  await expect(versionChart.getByRole('button').first()).toContainText('v1.1.0');
-  await page.getByLabel('下载量图表排序').selectOption('published');
-  await expect(versionChart.getByRole('button').first()).toContainText('v1.2.0');
-  await versionChart.getByRole('button').first().click();
-  await expect(versionChart.locator('.download-chart-detail')).toContainText('400 次下载');
+  await expect(page.getByRole('figure', { name: '各版本累计下载量对比图' })).toHaveCount(0);
+  await expect(page.getByLabel('下载量图表排序')).toHaveCount(0);
   await expect(panel.getByRole('figure', { name: '产物累计下载量对比图' })).toBeVisible();
   await expect(panel.getByRole('img', { name: '产物下载量占比图' })).toBeVisible();
   const distribution = panel.getByRole('figure', { name: '产物下载量占比分布' });
@@ -517,7 +516,7 @@ async function fixture(page: import('@playwright/test').Page, data: unknown) {
   await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data }));
 }
 
-test('renders aggregate overview charts without release details on desktop and mobile', async ({
+test('renders overview charts and the latest five mixed events on desktop and mobile', async ({
   page,
 }) => {
   const day = (offset: number) =>
@@ -557,11 +556,45 @@ test('renders aggregate overview charts without release details on desktop and m
     metrics: metricFixture,
     releaseMarkers: [metricFixture.latestRelease],
     timeline: [],
+    recentEvents: ['release', 'pull_request', 'issue', 'fork', 'star', 'star'].map(
+      (category, i) => ({
+        id: `recent-${i}`,
+        project_id: visualRepo.id,
+        full_name: visualRepo.full_name,
+        category,
+        action:
+          category === 'release'
+            ? 'published'
+            : category === 'issue' || category === 'pull_request'
+              ? 'opened'
+              : 'created',
+        actor_id: 10 + i,
+        actor_login: [
+          'release-author',
+          'pr-author',
+          'issue-author',
+          'forker',
+          'octocat',
+          'hidden-user',
+        ][i],
+        title: i === 5 ? '第六条不展示' : `最近${category}事件`,
+        number: null,
+        url: 'https://github.com/rssh-org/rssh',
+        received_at: now - i,
+      }),
+    ),
     timelineTotal: 0,
   });
   await page.goto('/');
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
+  const recent = page.getByRole('region', { name: '最近项目动态' });
+  await expect(recent.locator('tbody tr')).toHaveCount(5);
+  for (const kind of ['Star', 'Fork', 'Issue', 'PR', 'Release'])
+    await expect(recent.locator('.pill').filter({ hasText: kind })).toBeVisible();
+  await expect(recent).not.toContainText('第六条不展示');
+  await expect(recent.getByRole('button', { name: '下一页' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Star 事件记录' })).toHaveCount(0);
   await page.screenshot({ path: 'test-results/dashboard-desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect
@@ -598,6 +631,7 @@ test('guides a migrated project through first-time signing setup and lists the n
     metrics: { ...metricFixture, latestRelease: null },
     releaseMarkers: [],
     timeline: [],
+    recentEvents: [],
     timelineTotal: 0,
   });
   await fixture(page, data());
@@ -786,21 +820,23 @@ test('reads public Releases and downloads on opening without polling or requirin
   ).json();
   expect(initial.releaseChoices).toEqual([]);
   expect(initial.repositories.find((r) => r.id === project.id)?.last_received_at).toBeNull();
-  const versions: ReleaseRecord[] = [9002, 9001].map((id, i) => ({
-    project_id: project.id,
-    github_id: id,
-    full_name: 'owner/public-on-demand',
-    tag_name: i === 0 ? 'public-v2' : 'public-v1',
-    name: 'Public release',
-    author_login: 'octocat',
-    prerelease: 0,
-    draft: 0,
-    created_at: now - 3600 * (i + 1),
-    published_at: now - 3600 * (i + 1),
-    published_received_at: null,
-    deleted_at: null,
-    first_seen_at: now,
-  }));
+  const versions: ReleaseRecord[] = [9002, 9001, 8999, 8998, 8997, 8996, 8995, 8994].map(
+    (id, i) => ({
+      project_id: project.id,
+      github_id: id,
+      full_name: 'owner/public-on-demand',
+      tag_name: i === 0 ? 'public-v2' : i === 1 ? 'public-v1' : `older-v${i + 1}`,
+      name: 'Public release',
+      author_login: 'octocat',
+      prerelease: 0,
+      draft: 0,
+      created_at: now - 3600 * (i + 1),
+      published_at: now - 3600 * (i + 1),
+      published_received_at: null,
+      deleted_at: null,
+      first_seen_at: now,
+    }),
+  );
   let catalogReads = 0;
   let releaseLists = 0;
   let assetReads = 0;
@@ -835,7 +871,7 @@ test('reads public Releases and downloads on opening without polling or requirin
         forks: [],
         items: [],
         releases: versions,
-        total: 2,
+        total: versions.length,
         page: 1,
         labels: [],
         contributors: [],
@@ -866,6 +902,18 @@ test('reads public Releases and downloads on opening without polling or requirin
         ]
       : [],
   });
+  await page.route(`**/api/repositories/${project.id}/releases/9001/assets`, (route) =>
+    route.fulfill({
+      json: {
+        releaseId: 9001,
+        tag: 'public-v1',
+        source: 'github',
+        observedAt: now,
+        deleted: false,
+        assets: [],
+      },
+    }),
+  );
   await page.route(`**/api/repositories/${project.id}/releases/9002/assets`, (route) => {
     expect(route.request().method()).toBe('GET');
     downloadReads++;
@@ -882,7 +930,11 @@ test('reads public Releases and downloads on opening without polling or requirin
   expect(catalogReads).toBe(1);
   await page.getByRole('tab', { name: 'Release', exact: true }).click();
   await expect(page.getByRole('link', { name: 'public-v2', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'public-v2 产物下载量' }).click();
+  const releaseList = page.getByRole('region', { name: 'Release 版本', exact: true });
+  await expect(releaseList.locator('tbody tr')).toHaveCount(5);
+  await expect(releaseList).toContainText('3 个已缓存版本未显示');
+  await expect(releaseList.getByRole('link', { name: 'older-v6', exact: true })).toHaveCount(0);
+  await expect(releaseList.getByRole('button', { name: '下一页' })).toHaveCount(0);
   const panel = page.getByRole('region', { name: '产物下载量' });
   await expect(panel.locator('.asset-summary strong')).toHaveText('100');
   await page.waitForLoadState('networkidle');
@@ -895,6 +947,8 @@ test('reads public Releases and downloads on opening without polling or requirin
   await panel.getByRole('button', { name: '关闭产物下载量' }).click();
   await page.getByRole('button', { name: 'public-v2 产物下载量' }).click();
   await expect(panel.locator('.asset-summary strong')).toHaveText('300');
+  await page.getByRole('button', { name: 'public-v1 产物下载量' }).click();
+  await expect(panel.getByRole('heading', { name: 'public-v1 的产物下载量' })).toBeVisible();
   await page.getByRole('button', { name: '刷新公开 Release', exact: true }).click();
   await expect(page.getByRole('button', { name: '刷新公开 Release', exact: true })).toBeEnabled();
   expect(catalogReads).toBe(2);
@@ -903,6 +957,7 @@ test('reads public Releases and downloads on opening without polling or requirin
     'true',
   );
   expect(downloadReads).toBe(3);
+  await expect(panel.getByRole('heading', { name: 'public-v1 的产物下载量' })).toBeVisible();
   await page.getByRole('button', { name: '项目总览', exact: true }).click();
   await page
     .locator('.repo-card')
@@ -911,4 +966,7 @@ test('reads public Releases and downloads on opening without polling or requirin
     .click();
   await expect(page.getByRole('button', { name: '刷新公开 Release', exact: true })).toBeEnabled();
   expect(catalogReads).toBe(3);
+  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(panel.getByRole('heading', { name: 'public-v2 的产物下载量' })).toBeVisible();
+  expect(downloadReads).toBe(4);
 });

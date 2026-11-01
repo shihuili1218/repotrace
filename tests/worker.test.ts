@@ -683,6 +683,34 @@ describe('live analytics without scheduled work', () => {
     expect((await dashboard(session)).changeTotal).toBe(32);
     expect((await request('/dashboard?category=push', 'GET', undefined, session)).status).toBe(400);
   });
+  it('keeps the latest five mixed events independent of activity filters and pagination', async () => {
+    const session = await setup();
+    const config = await add(session);
+    for (let id = 1; id <= 8; id++)
+      await signed(config, 'star', { sender: { id, login: `visitor-${id}` } });
+    await signed(config, 'fork', {
+      forkee: {
+        id: 201,
+        full_name: 'forker/repo',
+        owner: { id: 30, login: 'forker' },
+        created_at: iso(nowSeconds()),
+      },
+    });
+    await signed(config, 'issues', { action: 'opened', issue: item() });
+    await signed(config, 'pull_request', { action: 'opened', pull_request: item(1002) });
+    await signed(config, 'release', { action: 'published', release: release() });
+    const data = await dashboard(session, `?repo=${config.id}&category=issue&page=2`);
+    expect(data.timeline).toEqual([]);
+    expect(data.recentEvents.map((e) => e.category)).toEqual([
+      'release',
+      'pull_request',
+      'issue',
+      'fork',
+      'star',
+    ]);
+    expect(data.recentEvents[4].actor_login).toBe('visitor-8');
+    expect((await dashboard(session)).recentEvents).toHaveLength(5);
+  });
 });
 
 describe('fork growth', () => {
@@ -1138,6 +1166,24 @@ function publicGitHub(handler: (url: string) => Response | Promise<Response>) {
 }
 
 describe('project scope and Release intervals', () => {
+  it('returns only the five newest cached Releases while retaining the full matching count', async () => {
+    const session = await setup();
+    const config = await add(session);
+    for (const offset of [3, 6, 1, 8, 2, 7, 4, 5])
+      await seedPublicRelease(config, {
+        release: release(2100 + offset, {
+          tag_name: `v${offset}`,
+          published_at: iso(nowSeconds() - offset * 60),
+        }),
+      });
+    publicGitHub(() => Response.json([]));
+    const first = await monitor(session, 'releases');
+    expect(first.total).toBe(8);
+    expect(first.releases.map((r) => r.github_id)).toEqual([2101, 2102, 2103, 2104, 2105]);
+    const next = await monitor(session, 'releases', '&page=2');
+    expect(next.page).toBe(1);
+    expect(next.releases.map((r) => r.github_id)).toEqual(first.releases.map((r) => r.github_id));
+  });
   it('keeps overview release-free while single-project data has its own releases and Star net changes', async () => {
     const session = await setup();
     const config = await add(session);

@@ -160,7 +160,7 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
       FROM releases r JOIN projects p ON p.id=r.project_id WHERE project_id=? AND
       (?='all' OR (?='stable' AND prerelease=0 AND draft=0 AND deleted_at IS NULL) OR (?='prerelease' AND prerelease=1 AND draft=0 AND deleted_at IS NULL) OR (?='draft' AND draft=1 AND deleted_at IS NULL) OR (?='deleted' AND deleted_at IS NOT NULL))`;
     params = [project, state, state, state, state, state];
-    order = 'COALESCE(r.published_at,r.created_at) DESC,r.github_id DESC';
+    order = 'r.published_at DESC,r.created_at DESC,r.github_id DESC';
   } else {
     const kind = type === 'issues' ? 'issue' : 'pull_request';
     selected = `SELECT w.*,p.full_name FROM work_items w JOIN projects p ON p.id=w.project_id WHERE kind=? AND project_id=?
@@ -188,8 +188,8 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
   }
   const [rows, total] = await Promise.all([
     db
-      .prepare(`${selected} ORDER BY ${order} LIMIT 30 OFFSET ?`)
-      .bind(...params, (page - 1) * 30)
+      .prepare(`${selected} ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .bind(...params, type === 'releases' ? 5 : 30, type === 'releases' ? 0 : (page - 1) * 30)
       .all(),
     db
       .prepare(`SELECT COUNT(*) AS count FROM (${selected})`)
@@ -197,6 +197,7 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
       .first<number>('count'),
   ]);
   result.total = total ?? 0;
+  if (type === 'releases') result.page = 1;
   if (type === 'stars') result.stars = rows.results as unknown as StarChange[];
   else if (type === 'forks') result.forks = rows.results as unknown as ForkRecord[];
   else if (type === 'releases') result.releases = rows.results as unknown as ReleaseRecord[];

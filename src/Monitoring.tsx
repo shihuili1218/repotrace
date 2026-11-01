@@ -191,6 +191,7 @@ export function Monitoring({
   const [starMode, setStarMode] = useState('net');
   const [starKind, setStarKind] = useState('all');
   const [assetId, setAssetId] = useState<number | null>(null);
+  const [autoAsset, setAutoAsset] = useState(true);
   const [label, setLabel] = useState('');
   const [page, setPage] = useState(1);
   const [data, setData] = useState<MonitorData | null>(null);
@@ -235,6 +236,14 @@ export function Monitoring({
   useEffect(() => {
     setPage(1);
   }, [repo]);
+  useEffect(() => {
+    if (type !== 'releases' || data?.type !== 'releases' || !autoAsset) return;
+    const latest = data.releases
+      .slice(0, 5)
+      .find((r) => !r.draft && r.deleted_at === null && r.published_at !== null);
+    setAssetId(latest?.github_id ?? null);
+  }, [type, data, autoAsset]);
+  const releaseRows = data?.type === 'releases' ? data.releases.slice(0, 5) : [];
   const options =
     type === 'issues'
       ? [
@@ -281,6 +290,10 @@ export function Monitoring({
           aria-selected={type === tab.id}
           className={type === tab.id ? 'active' : ''}
           onClick={() => {
+            if (tab.id === 'releases' && type !== 'releases') {
+              setAutoAsset(true);
+              setAssetId(null);
+            }
             setType(tab.id);
             setState('all');
             setLabel('');
@@ -411,7 +424,7 @@ export function Monitoring({
           <WorkChart history={history} mode={type} />
         </section>
       )}
-      <section className="panel">
+      <section className="panel" aria-label={type === 'releases' ? 'Release 版本' : undefined}>
         <div className="panel-header">
           <div>
             <h2>
@@ -554,7 +567,7 @@ export function Monitoring({
                         </tr>
                       ))
                     : type === 'releases'
-                      ? data.releases.map((r) => (
+                      ? releaseRows.map((r) => (
                           <tr key={`${r.project_id}:${r.github_id}`}>
                             <td>
                               <a
@@ -596,7 +609,10 @@ export function Monitoring({
                               <button
                                 className="text-button"
                                 aria-label={`${r.tag_name} 产物下载量`}
-                                onClick={() => setAssetId(r.github_id)}
+                                onClick={() => {
+                                  setAutoAsset(false);
+                                  setAssetId(r.github_id);
+                                }}
                               >
                                 查看产物
                                 {r.assets_count === undefined || r.assets_count === null
@@ -666,8 +682,16 @@ export function Monitoring({
                 </tbody>
               </table>
             </div>
-            <PageButtons page={data.page} total={data.total} onPage={setPage} />
+            {type !== 'releases' && (
+              <PageButtons page={data.page} total={data.total} onPage={setPage} />
+            )}
           </>
+        )}
+        {type === 'releases' && data && (
+          <div className="pagination" role="status">
+            已显示 {releaseRows.length} 个 Release，另有{' '}
+            {Math.max(0, data.total - releaseRows.length)} 个已缓存版本未显示。
+          </div>
         )}
       </section>
       {type === 'pull_requests' && !!data?.contributors.length && (
@@ -695,7 +719,10 @@ export function Monitoring({
           key={`${repo}:${assetId}`}
           repo={repo}
           releaseId={assetId}
-          onClose={() => setAssetId(null)}
+          onClose={() => {
+            setAutoAsset(false);
+            setAssetId(null);
+          }}
         />
       )}
     </div>
@@ -707,32 +734,49 @@ export function ActivityFeed({
   category,
   onCategory,
   onPage,
+  preview = false,
+  onViewAll,
 }: {
   data: Dashboard;
   category: string;
   onCategory: (value: string) => void;
   onPage: (page: number) => void;
+  preview?: boolean;
+  onViewAll?: () => void;
 }) {
+  const events = preview ? (data.recentEvents ?? []).slice(0, 5) : data.timeline;
   return (
-    <section className="panel changes-panel">
+    <section className="panel changes-panel" aria-label={preview ? '最近项目动态' : '项目动态'}>
       <div className="panel-header">
         <div>
-          <h2>项目动态</h2>
-          <p>所有维度的已收到事件 · 北京时间</p>
+          <h2>{preview ? '最近项目动态' : '项目动态'}</h2>
+          <p>
+            {preview
+              ? '所选范围内的所有类型事件 · 最近 5 条 · 北京时间'
+              : '所有维度的已收到事件 · 北京时间'}
+          </p>
         </div>
-      </div>
-      <div className="change-tabs feed-tabs">
-        {[['all', '全部'], ...Object.entries(categoryLabels)].map(([value, label]) => (
-          <button
-            key={value}
-            className={category === value ? 'active' : ''}
-            onClick={() => onCategory(value)}
-          >
-            {label}
+        {preview && onViewAll && (
+          <button className="text-button" onClick={onViewAll}>
+            查看全部动态
+            <ArrowUpRight size={14} />
           </button>
-        ))}
+        )}
       </div>
-      {data.timeline.length ? (
+      {!preview && (
+        <div className="change-tabs feed-tabs">
+          {[['all', '全部'], ...Object.entries(categoryLabels)].map(([value, label]) => (
+            <button
+              key={value}
+              className={category === value ? 'active' : ''}
+              onClick={() => onCategory(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+      {events.length ? (
         <>
           <div className="table-scroll">
             <table className="monitor-table">
@@ -745,7 +789,7 @@ export function ActivityFeed({
                 </tr>
               </thead>
               <tbody>
-                {data.timeline.map((event) => (
+                {events.map((event) => (
                   <tr key={event.id}>
                     <td>
                       <span
@@ -779,7 +823,7 @@ export function ActivityFeed({
               </tbody>
             </table>
           </div>
-          <PageButtons page={data.page} total={data.timelineTotal} onPage={onPage} />
+          {!preview && <PageButtons page={data.page} total={data.timelineTotal} onPage={onPage} />}
         </>
       ) : (
         <Empty>配置对应的 GitHub Webhook 事件后，这里会持续记录项目的变化。</Empty>

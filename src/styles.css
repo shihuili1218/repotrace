@@ -2892,17 +2892,6 @@ td small {
   gap: 12px;
   border-top: 1px solid #edf0f5;
 }
-.download-chart-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 24px;
-  font-size: 13px;
-}
-.download-chart-toolbar select {
-  max-width: 170px;
-}
 .download-bars {
   display: grid;
   gap: 6px;
@@ -3006,10 +2995,6 @@ td small {
 @media (max-width: 600px) {
   .download-chart {
     margin: 18px 14px;
-  }
-  .download-chart-toolbar {
-    padding: 8px 14px;
-    flex-wrap: wrap;
   }
   .download-distribution {
     grid-template-columns: 115px minmax(0, 1fr);

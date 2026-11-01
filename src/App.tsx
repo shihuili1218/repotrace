@@ -822,7 +822,22 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                   onPage={setPage}
                 />
               )}
-              {(view === 'overview' || (view === 'activity' && !!summary)) && (
+              {view === 'overview' && (
+                <ActivityFeed
+                  data={data}
+                  category="all"
+                  onCategory={setCategory}
+                  onPage={setPage}
+                  preview
+                  onViewAll={() => {
+                    setSummary('');
+                    setCategory('all');
+                    setPage(1);
+                    setView('activity');
+                  }}
+                />
+              )}
+              {view === 'activity' && !!summary && (
                 <Changes
                   data={data}
                   summary={summary}

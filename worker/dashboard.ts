@@ -131,7 +131,7 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     UNION ALL SELECT 'event:'||e.delivery_seq,e.delivery_seq,e.project_id,p.full_name,e.category,e.action,e.actor_id,e.actor_login,e.title,e.number,e.url,e.received_at FROM project_events e JOIN projects p ON p.id=e.project_id
     ) WHERE (? IS NULL OR project_id=?) AND received_at>=? AND received_at<? AND (?='all' OR category=?)`;
   const feedParams = [project, project, since, until, category, category];
-  const [changes, count, timeline, timelineCount] = await Promise.all([
+  const [changes, count, timeline, timelineCount, recent] = await Promise.all([
     db
       .prepare(`${selected} ORDER BY observed_at DESC,id DESC LIMIT 30 OFFSET ?`)
       .bind(...params, (page - 1) * 30)
@@ -148,6 +148,12 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
       .prepare(`SELECT COUNT(*) AS count FROM (${feed})`)
       .bind(...feedParams)
       .first<number>('count'),
+    category === 'all' && page === 1
+      ? Promise.resolve(null)
+      : db
+          .prepare(`${feed} ORDER BY received_at DESC,seq DESC LIMIT 5`)
+          .bind(project, project, since, until, 'all', 'all')
+          .all<ActivityRecord>(),
   ]);
   const [net, choices, catalog] = await Promise.all([
     db
@@ -193,6 +199,7 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     metrics,
     releaseMarkers: markers.results,
     timeline: timeline.results,
+    recentEvents: (recent?.results ?? timeline.results).slice(0, 5),
     timelineTotal: timelineCount ?? 0,
   };
 }
