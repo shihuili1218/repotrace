@@ -622,7 +622,7 @@ export function Monitoring({
                           </tr>
                         ))
                       : data.items.map((w) => (
-                          <tr key={`${w.project_id}:${w.github_id}`}>
+                          <tr key={`${w.project_id}:${w.kind}:${w.number}`}>
                             <td>
                               <a
                                 className="record-title"

@@ -18,7 +18,7 @@ export async function monitorMetrics(
 ): Promise<MonitorMetrics> {
   const { since, until } = range;
   const active = projectScope
-    ? ` AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.object_id=w.github_id AND e.category=w.kind AND e.received_at>=? AND e.received_at<?)`
+    ? ` AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.number=w.number AND e.category=w.kind AND e.received_at>=? AND e.received_at<?)`
     : '';
   const [work, activity, forks, releases, latest] = await Promise.all([
     db
@@ -47,11 +47,11 @@ export async function monitorMetrics(
       >(),
     db
       .prepare(
-        `SELECT COUNT(DISTINCT CASE WHEN category='issue' AND action='opened' THEN project_id||':'||object_id END) AS issuesOpened,
-      COUNT(DISTINCT CASE WHEN category='issue' AND action='closed' THEN project_id||':'||object_id END) AS issuesClosed,
-      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='opened' THEN project_id||':'||object_id END) AS prsOpened,
-      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='merged' THEN project_id||':'||object_id END) AS prsMerged,
-      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||object_id END) AS prsClosed
+        `SELECT COUNT(DISTINCT CASE WHEN category='issue' AND action='opened' THEN project_id||':'||number END) AS issuesOpened,
+      COUNT(DISTINCT CASE WHEN category='issue' AND action='closed' THEN project_id||':'||number END) AS issuesClosed,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='opened' THEN project_id||':'||number END) AS prsOpened,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='merged' THEN project_id||':'||number END) AS prsMerged,
+      COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||number END) AS prsClosed
       FROM project_events WHERE received_at>=? AND received_at<? AND (? IS NULL OR project_id=?)`,
       )
       .bind(since, until, project, project)
@@ -164,14 +164,14 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
   } else {
     const kind = type === 'issues' ? 'issue' : 'pull_request';
     selected = `SELECT w.*,p.full_name FROM work_items w JOIN projects p ON p.id=w.project_id WHERE kind=? AND project_id=?
-      AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.object_id=w.github_id AND e.category=w.kind AND e.received_at>=? AND e.received_at<?)
+      AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.number=w.number AND e.category=w.kind AND e.received_at>=? AND e.received_at<?)
       AND (?='all' OR state=? OR (?='unanswered' AND state='open' AND first_reply_at IS NULL) OR (?='awaiting_review' AND state='open' AND draft=0 AND (review_state IS NULL OR review_state='dismissed')))
       AND (?='' OR EXISTS(SELECT 1 FROM json_each(w.labels) WHERE value=?))`;
     params = [kind, project, since, until, state, state, state, state, label, label];
-    order = 'w.updated_at DESC,w.github_id DESC';
+    order = 'w.updated_at DESC,w.number DESC';
     const labels = await db
       .prepare(
-        `SELECT DISTINCT j.value AS label FROM work_items w,json_each(w.labels) j WHERE kind=? AND project_id=? AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.object_id=w.github_id AND e.category=w.kind AND e.received_at>=? AND e.received_at<?) ORDER BY label COLLATE NOCASE`,
+        `SELECT DISTINCT j.value AS label FROM work_items w,json_each(w.labels) j WHERE kind=? AND project_id=? AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.number=w.number AND e.category=w.kind AND e.received_at>=? AND e.received_at<?) ORDER BY label COLLATE NOCASE`,
       )
       .bind(kind, project, since, until)
       .all<{ label: string }>();
@@ -179,7 +179,7 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
     if (type === 'pull_requests') {
       const people = await db
         .prepare(
-          `SELECT author_id AS id,MAX(author_login) AS login,COUNT(*) AS prs,SUM(state='merged') AS merged FROM work_items w WHERE kind='pull_request' AND project_id=? AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.object_id=w.github_id AND e.category=w.kind AND e.received_at>=? AND e.received_at<?) GROUP BY author_id ORDER BY prs DESC,id LIMIT 12`,
+          `SELECT author_id AS id,MAX(author_login) AS login,COUNT(*) AS prs,SUM(state='merged') AS merged FROM work_items w WHERE kind='pull_request' AND project_id=? AND EXISTS(SELECT 1 FROM project_events e WHERE e.project_id=w.project_id AND e.number=w.number AND e.category=w.kind AND e.received_at>=? AND e.received_at<?) GROUP BY author_id ORDER BY prs DESC,id LIMIT 12`,
         )
         .bind(project, since, until)
         .all<MonitorData['contributors'][number]>();

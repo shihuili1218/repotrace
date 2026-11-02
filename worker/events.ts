@@ -233,10 +233,10 @@ export function normalizeEvent(
         .prepare(
           `INSERT INTO work_items(project_id,github_id,kind,number,title,author_id,author_login,state,draft,labels,created_at,updated_at,closed_at,merged_at,first_seen_at,first_reply_at,review_state,reviewed_at,head_sha,last_delivery_seq)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,seq FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND processed=0 AND recorded=1
-      ON CONFLICT(project_id,kind,github_id) DO UPDATE SET
+      ON CONFLICT(project_id,kind,number) DO UPDATE SET
       title=CASE WHEN ${fresh} THEN excluded.title ELSE work_items.title END,
       author_login=CASE WHEN ${fresh} THEN excluded.author_login ELSE work_items.author_login END,
-      state=CASE WHEN work_items.state IN ('deleted','merged') THEN work_items.state WHEN ${fresh} THEN excluded.state ELSE work_items.state END,
+      state=CASE WHEN work_items.state IN ('deleted','merged') THEN work_items.state WHEN excluded.state='merged' THEN 'merged' WHEN ${fresh} THEN excluded.state ELSE work_items.state END,
       draft=CASE WHEN ${fresh} AND ?=0 THEN excluded.draft ELSE work_items.draft END,
       labels=CASE WHEN ${fresh} THEN excluded.labels ELSE work_items.labels END,
       updated_at=MAX(work_items.updated_at,excluded.updated_at),

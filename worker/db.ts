@@ -169,6 +169,22 @@ export const migrations = [
     `UPDATE release_refresh SET error=NULL,retry_at=0,lease_token=NULL,lease_until=0 WHERE resource='downloads'`,
     `UPDATE public_api_backoff SET error='GitHub 公开接口暂时不可用。'`,
   ],
+  [
+    // PR comments carry an Issue ID, while PR/review events carry a PR ID.
+    // Their repository-local number is the common identity across both sources.
+    `CREATE TABLE work_items_number (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL, kind TEXT NOT NULL, number INTEGER NOT NULL, title TEXT NOT NULL,
+      author_id INTEGER NOT NULL, author_login TEXT NOT NULL, state TEXT NOT NULL, draft INTEGER NOT NULL DEFAULT 0,
+      labels TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, merged_at INTEGER,
+      first_seen_at INTEGER NOT NULL, first_reply_at INTEGER, review_state TEXT, reviewed_at INTEGER, head_sha TEXT,
+      last_delivery_seq INTEGER NOT NULL, PRIMARY KEY(project_id,kind,number)
+    )`,
+    `INSERT INTO work_items_number SELECT * FROM work_items`,
+    `DROP TABLE work_items`,
+    `ALTER TABLE work_items_number RENAME TO work_items`,
+    `CREATE INDEX work_status ON work_items(project_id,kind,state,updated_at)`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

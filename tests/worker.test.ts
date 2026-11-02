@@ -753,6 +753,204 @@ describe('fork growth', () => {
 });
 
 describe('issues and pull requests', () => {
+  it('merges a PR first observed through an issue comment with a different GitHub ID', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const pr = item(5086723206, { number: 310 });
+    expect(
+      (
+        await signed(config, 'issue_comment', {
+          action: 'created',
+          issue: { ...pr, id: 6121875079, pull_request: {} },
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+        })
+      ).status,
+    ).toBe(200);
+    expect((await monitor(session, 'pull_requests', '&state=open')).total).toBe(1);
+
+    expect(
+      (
+        await signed(config, 'pull_request', {
+          action: 'closed',
+          pull_request: {
+            ...pr,
+            state: 'closed',
+            merged: true,
+            merged_at: iso(nowSeconds()),
+            closed_at: iso(nowSeconds()),
+            updated_at: iso(nowSeconds()),
+          },
+        })
+      ).status,
+    ).toBe(200);
+
+    expect(await scalar('SELECT COUNT(*) AS count FROM work_items')).toBe(1);
+    expect((await monitor(session, 'pull_requests', '&state=merged')).items[0]).toMatchObject({
+      number: 310,
+      state: 'merged',
+    });
+    expect((await monitor(session, 'pull_requests', '&state=open')).total).toBe(0);
+    expect((await dashboard(session)).metrics).toMatchObject({ openPRs: 0, prsMerged: 1 });
+  });
+  it('accepts issue comments with a different GitHub ID after a PR has merged', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const mergedAt = nowSeconds() - 10;
+    const pr = item(1002, {
+      state: 'closed',
+      merged: true,
+      merged_at: iso(mergedAt),
+      closed_at: iso(mergedAt),
+    });
+    expect(
+      (await signed(config, 'pull_request', { action: 'closed', pull_request: pr })).status,
+    ).toBe(200);
+    expect(
+      (
+        await signed(config, 'issue_comment', {
+          action: 'created',
+          issue: item(3001, {
+            number: pr.number,
+            state: 'closed',
+            closed_at: iso(mergedAt),
+            updated_at: iso(nowSeconds()),
+            pull_request: {},
+          }),
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+        })
+      ).status,
+    ).toBe(200);
+    const list = await monitor(session, 'pull_requests');
+    expect(list.items).toHaveLength(1);
+    expect(list.items[0]).toMatchObject({
+      number: pr.number,
+      state: 'merged',
+      merged_at: mergedAt,
+    });
+    expect(await scalar('SELECT COUNT(*) AS count FROM work_items')).toBe(1);
+  });
+  it('recognizes a delayed PR merge without overwriting newer comment metadata', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const mergedAt = nowSeconds() - 20;
+    expect(
+      (
+        await signed(config, 'issue_comment', {
+          action: 'created',
+          issue: item(3001, {
+            number: 2,
+            title: 'New title',
+            state: 'closed',
+            closed_at: iso(mergedAt),
+            updated_at: iso(nowSeconds()),
+            pull_request: {},
+          }),
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await signed(config, 'pull_request', {
+          action: 'closed',
+          pull_request: item(1002, {
+            title: 'Old title',
+            state: 'closed',
+            merged: true,
+            merged_at: iso(mergedAt),
+            closed_at: iso(mergedAt),
+            updated_at: iso(mergedAt),
+          }),
+        })
+      ).status,
+    ).toBe(200);
+    expect((await monitor(session, 'pull_requests')).items[0]).toMatchObject({
+      number: 2,
+      title: 'New title',
+      state: 'merged',
+      merged_at: mergedAt,
+    });
+  });
+  it('includes an existing PR in a time range containing only its issue comments', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const earlier = nowSeconds() - 8 * 86400;
+    const pr = item(1002, { created_at: iso(earlier - 100), updated_at: iso(earlier) });
+    expect(
+      (
+        await signed(
+          config,
+          'pull_request',
+          { action: 'opened', pull_request: pr },
+          crypto.randomUUID(),
+          earlier,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await signed(config, 'issue_comment', {
+          action: 'created',
+          issue: { ...pr, id: 3001, updated_at: iso(nowSeconds()), pull_request: {} },
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+        })
+      ).status,
+    ).toBe(200);
+
+    const list = await monitor(session, 'pull_requests', '&days=7');
+    expect(list.total).toBe(1);
+    expect(list.items[0]).toMatchObject({ number: pr.number, state: 'open' });
+    expect(list.labels).toEqual(['bug']);
+    expect(list.contributors).toEqual([{ id: 10, login: 'author', prs: 1, merged: 0 }]);
+    expect(
+      (await dashboard(session, `?scope=project&repo=${config.id}&days=7`)).metrics,
+    ).toMatchObject({
+      openPRs: 1,
+      awaitingReview: 1,
+      contributors: 1,
+      prsOpened: 0,
+    });
+  });
+  it('keeps different PRs separate when their issue and pull request IDs overlap', async () => {
+    const session = await setup();
+    const config = await add(session);
+    expect(
+      (
+        await signed(config, 'issue_comment', {
+          action: 'created',
+          issue: item(3001, { number: 2, title: 'First PR', pull_request: {} }),
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await signed(config, 'pull_request', {
+          action: 'closed',
+          pull_request: item(3001, {
+            number: 3,
+            title: 'Second PR',
+            state: 'closed',
+            merged: true,
+            merged_at: iso(nowSeconds()),
+            closed_at: iso(nowSeconds()),
+            updated_at: iso(nowSeconds()),
+          }),
+        })
+      ).status,
+    ).toBe(200);
+    const list = await monitor(session, 'pull_requests');
+    expect(list.total).toBe(2);
+    expect(list.items.find((pr) => pr.number === 2)).toMatchObject({
+      title: 'First PR',
+      state: 'open',
+    });
+    expect(list.items.find((pr) => pr.number === 3)).toMatchObject({
+      title: 'Second PR',
+      state: 'merged',
+    });
+    expect((await dashboard(session)).metrics).toMatchObject({ openPRs: 1, prsMerged: 1 });
+  });
   it('tracks issues, labels, human first response, closing and reopening', async () => {
     const session = await setup();
     const config = await add(session);
@@ -1022,6 +1220,47 @@ it('never treats an approval of an old commit as a current PR approval', async (
   });
   expect((await monitor(session, 'pull_requests')).items[0].review_state).toBeNull();
   expect((await dashboard(session)).metrics.awaitingReview).toBe(1);
+});
+
+it('preserves existing work items when migrating their identity to repository numbers', async () => {
+  const session = await setup();
+  const config = await add(session);
+  await env.DB.batch([
+    env.DB.prepare('DROP TABLE work_items'),
+    ...migrations[3]
+      .filter((sql) => /^CREATE (TABLE work_items|INDEX work_status)\b/.test(sql))
+      .map((sql) => env.DB.prepare(sql)),
+    env.DB.prepare(
+      `INSERT INTO work_items(project_id,github_id,kind,number,title,author_id,author_login,state,draft,labels,created_at,updated_at,closed_at,merged_at,first_seen_at,first_reply_at,review_state,reviewed_at,head_sha,last_delivery_seq)
+      VALUES (?,6121875079,'pull_request',310,'Existing PR',10,'author','open',1,'["bug"]',100,120,NULL,NULL,130,110,'approved',115,?,1)`,
+    ).bind(config.id, 'a'.repeat(40)),
+  ]);
+  const before = await env.DB.prepare('SELECT * FROM work_items').all();
+  await env.DB.batch(migrations[8].map((sql) => env.DB.prepare(sql)));
+  expect((await env.DB.prepare('SELECT * FROM work_items').all()).results).toEqual(before.results);
+  expect(
+    (
+      await signed(config, 'pull_request', {
+        action: 'closed',
+        pull_request: item(5086723206, {
+          number: 310,
+          state: 'closed',
+          merged: true,
+          merged_at: iso(nowSeconds()),
+          closed_at: iso(nowSeconds()),
+          updated_at: iso(nowSeconds()),
+        }),
+      })
+    ).status,
+  ).toBe(200);
+  expect(await scalar('SELECT COUNT(*) AS count FROM work_items')).toBe(1);
+  expect((await monitor(session, 'pull_requests')).items[0]).toMatchObject({
+    number: 310,
+    state: 'merged',
+    first_reply_at: 110,
+  });
+  expect((await request(`/repositories/${config.id}`, 'DELETE', {}, session)).status).toBe(200);
+  expect(await scalar('SELECT COUNT(*) AS count FROM work_items')).toBe(0);
 });
 
 it('scopes and paginates item lists, validates filters and generates safe GitHub links', async () => {
@@ -1898,7 +2137,7 @@ describe('hourly Release collection and live asset cache', () => {
         'INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)',
       ).bind(config.id, 'assets:2001', '{}'),
     ]);
-    await env.DB.batch(migrations.at(-1)!.map((sql) => env.DB.prepare(sql)));
+    await env.DB.batch(migrations[7].map((sql) => env.DB.prepare(sql)));
     expect(
       await scalar(
         "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='release_catalog_sync'",
