@@ -2,6 +2,7 @@ import { object, integer, text, user, date } from './events';
 import { parseRepository } from './projects';
 import { assetSnapshotStatements, normalizeAssets } from './release-assets';
 import { AppError, nowSeconds, type Env } from './types';
+import { statisticsRange } from './range';
 import type { AssetReport, ReleaseAsset, DownloadSummary, ReleaseDownload } from '../shared/types';
 import { readReleaseCache, cacheState, refreshInBackground, UpstreamError } from './release-cache';
 
@@ -60,9 +61,9 @@ async function github(
     );
     await response.body?.cancel();
     const message = limited
-      ? 'GitHub 公开接口暂时限流，已保留缓存，稍后访问时再尝试刷新。'
+      ? 'GitHub 公开接口暂时限流。'
       : response.status === 403
-        ? 'GitHub 暂时拒绝公开接口访问（HTTP 403），已保留缓存。'
+        ? 'GitHub 暂时拒绝公开接口访问（HTTP 403）。'
         : `GitHub 公开 Release 数据暂时无法刷新（HTTP ${response.status}），已保留缓存。`;
     if ([403, 429].includes(response.status)) {
       await env.DB.prepare(
@@ -168,50 +169,6 @@ function publicMetadata(input: unknown) {
     published: date(r.published_at),
   };
 }
-function metadataStatement(
-  db: D1Database,
-  project: string,
-  records: ReturnType<typeof publicMetadata>[],
-  at: number,
-) {
-  return db
-    .prepare(
-      `INSERT INTO releases(project_id,github_id,tag_name,name,author_login,prerelease,draft,created_at,published_at,first_seen_at,last_delivery_seq,metadata_observed_at)
-    SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.tag'),json_extract(value,'$.name'),json_extract(value,'$.author'),json_extract(value,'$.prerelease'),json_extract(value,'$.draft'),json_extract(value,'$.created'),json_extract(value,'$.published'),?,0,? FROM json_each(?) WHERE 1
-    ON CONFLICT(project_id,github_id) DO UPDATE SET tag_name=excluded.tag_name,name=excluded.name,author_login=excluded.author_login,prerelease=excluded.prerelease,draft=excluded.draft,created_at=excluded.created_at,published_at=excluded.published_at,metadata_observed_at=excluded.metadata_observed_at
-    WHERE releases.deleted_at IS NULL AND releases.metadata_observed_at<=excluded.metadata_observed_at`,
-    )
-    .bind(project, at, at, JSON.stringify(records));
-}
-export async function syncPublicReleases(
-  env: Env,
-  project: string,
-  page: number,
-  signal?: AbortSignal,
-) {
-  if (!Number.isInteger(page) || page < 1 || page > 1000) throw new AppError(400, '版本页码无效。');
-  const at = nowSeconds();
-  const repo = await source(env, project, signal);
-  const result = await github(env, `${repo.path}/releases?per_page=30&page=${page}`, signal);
-  if (!Array.isArray(result.data) || result.data.length > 30)
-    throw new AppError(502, 'GitHub 返回的 Release 列表无效。');
-  const records = result.data.map(publicMetadata).filter((r) => !r.draft && r.published !== null);
-  await env.DB.batch([
-    env.DB.prepare(
-      'UPDATE projects SET github_id=?,full_name=? WHERE id=? AND (github_id IS NULL OR github_id=?)',
-    ).bind(repo.githubId, repo.name, project, repo.githubId),
-    metadataStatement(env.DB, project, records, at),
-    env.DB.prepare(
-      'INSERT INTO release_catalog_sync(project_id,last_page,next_page,updated_at) VALUES (?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET last_page=excluded.last_page,next_page=excluded.next_page,updated_at=excluded.updated_at',
-    ).bind(project, page, result.next ? page + 1 : null, nowSeconds()),
-  ]);
-  return {
-    nextPage: result.next ? page + 1 : null,
-    updatedAt: nowSeconds(),
-    count: records.length,
-    cached: false,
-  };
-}
 export async function assetReport(
   db: D1Database,
   project: string,
@@ -253,7 +210,6 @@ export async function refreshPublicAssets(
 ) {
   const existing = await assetReport(env.DB, project, release);
   if (existing.deleted) return existing;
-  const started = nowSeconds();
   const repo = await source(env, project, signal);
   const metadata = publicMetadata(
     (await github(env, `${repo.path}/releases/${release}`, signal)).data,
@@ -275,7 +231,6 @@ export async function refreshPublicAssets(
   const normalized = normalizeAssets(assets, repo.name);
   const at = nowSeconds();
   await env.DB.batch([
-    metadataStatement(env.DB, project, [metadata], started),
     ...assetSnapshotStatements(
       env.DB,
       project,
@@ -289,95 +244,152 @@ export async function refreshPublicAssets(
   return assetReport(env.DB, project, release);
 }
 
-export async function cachedCatalog(
-  env: Env,
-  project: string,
-  page: number,
-  ctx: ExecutionContext,
-) {
-  if (!Number.isInteger(page) || page < 1 || page > 1000) throw new AppError(400, '版本页码无效。');
-  const resource = `catalog:${page}`;
-  const row = await readReleaseCache(env.DB, project, resource);
-  const saved = row?.payload
-    ? (JSON.parse(row.payload) as { nextPage: number | null; count: number })
-    : null;
-  const old = await env.DB.prepare(
-    'SELECT next_page,updated_at FROM release_catalog_sync WHERE project_id=? AND last_page=?',
-  )
-    .bind(project, page)
-    .first<{ next_page: number | null; updated_at: number }>();
-  const report = {
-    nextPage: saved?.nextPage ?? old?.next_page ?? null,
-    count: saved?.count ?? 0,
-    updatedAt: row?.updated_at ?? old?.updated_at ?? null,
-    cache: { ...cacheState(row), updatedAt: row?.updated_at ?? old?.updated_at ?? null },
-  };
-  refreshInBackground(env, project, resource, ctx, (signal) =>
-    syncPublicReleases(env, project, page, signal),
-  );
-  return report;
-}
 export async function cachedDownloads(
   env: Env,
   project: string,
-  ctx: ExecutionContext,
+  url: URL,
 ): Promise<DownloadSummary> {
-  const row = await readReleaseCache(env.DB, project, 'downloads');
+  const range = await statisticsRange(env.DB, url, project);
+  const [row, history] = await Promise.all([
+    readReleaseCache(env.DB, project, 'downloads'),
+    env.DB.prepare(
+      'SELECT observed_at AS observedAt,total FROM download_snapshots WHERE project_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at,hour',
+    )
+      .bind(project, range.since, range.until)
+      .all<DownloadSummary['history'][number]>(),
+  ]);
   const payload = row?.payload ? (JSON.parse(row.payload) as DownloadSummary) : null;
   const saved = payload?.source === 'github' ? payload : null;
-  const report: DownloadSummary = {
+  return {
     total: saved?.total ?? null,
     latest: saved?.latest ?? null,
     source: 'github',
     releases: saved?.releases ?? [],
-    cache: cacheState(row),
+    cache: { updatedAt: row?.updated_at ?? null, error: row?.error ?? null },
+    history: history.results,
   };
-  refreshInBackground(env, project, 'downloads', ctx, async (signal) => {
-    const repo = await source(env, project, signal);
-    let total = 0n;
+}
+
+function sumDownloads(input: unknown): bigint {
+  if (!Array.isArray(input)) throw new AppError(502, 'GitHub 返回的下载量清单无效。');
+  return input.reduce((value: bigint, raw: unknown) => {
+    const count = object(raw).download_count;
+    if (!Number.isSafeInteger(count) || (count as number) < 0)
+      throw new AppError(502, 'GitHub 产物下载量缺失。');
+    return value + BigInt(count as number);
+  }, 0n);
+}
+
+async function collectProjectReleases(
+  env: Env,
+  project: { id: string; full_name: string },
+  hour: number,
+) {
+  const started = nowSeconds();
+  const token = crypto.randomUUID();
+  const lease = await env.DB.prepare(
+    `INSERT INTO release_refresh(project_id,resource,lease_token,lease_until,scheduled_hour)
+    SELECT ?,'downloads',?,?,? WHERE EXISTS(SELECT 1 FROM projects WHERE id=? AND enabled=1 AND full_name=?)
+    ON CONFLICT(project_id,resource) DO UPDATE SET lease_token=excluded.lease_token,lease_until=excluded.lease_until,scheduled_hour=excluded.scheduled_hour
+    WHERE release_refresh.lease_until<=? AND (release_refresh.scheduled_hour IS NULL OR release_refresh.scheduled_hour<?) RETURNING lease_token`,
+  )
+    .bind(project.id, token, started + 35, hour, project.id, project.full_name, started, hour)
+    .first();
+  if (!lease) return;
+  try {
+    const signal = AbortSignal.timeout(25000);
+    const path = `/repos/${project.full_name.split('/').map(encodeURIComponent).join('/')}`;
+    const records: ReturnType<typeof publicMetadata>[] = [];
     const versions: ReleaseDownload[] = [];
-    const sum = (input: unknown) => {
-      if (!Array.isArray(input)) throw new AppError(502, 'GitHub 返回的下载量清单无效。');
-      return input.reduce((value: bigint, raw: unknown) => {
-        const count = object(raw).download_count;
-        if (!Number.isSafeInteger(count) || (count as number) < 0)
-          throw new AppError(502, 'GitHub 产物下载量缺失，已保留缓存。');
-        return value + BigInt(count as number);
-      }, 0n);
-    };
-    for (let page = 1; page <= 20; page++) {
-      const result = await github(env, `${repo.path}/releases?per_page=100&page=${page}`, signal);
+    let total = 0n;
+    for (let page = 1; ; page++) {
+      signal.throwIfAborted();
+      const result = await github(env, `${path}/releases?per_page=100&page=${page}`, signal);
       if (!Array.isArray(result.data) || result.data.length > 100)
         throw new AppError(502, 'GitHub 返回的版本清单无效。');
       for (const raw of result.data) {
         const r = object(raw);
         if (r.draft || !r.published_at) continue;
-        const downloads = sum(r.assets);
+        const metadata = publicMetadata(r);
+        const downloads = sumDownloads(r.assets);
+        records.push(metadata);
         total += downloads;
         versions.push({
-          id: integer(r.id),
-          tag: text(r.tag_name, 255),
-          name: typeof r.name === 'string' ? r.name : text(r.tag_name, 255),
-          publishedAt: date(r.published_at)!,
-          prerelease: !!r.prerelease,
+          id: metadata.id,
+          tag: metadata.tag,
+          name: metadata.name,
+          publishedAt: metadata.published!,
+          prerelease: !!metadata.prerelease,
           downloads: String(downloads),
         });
       }
       if (!result.next) break;
-      if (page === 20) throw new AppError(502, '版本下载量尚未完整汇总，已保留缓存。');
     }
     const latest = versions.length
-      ? (await github(env, `${repo.path}/releases/latest`, signal, true)).data
+      ? (await github(env, `${path}/releases/latest`, signal, true)).data
       : null;
-    return {
+    const payload = {
       total: String(total),
-      latest: latest === null ? null : String(sum(object(latest).assets)),
+      latest: latest === null ? null : String(sumDownloads(object(latest).assets)),
       source: 'github',
       releases: versions,
     };
-  });
-  return report;
+    const at = nowSeconds();
+    // A complete collection replaces all three views together. A rename, pause,
+    // deletion or newer lease while fetching must not publish this stale result.
+    const guard = `EXISTS(SELECT 1 FROM release_refresh f JOIN projects p ON p.id=f.project_id
+      WHERE f.project_id=? AND f.resource='downloads' AND f.lease_token=? AND p.enabled=1 AND p.full_name=?)`;
+    const params = [project.id, token, project.full_name];
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO releases(project_id,github_id,tag_name,name,author_login,prerelease,draft,created_at,published_at,first_seen_at,last_delivery_seq,metadata_observed_at)
+        SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.tag'),json_extract(value,'$.name'),json_extract(value,'$.author'),json_extract(value,'$.prerelease'),json_extract(value,'$.draft'),json_extract(value,'$.created'),json_extract(value,'$.published'),?,0,?
+        FROM json_each(?) WHERE ${guard}
+        ON CONFLICT(project_id,github_id) DO UPDATE SET tag_name=excluded.tag_name,name=excluded.name,author_login=excluded.author_login,prerelease=excluded.prerelease,draft=excluded.draft,created_at=excluded.created_at,published_at=excluded.published_at,metadata_observed_at=excluded.metadata_observed_at,deleted_at=NULL`,
+      ).bind(project.id, at, at, JSON.stringify(records), ...params),
+      env.DB.prepare(
+        `UPDATE releases SET deleted_at=COALESCE(deleted_at,?),metadata_observed_at=?
+        WHERE project_id=? AND github_id NOT IN(SELECT json_extract(value,'$.id') FROM json_each(?)) AND ${guard}`,
+      ).bind(at, at, project.id, JSON.stringify(records), ...params),
+      env.DB.prepare(
+        `INSERT INTO download_snapshots(project_id,hour,observed_at,total)
+        SELECT ?,?,?,? WHERE ${guard}`,
+      ).bind(project.id, hour, at, payload.total, ...params),
+      env.DB.prepare(
+        `UPDATE release_refresh SET updated_at=?,error=NULL,retry_at=0,lease_token=NULL,lease_until=0,payload=?
+        WHERE project_id=? AND resource='downloads' AND ${guard}`,
+      ).bind(at, JSON.stringify(payload), project.id, ...params),
+    ]);
+  } catch (error) {
+    const message = error instanceof AppError ? error.message : 'Release 定时采集失败。';
+    await env.DB.prepare(
+      `UPDATE release_refresh SET error=?,retry_at=0,lease_token=NULL,lease_until=0
+      WHERE project_id=? AND resource='downloads' AND lease_token=?`,
+    )
+      .bind(message, project.id, token)
+      .run();
+  }
 }
+
+export async function collectScheduledReleases(env: Env, scheduledTime: number) {
+  const hour = Math.floor(scheduledTime / 3600000) * 3600;
+  const projects = await env.DB.prepare(
+    'SELECT id,full_name FROM projects WHERE enabled=1 ORDER BY id',
+  ).all<{ id: string; full_name: string }>();
+  for (const project of projects.results) {
+    try {
+      await collectProjectReleases(env, project, hour);
+    } catch (error) {
+      // Database errors must not prevent the remaining projects from collecting.
+      console.error(
+        'Release collection failed:',
+        project.id,
+        error instanceof Error ? error.name : 'UnknownError',
+      );
+    }
+  }
+}
+
 export async function cachedAssets(
   env: Env,
   project: string,

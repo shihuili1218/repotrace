@@ -166,7 +166,7 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     projectScope
       ? db
           .prepare(
-            'SELECT github_id,tag_name,published_at,prerelease FROM releases WHERE project_id=? AND published_at IS NOT NULL AND draft=0 ORDER BY published_at DESC,github_id DESC LIMIT 1000',
+            'SELECT github_id,tag_name,published_at,prerelease FROM releases WHERE project_id=? AND published_at IS NOT NULL AND draft=0 AND deleted_at IS NULL ORDER BY published_at DESC,github_id DESC',
           )
           .bind(project)
           .all<ReleaseBoundary>()
@@ -174,10 +174,10 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     projectScope
       ? db
           .prepare(
-            'SELECT next_page AS nextPage,updated_at AS updatedAt FROM release_catalog_sync WHERE project_id=?',
+            "SELECT updated_at AS updatedAt,error FROM release_refresh WHERE project_id=? AND resource='downloads'",
           )
           .bind(project)
-          .first<{ nextPage: number | null; updatedAt: number | null }>()
+          .first<Dashboard['releaseCatalog']>()
       : Promise.resolve(null),
   ]);
   return {
@@ -188,7 +188,7 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     })),
     range,
     releaseChoices: choices.results,
-    releaseCatalog: catalog ?? { nextPage: null, updatedAt: null },
+    releaseCatalog: catalog ?? { updatedAt: null, error: null },
     starNet: net ?? { added: 0, removed: 0 },
     history: history.results,
     summaries: summaries.results,

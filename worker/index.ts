@@ -15,7 +15,7 @@ import { parseRepository } from './projects';
 import { sealWebhookSecret, secretStatement } from './webhook-secrets';
 import { newWebhookSecret, receiveWebhook } from './webhooks';
 import { monitoring } from './monitoring';
-import { cachedCatalog, cachedAssets, cachedDownloads } from './public-releases';
+import { cachedAssets, cachedDownloads, collectScheduledReleases } from './public-releases';
 import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
 
@@ -123,11 +123,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     return json({ ok: true }, 200, { 'Set-Cookie': await createSession(env.DB, request) });
   }
   if (path === '/api/dashboard' && method === 'GET') return json(await dashboard(env.DB, url));
-  if (path === '/api/monitoring' && method === 'GET') {
-    const cached = await monitoring(env.DB, url);
-    if (cached.type === 'releases') await cachedCatalog(env, url.searchParams.get('repo')!, 1, ctx);
-    return json(cached);
-  }
+  if (path === '/api/monitoring' && method === 'GET') return json(await monitoring(env.DB, url));
   if (path === '/api/settings' && method === 'GET')
     return json({ timezone: 'Asia/Shanghai', monitors: webhookEvents });
   if (path === '/api/repositories' && method === 'POST') {
@@ -156,23 +152,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     return json(webhookConfig(url.origin, id, name, secret), 201);
   }
   const releasePath = path.match(
-    /^\/api\/repositories\/([^/]+)\/releases\/(sync|downloads|([1-9][0-9]*)\/assets)$/,
+    /^\/api\/repositories\/([^/]+)\/releases\/(downloads|([1-9][0-9]*)\/assets)$/,
   );
   if (releasePath) {
     const project = releasePath[1];
     if (!(await env.DB.prepare('SELECT 1 FROM projects WHERE id=?').bind(project).first()))
       throw new AppError(404, '项目不存在。');
     if (releasePath[2] === 'downloads' && method === 'GET')
-      return json(await cachedDownloads(env, project, ctx));
-    if (releasePath[2] === 'sync' && ['GET', 'POST'].includes(method)) {
-      const data =
-        method === 'POST'
-          ? await body(request)
-          : { page: Number(url.searchParams.get('page') || 1) };
-      return json(
-        await cachedCatalog(env, project, data.page === undefined ? 1 : (data.page as number), ctx),
-      );
-    }
+      return json(await cachedDownloads(env, project, url));
     if (releasePath[3]) {
       const id = Number(releasePath[3]);
       if (!Number.isSafeInteger(id)) throw new AppError(400, '版本 ID 无效。');
@@ -222,6 +209,10 @@ function webhookConfig(origin: string, id: string, name: string, secret?: string
 }
 
 export default {
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    await initDB(env.DB);
+    await collectScheduledReleases(env, controller.scheduledTime);
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     let response: Response;
     try {

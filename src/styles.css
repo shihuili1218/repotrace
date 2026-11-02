@@ -2718,15 +2718,7 @@ td small {
 .project-controls select {
   max-width: 280px;
 }
-.project-sync-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.project-sync-actions .button {
-  font-size: 11px;
-}
+
 .release-range {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
@@ -3008,4 +3000,28 @@ td small {
   .panel > .release-cache-note {
     margin: 12px 14px;
   }
+}
+
+.download-growth-scroll {
+  overflow-x: auto;
+}
+.download-growth .trend-svg {
+  min-width: 620px;
+  height: auto;
+  font-variant-numeric: tabular-nums;
+}
+.download-growth-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.download-growth-control input {
+  flex: 1;
+  min-width: 0;
+  accent-color: #5369ef;
+}
+.download-growth .download-chart-detail {
+  font-variant-numeric: tabular-nums;
 }

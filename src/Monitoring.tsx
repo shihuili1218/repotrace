@@ -171,9 +171,6 @@ export function Monitoring({
   repositories,
   dashboard,
   rangeQuery,
-  refreshVersion,
-  syncingReleases,
-  onRefreshReleases,
 }: {
   repo: string;
   days: number;
@@ -182,9 +179,6 @@ export function Monitoring({
   repositories: RepoSummary[];
   dashboard: Dashboard;
   rangeQuery: string;
-  refreshVersion: number;
-  syncingReleases: boolean;
-  onRefreshReleases: () => Promise<void>;
 }) {
   const [type, setType] = useState<MonitorType>('stars');
   const [state, setState] = useState('all');
@@ -198,6 +192,7 @@ export function Monitoring({
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const requestId = useRef(0);
+  const releaseUpdatedAt = type === 'releases' ? dashboard.releaseCatalog.updatedAt : null;
   const load = useCallback(async () => {
     const id = ++requestId.current;
     setLoading(true);
@@ -223,7 +218,7 @@ export function Monitoring({
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [repo, type, state, label, page, rangeQuery, starMode, starKind, refreshVersion]);
+  }, [repo, type, state, label, page, rangeQuery, starMode, starKind, releaseUpdatedAt]);
   useEffect(() => {
     setData(null);
     void load();
@@ -333,7 +328,9 @@ export function Monitoring({
   return (
     <div className="monitor-view">
       {tabBar}
-      {type === 'releases' && <ReleaseDownloads repo={repo} />}
+      {type === 'releases' && (
+        <ReleaseDownloads repo={repo} rangeQuery={rangeQuery} cache={dashboard.releaseCatalog} />
+      )}
       {type !== 'releases' && (
         <div className={`module-metrics ${type === 'forks' ? 'pair' : ''}`}>
           {type === 'forks' ? (
@@ -442,7 +439,7 @@ export function Monitoring({
               {type === 'forks'
                 ? 'GitHub 只通知新增 Fork，无法据此追踪删除。'
                 : type === 'releases'
-                  ? '打开项目数据时读取公开版本目录，也可手动刷新；下载量为当前累计值。'
+                  ? '版本目录每小时更新，展示最近一次采集结果；产物下载量可实时刷新。'
                   : '只展示所选期间有事件的条目，状态为当前已记录状态。'}
             </p>
           </div>
@@ -480,14 +477,16 @@ export function Monitoring({
                 ))}
               </select>
             )}
-            <button
-              className="icon-button"
-              aria-label={type === 'releases' ? '刷新版本列表' : '刷新监控数据'}
-              disabled={loading || (type === 'releases' && syncingReleases)}
-              onClick={() => void (type === 'releases' ? onRefreshReleases() : load())}
-            >
-              <RefreshCw size={15} className={loading ? 'spin' : ''} />
-            </button>
+            {type !== 'releases' && (
+              <button
+                className="icon-button"
+                aria-label="刷新监控数据"
+                disabled={loading}
+                onClick={() => void load()}
+              >
+                <RefreshCw size={15} className={loading ? 'spin' : ''} />
+              </button>
+            )}
           </div>
         </div>
         {error && (
@@ -501,7 +500,7 @@ export function Monitoring({
         ) : !data.total ? (
           <Empty>
             {type === 'releases'
-              ? '暂无已读取的公开 Release，可刷新版本列表或加载更早版本。'
+              ? '暂无已采集的公开 Release，等待下一次每小时采集。'
               : '在 GitHub Webhook 中勾选对应事件，收到新事件后会出现在这里。'}
           </Empty>
         ) : (

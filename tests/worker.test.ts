@@ -613,7 +613,7 @@ async function monitor(session: string, type: string, query = '') {
   return response.json<MonitorData>();
 }
 
-describe('live analytics without scheduled work', () => {
+describe('live webhook analytics', () => {
   it('updates net changes immediately by Beijing calendar date and cancels opposite actions per stable user', async () => {
     const session = await setup();
     const config = await add(session);
@@ -648,7 +648,6 @@ describe('live analytics without scheduled work', () => {
     expect(data.history.at(-1)).toMatchObject({ added: 0, removed: 1, total: 10 });
     expect(data.eventCounts).toEqual({ added: 2, removed: 2 });
     expect(data.summaries).toHaveLength(0);
-    expect('scheduled' in worker).toBe(false);
     expect((await request('/settings', 'PATCH', { dailyHour: 23 }, session)).status).toBe(404);
     expect(await (await request('/settings', 'GET', undefined, session)).json()).not.toHaveProperty(
       'dailyHour',
@@ -1352,103 +1351,70 @@ async function seedPublicRelease(config: WebhookConfig, patch: Record<string, un
   if (statements.length) await env.DB.batch(statements);
 }
 
-describe('Worker Release cache and background refresh', () => {
-  it('returns a cold catalog before upstream completes and serves the refreshed cache on the next visit', async () => {
+async function collect(at = nowSeconds()) {
+  const ctx = createExecutionContext();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(at * 1000);
+  try {
+    await worker.scheduled({ scheduledTime: at * 1000, cron: '0 * * * *', noRetry() {} }, env, ctx);
+    await waitOnExecutionContext(ctx);
+  } finally {
+    clock.mockRestore();
+  }
+}
+
+describe('hourly Release collection and live asset cache', () => {
+  it('reads a cold summary and catalog without contacting GitHub and removes the sync route', async () => {
     const session = await setup();
     const config = await add(session);
-    let unblock!: () => void;
-    const gate = new Promise<void>((r) => {
-      unblock = r;
-    });
-    const outgoing = publicGitHub(async () => {
-      await gate;
-      return Response.json([release()]);
-    });
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(
-      new Request(`${origin}/api/repositories/${config.id}/releases/sync`, {
-        method: 'POST',
-        headers: { Origin: origin, Cookie: session, 'Content-Type': 'application/json' },
-        body: '{}',
-      }),
-      env,
-      ctx,
-    );
-    expect(await response.json()).toMatchObject({ count: 0, updatedAt: null });
-    unblock();
-    await waitOnExecutionContext(ctx);
-    const next = await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session);
-    expect(await next.json()).toMatchObject({
-      count: 1,
-      cache: { error: null, refreshRequested: true },
-    });
+    const outgoing = publicGitHub(() => Response.json([]));
     expect(
-      (await dashboard(session, `?repo=${config.id}&scope=project`)).releaseChoices,
-    ).toHaveLength(1);
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
+      total: null,
+      latest: null,
+      releases: [],
+      history: [],
+      cache: { updatedAt: null, error: null },
+    });
+    const data = await dashboard(session, `?scope=project&repo=${config.id}`);
+    expect(data.releaseChoices).toEqual([]);
+    expect(data.releaseCatalog).toEqual({ updatedAt: null, error: null });
+    expect((await monitor(session, 'releases')).releases).toEqual([]);
+    expect(
+      (await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session)).status,
+    ).toBe(404);
+    expect(outgoing).not.toHaveBeenCalled();
+  });
+  it('collects totals and release metadata together on schedule without checking repository identity', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const data = release(2001, { assets: [artifact(1, 42)] });
+    const outgoing = publicGitHub((url) => Response.json(url.endsWith('/latest') ? data : [data]));
+    await collect();
+    expect(outgoing).toHaveBeenCalledTimes(2);
+    expect(outgoing.mock.calls.every(([input]) => String(input).includes('/releases'))).toBe(true);
+    const cached = await (
+      await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+    ).json();
+    expect(cached).toMatchObject({ total: '42', latest: '42', history: [{ total: '42' }] });
+    const overview = await dashboard(session, `?scope=project&repo=${config.id}`);
+    expect(overview.releaseChoices).toHaveLength(1);
+    expect(overview.metrics.latestRelease?.tag_name).toBe('v1.1.0');
+    expect(overview.releaseCatalog).toMatchObject({ error: null, updatedAt: expect.any(Number) });
+    expect((await monitor(session, 'releases')).releases).toHaveLength(1);
+    expect(outgoing).toHaveBeenCalledTimes(2);
     expect(await scalar('SELECT COUNT(*) AS count FROM project_events')).toBe(0);
     expect((await getWebhookCredentials(env, config.id))?.secret).toBe(config.secret);
-    expect(outgoing).toHaveBeenCalled();
-  });
-  it('coalesces concurrent refreshes using a shared D1 lease', async () => {
-    const session = await setup();
-    const config = await add(session);
-    let started!: () => void;
-    let unblock!: () => void;
-    const entered = new Promise<void>((r) => {
-      started = r;
-    });
-    const gate = new Promise<void>((r) => {
-      unblock = r;
-    });
-    const outgoing = publicGitHub(async () => {
-      started();
-      await gate;
-      return Response.json([release()]);
-    });
-    const make = () =>
-      new Request(`${origin}/api/repositories/${config.id}/releases/sync`, {
-        headers: { Cookie: session },
-      });
-    const a = createExecutionContext();
-    await worker.fetch(make(), env, a);
-    await entered;
-    const b = createExecutionContext();
-    await worker.fetch(make(), env, b);
-    await waitOnExecutionContext(b);
-    unblock();
-    await waitOnExecutionContext(a);
-    expect(outgoing).toHaveBeenCalledTimes(2);
-  });
-  it('keeps the last good catalog on rate limiting and honors GitHub cooldown without advising tokens', async () => {
-    const session = await setup();
-    const config = await add(session);
-    const outgoing = publicGitHub(() => Response.json([release()]));
-    await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session);
-    outgoing.mockResolvedValue(
-      new Response('rate limit', {
-        status: 403,
-        headers: { 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': String(nowSeconds() + 600) },
-      }),
-    );
-    await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session);
-    const calls = outgoing.mock.calls.length;
-    const cached = await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session);
-    expect(cached.status).toBe(200);
-    expect(await cached.json()).toMatchObject({
-      count: 1,
-      cache: { error: expect.stringContaining('限流'), refreshRequested: false },
-    });
-    expect(outgoing).toHaveBeenCalledTimes(calls);
-    expect(
-      (await dashboard(session, `?repo=${config.id}&scope=project`)).releaseChoices,
-    ).toHaveLength(1);
   });
   it('refreshes full paginated asset metadata behind an unchanged immediate cached response', async () => {
     const session = await setup();
     const config = await add(session);
     await seedPublicRelease(config, { release: release() });
     const outgoing = publicGitHub((url) => {
-      if (url.endsWith('/releases/2001')) return Response.json(release());
+      if (url.endsWith('/releases/2001'))
+        return Response.json(release(2001, { name: 'Changed upstream after hourly collection' }));
       if (url.endsWith('page=1'))
         return Response.json(
           Array.from({ length: 100 }, (_, i) => artifact(i + 1, i + 1)),
@@ -1469,6 +1435,7 @@ describe('Worker Release cache and background refresh', () => {
     expect(warm.assets).toHaveLength(101);
     expect(warm.source).toBe('github');
     expect(warm.assets.reduce((s, a) => s + a.download_count, 0)).toBe(5151);
+    expect((await monitor(session, 'releases')).releases[0].name).toBe('Release 2001');
   });
   it('surfaces GitHub errors while preserving the last successful asset cache without contacting another host', async () => {
     const session = await setup();
@@ -1488,7 +1455,7 @@ describe('Worker Release cache and background refresh', () => {
     });
     expect(outgoing).toHaveBeenCalledTimes(1);
   });
-  it('reports summary failures and keeps unknown totals distinct from zero', async () => {
+  it('preserves cached totals and leaves unknown totals null when scheduled collection fails', async () => {
     const session = await setup();
     const config = await add(session);
     await env.DB.prepare(
@@ -1501,27 +1468,33 @@ describe('Worker Release cache and background refresh', () => {
         nowSeconds(),
       )
       .run();
-    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      expect(new URL(String(input)).hostname).toBe('api.github.com');
-      return new Response('forbidden', { status: 403 });
-    });
-    const path = `/repositories/${config.id}/releases/downloads`;
-    await request(path, 'GET', undefined, session);
-    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
+    const empty = await add(session, 'another/project');
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('failed', { status: 502 }));
+    await collect();
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
       total: '15',
       latest: '10',
       source: 'github',
-      cache: { error: expect.stringContaining('403') },
+      history: [],
+      cache: { error: expect.stringContaining('502') },
     });
-    const empty = await add(session, 'another/project');
-    const emptyPath = `/repositories/${empty.id}/releases/downloads`;
-    await request(emptyPath, 'GET', undefined, session);
-    expect(await (await request(emptyPath, 'GET', undefined, session)).json()).toMatchObject({
+    expect(
+      await (
+        await request(`/repositories/${empty.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
       total: null,
       latest: null,
+      history: [],
       cache: { error: expect.any(String) },
     });
-    expect(outgoing).toHaveBeenCalledTimes(1);
+    expect(outgoing).toHaveBeenCalledTimes(2);
   });
   it('cleans retired third-party cached counts while preserving GitHub data and release metadata', async () => {
     const session = await setup();
@@ -1556,59 +1529,70 @@ describe('Worker Release cache and background refresh', () => {
       await scalar('SELECT COUNT(*) AS count FROM release_refresh WHERE project_id=?', other.id),
     ).toBe(1);
   });
-  it('calculates exact total and latest downloads itself across all GitHub pages', async () => {
+  it('calculates exact total and latest downloads across every page including more than twenty pages', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const count = Number.MAX_SAFE_INTEGER;
+    const outgoing = publicGitHub((url) => {
+      if (url.endsWith('/releases/latest'))
+        return Response.json({ assets: [{ download_count: count }, { download_count: 1 }] });
+      const page = Number(new URL(url).searchParams.get('page'));
+      return Response.json(
+        [release(2000 + page, { prerelease: page !== 1, assets: [artifact(page, count)] })],
+        {
+          headers:
+            page < 21
+              ? {
+                  Link: `<https://api.github.com/repos/owner/repo/releases?per_page=100&page=${page + 1}>; rel="next"`,
+                }
+              : {},
+        },
+      );
+    });
+    await collect();
+    const report = await (
+      await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+    ).json<{ total: string; latest: string; releases: { id: number; downloads: string }[] }>();
+    expect(report.total).toBe(String(BigInt(count) * 21n));
+    expect(report.latest).toBe(String(BigInt(count) + 1n));
+    expect(report.releases).toHaveLength(21);
+    expect(report.releases[20]).toMatchObject({ id: 2021, downloads: String(count) });
+    expect(
+      (await dashboard(session, `?scope=project&repo=${config.id}`)).releaseChoices,
+    ).toHaveLength(21);
+    expect(outgoing).toHaveBeenCalledTimes(22);
+  });
+  it('includes published prereleases while excluding drafts and unpublished versions', async () => {
     const session = await setup();
     const config = await add(session);
     publicGitHub((url) => {
-      if (url.endsWith('/releases/latest'))
-        return Response.json({ assets: [{ download_count: 9 }, { download_count: 1 }] });
-      if (url.endsWith('page=1'))
-        return Response.json(
-          [
-            {
-              id: 1,
-              tag_name: 'v1',
-              draft: false,
-              published_at: iso(nowSeconds()),
-              assets: [{ download_count: 10 }],
-            },
-            {
-              id: 2,
-              tag_name: 'v2',
-              prerelease: true,
-              published_at: iso(nowSeconds()),
-              assets: [{ download_count: 3 }],
-            },
-          ],
-          {
-            headers: {
-              Link: '<https://api.github.com/repos/owner/repo/releases?per_page=100&page=2>; rel="next"',
-            },
-          },
-        );
+      if (url.endsWith('/latest')) return new Response('not found', { status: 404 });
       return Response.json([
-        { id: 3, tag_name: 'v3', published_at: iso(nowSeconds()), assets: [{ download_count: 2 }] },
+        release(2001, { prerelease: true, assets: [artifact(1, 15)] }),
+        release(2002, { draft: true, assets: [artifact(2, 500)] }),
+        release(2003, { published_at: null, assets: [artifact(3, 500)] }),
       ]);
     });
-    const path = `/repositories/${config.id}/releases/downloads`;
-    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
-      total: null,
-      latest: null,
-    });
-    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
+    await collect();
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
       total: '15',
-      latest: '10',
-      source: 'github',
-      releases: [
-        { id: 1, tag: 'v1', downloads: '10' },
-        { id: 2, tag: 'v2', downloads: '3' },
-        { id: 3, tag: 'v3', downloads: '2' },
-      ],
+      latest: null,
+      releases: [{ id: 2001, prerelease: true, downloads: '15' }],
+      history: [{ total: '15' }],
     });
+    expect(
+      (await dashboard(session, `?scope=project&repo=${config.id}`)).releaseChoices.map(
+        (r) => r.github_id,
+      ),
+    ).toEqual([2001]);
   });
-  it('rejects redirects and changed repository identity without overwriting data', async () => {
+  it('rejects redirects without overwriting data or following another host', async () => {
     const session = await setup();
-    const config = await add(session);
+    await add(session);
     const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const req = new Request(input, init);
       expect(req.redirect).toBe('manual');
@@ -1617,9 +1601,323 @@ describe('Worker Release cache and background refresh', () => {
         headers: { Location: 'https://example.invalid/elsewhere' },
       });
     });
-    await request(`/repositories/${config.id}/releases/sync`, 'POST', {}, session);
+    await collect();
     expect(outgoing).toHaveBeenCalledTimes(1);
     expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
+    expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
+  });
+  it('keeps a complete snapshot unchanged if a later page fails and retries only next hour', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const at = Math.floor(nowSeconds() / 3600) * 3600 - 7200;
+    const first = release(2001, { assets: [artifact(1, 20)] });
+    const outgoing = publicGitHub((url) =>
+      Response.json(url.endsWith('/latest') ? first : [first]),
+    );
+    await collect(at);
+    outgoing.mockImplementation(async (input) => {
+      if (String(input).endsWith('page=1'))
+        return Response.json([release(2002, { assets: [artifact(2, 500)] })], {
+          headers: {
+            Link: '<https://api.github.com/repos/owner/repo/releases?per_page=100&page=2>; rel="next"',
+          },
+        });
+      return new Response('upstream failed', { status: 502 });
+    });
+    await collect(at + 3600);
+    await collect(at + 3601);
+    expect(outgoing).toHaveBeenCalledTimes(4);
+    const cached = await (
+      await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+    ).json();
+    expect(cached).toMatchObject({
+      total: '20',
+      latest: '20',
+      releases: [{ id: 2001 }],
+      history: [{ total: '20' }],
+      cache: { updatedAt: at, error: expect.any(String) },
+    });
+    expect(
+      (await dashboard(session, `?scope=project&repo=${config.id}`)).releaseChoices.map(
+        (r) => r.github_id,
+      ),
+    ).toEqual([2001]);
+    expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(1);
+    const recovered = release(2002, { assets: [artifact(2, 30)] });
+    outgoing.mockImplementation(async (input) =>
+      Response.json(String(input).endsWith('/latest') ? recovered : [recovered]),
+    );
+    await collect(at + 7200);
+    expect(outgoing).toHaveBeenCalledTimes(6);
+    const data = await dashboard(session, `?scope=project&repo=${config.id}`);
+    expect(data.releaseChoices.map((r) => r.github_id)).toEqual([2002]);
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
+      total: '30',
+      history: [{ total: '20' }, { total: '30' }],
+      cache: { error: null },
+    });
+  });
+  it('records zero only after a successful empty collection and accepts falling totals', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const at = Math.floor(nowSeconds() / 3600) * 3600 - 7200;
+    const outgoing = publicGitHub(() => Response.json([]));
+    await collect(at);
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({ total: '0', latest: null, history: [{ total: '0' }] });
+    const first = release(2001, { assets: [artifact(1, 100)] });
+    outgoing.mockImplementation(async (input) =>
+      Response.json(String(input).endsWith('/latest') ? first : [first]),
+    );
+    await collect(at + 3600);
+    outgoing.mockResolvedValue(Response.json([]));
+    await collect(at + 7200);
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({
+      total: '0',
+      latest: null,
+      releases: [],
+      history: [{ total: '0' }, { total: '100' }, { total: '0' }],
+    });
+    expect((await dashboard(session, `?scope=project&repo=${config.id}`)).releaseChoices).toEqual(
+      [],
+    );
+  });
+  it('coalesces concurrent and repeated scheduled deliveries for the same hour', async () => {
+    const session = await setup();
+    await add(session);
+    let started!: () => void;
+    let unblock!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    const outgoing = publicGitHub(async () => {
+      started();
+      await gate;
+      return Response.json([]);
+    });
+    const controller = { scheduledTime: Date.now(), cron: '0 * * * *', noRetry() {} };
+    const a = createExecutionContext();
+    const first = worker.scheduled(controller, env, a);
+    await entered;
+    const b = createExecutionContext();
+    await worker.scheduled(controller, env, b);
+    await waitOnExecutionContext(b);
+    unblock();
+    await first;
+    await waitOnExecutionContext(a);
+    await collect(Math.floor(controller.scheduledTime / 1000));
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(1);
+  });
+  it('skips paused projects and lets other projects finish after one fails', async () => {
+    const session = await setup();
+    const failed = await add(session, 'owner/broken');
+    const active = await add(session, 'owner/repo');
+    const paused = await add(session, 'owner/paused');
+    await request(`/repositories/${paused.id}`, 'PATCH', { enabled: false }, session);
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).not.toContain('/paused');
+      return url.includes('/broken/') ? new Response('failed', { status: 502 }) : Response.json([]);
+    });
+    await collect();
+    expect(outgoing).toHaveBeenCalledTimes(2);
+    expect(
+      await scalar(
+        'SELECT COUNT(*) AS count FROM download_snapshots WHERE project_id=?',
+        active.id,
+      ),
+    ).toBe(1);
+    expect(
+      await scalar(
+        'SELECT COUNT(*) AS count FROM download_snapshots WHERE project_id IN (?,?)',
+        failed.id,
+        paused.id,
+      ),
+    ).toBe(0);
+  });
+  it.each(['paused', 'deleted', 'renamed'])(
+    'discards in-flight results when a project is %s',
+    async (change) => {
+      const session = await setup();
+      const config = await add(session);
+      await signed(config);
+      let started!: () => void;
+      let unblock!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        unblock = resolve;
+      });
+      const version = release(2001, { assets: [artifact(1, 42)] });
+      publicGitHub(async (url) => {
+        started();
+        await gate;
+        return Response.json(url.endsWith('/latest') ? version : [version]);
+      });
+      const ctx = createExecutionContext();
+      const work = worker.scheduled(
+        { scheduledTime: Date.now(), cron: '0 * * * *', noRetry() {} },
+        env,
+        ctx,
+      );
+      await entered;
+      try {
+        if (change === 'paused')
+          expect(
+            (await request(`/repositories/${config.id}`, 'PATCH', { enabled: false }, session))
+              .status,
+          ).toBe(200);
+        else if (change === 'deleted')
+          expect((await request(`/repositories/${config.id}`, 'DELETE', {}, session)).status).toBe(
+            200,
+          );
+        else
+          expect(
+            (await signed(config, 'ping', { repository: { id: 100, full_name: 'owner/renamed' } }))
+              .status,
+          ).toBe(200);
+      } finally {
+        unblock();
+      }
+      await work;
+      await waitOnExecutionContext(ctx);
+      expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
+      expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
+      const response = await request(
+        `/repositories/${config.id}/releases/downloads`,
+        'GET',
+        undefined,
+        session,
+      );
+      if (change === 'deleted') expect(response.status).toBe(404);
+      else expect(await response.json()).toMatchObject({ total: null, history: [] });
+    },
+  );
+  it('filters download history to the selected half-open Release interval', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const start = Math.floor(nowSeconds() / 3600) * 3600 - 10800;
+    const end = start + 7200;
+    await seedPublicRelease(config, { release: release(2001, { published_at: iso(start) }) });
+    await seedPublicRelease(config, { release: release(2002, { published_at: iso(end) }) });
+    for (const [at, total] of [
+      [start - 1, '1'],
+      [start, '2'],
+      [end - 1, '3'],
+      [end, '4'],
+    ] as const)
+      await env.DB.prepare(
+        'INSERT INTO download_snapshots(project_id,hour,observed_at,total) VALUES (?,?,?,?)',
+      )
+        .bind(config.id, Math.floor(at / 3600), at, total)
+        .run();
+    const outgoing = publicGitHub(() => Response.json([]));
+    const path = `/repositories/${config.id}/releases/downloads?range=releases&fromRelease=2001&toRelease=2002`;
+    expect(await (await request(path, 'GET', undefined, session)).json()).toMatchObject({
+      history: [
+        { observedAt: start, total: '2' },
+        { observedAt: end - 1, total: '3' },
+      ],
+    });
+    expect(
+      (
+        await request(
+          `/repositories/${config.id}/releases/downloads?range=invalid`,
+          'GET',
+          undefined,
+          session,
+        )
+      ).status,
+    ).toBe(400);
+    expect(outgoing).not.toHaveBeenCalled();
+  });
+  it.each(['missing asset count', 'latest request failure'])(
+    'does not publish incomplete totals on %s',
+    async (failure) => {
+      const session = await setup();
+      const config = await add(session);
+      const outgoing = publicGitHub((url) => {
+        if (url.endsWith('/latest')) return new Response('unavailable', { status: 502 });
+        return Response.json([
+          release(2001, { assets: [artifact(1, failure === 'missing asset count' ? null : 100)] }),
+        ]);
+      });
+      await collect();
+      expect(
+        await (
+          await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+        ).json(),
+      ).toMatchObject({ total: null, history: [], cache: { error: expect.any(String) } });
+      expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
+      expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
+      expect(outgoing).toHaveBeenCalledTimes(failure === 'missing asset count' ? 1 : 2);
+    },
+  );
+  it('retires catalog cursors while keeping existing GitHub totals and live asset caches during migration', async () => {
+    const session = await setup();
+    const config = await add(session);
+    await seedPublicRelease(config, { release: release(2001, { assets: [artifact(1, 42)] }) });
+    await env.DB.batch([
+      env.DB.prepare('DROP TABLE download_snapshots'),
+      env.DB.prepare('ALTER TABLE release_refresh DROP COLUMN scheduled_hour'),
+      env.DB.prepare(
+        'CREATE TABLE release_catalog_sync(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,last_page INTEGER,next_page INTEGER,updated_at INTEGER)',
+      ),
+      env.DB.prepare('INSERT INTO release_catalog_sync VALUES (?,1,2,?)').bind(
+        config.id,
+        nowSeconds(),
+      ),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)',
+      ).bind(config.id, 'catalog:1', '{"nextPage":2,"count":100}'),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)',
+      ).bind(
+        config.id,
+        'downloads',
+        '{"total":"42","latest":"42","source":"github","releases":[]}',
+      ),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)',
+      ).bind(config.id, 'assets:2001', '{}'),
+    ]);
+    await env.DB.batch(migrations.at(-1)!.map((sql) => env.DB.prepare(sql)));
+    expect(
+      await scalar(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='release_catalog_sync'",
+      ),
+    ).toBe(0);
+    expect(
+      await scalar("SELECT COUNT(*) AS count FROM release_refresh WHERE resource LIKE 'catalog:%'"),
+    ).toBe(0);
+    expect(
+      await scalar("SELECT COUNT(*) AS count FROM release_refresh WHERE resource='assets:2001'"),
+    ).toBe(1);
+    expect(await scalar('SELECT COUNT(*) AS count FROM release_assets')).toBe(1);
+    const outgoing = publicGitHub(() => Response.json([]));
+    expect(
+      await (
+        await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+      ).json(),
+    ).toMatchObject({ total: '42', latest: '42', history: [] });
+    expect(outgoing).not.toHaveBeenCalled();
   });
   it('requires authentication for cached data and cascades cache deletion with the project', async () => {
     const session = await setup();
@@ -1628,7 +1926,13 @@ describe('Worker Release cache and background refresh', () => {
     await env.DB.prepare('INSERT INTO release_refresh(project_id,resource,payload) VALUES (?,?,?)')
       .bind(config.id, 'downloads', '{}')
       .run();
+    await env.DB.prepare(
+      'INSERT INTO download_snapshots(project_id,hour,observed_at,total) VALUES (?,?,?,?)',
+    )
+      .bind(config.id, 1, 3600, '0')
+      .run();
     await request(`/repositories/${config.id}`, 'DELETE', {}, session);
     expect(await scalar('SELECT COUNT(*) AS count FROM release_refresh')).toBe(0);
+    expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
   });
 });

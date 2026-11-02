@@ -18,10 +18,6 @@ export function seedPublicCache(project: string, raw: Record<string, unknown>) {
       if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='releases'").get())
         continue;
       const now = Math.floor(Date.now() / 1000);
-      // Prevent fixture-only browser tests from touching a real external API.
-      db.prepare(
-        'INSERT OR REPLACE INTO release_refresh(project_id,resource,retry_at) VALUES (?,?,?)',
-      ).run(project, 'catalog:1', now + 3600);
       const at = (value: unknown) =>
         typeof value === 'string' ? Math.floor(Date.parse(value) / 1000) : null;
       const author = raw.author as { login?: string } | undefined;

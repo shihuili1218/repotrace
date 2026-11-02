@@ -157,9 +157,9 @@ export async function monitoring(db: D1Database, url: URL): Promise<MonitorData>
   } else if (type === 'releases') {
     selected = `SELECT r.*,p.full_name,(SELECT MAX(old.published_at) FROM releases old WHERE old.project_id=r.project_id AND old.published_at<r.published_at AND old.draft=0 AND old.deleted_at IS NULL) AS previous_published_at,
       CASE WHEN assets_seen_at IS NOT NULL THEN (SELECT COUNT(*) FROM release_assets a WHERE a.project_id=r.project_id AND a.release_id=r.github_id) END AS assets_count
-      FROM releases r JOIN projects p ON p.id=r.project_id WHERE project_id=? AND
+      FROM releases r JOIN projects p ON p.id=r.project_id WHERE project_id=? AND (?='deleted' OR deleted_at IS NULL) AND
       (?='all' OR (?='stable' AND prerelease=0 AND draft=0 AND deleted_at IS NULL) OR (?='prerelease' AND prerelease=1 AND draft=0 AND deleted_at IS NULL) OR (?='draft' AND draft=1 AND deleted_at IS NULL) OR (?='deleted' AND deleted_at IS NOT NULL))`;
-    params = [project, state, state, state, state, state];
+    params = [project, state, state, state, state, state, state];
     order = 'r.published_at DESC,r.created_at DESC,r.github_id DESC';
   } else {
     const kind = type === 'issues' ? 'issue' : 'pull_request';

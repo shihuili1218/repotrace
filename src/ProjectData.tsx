@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FolderGit2, RefreshCw } from 'lucide-react';
-import type { Dashboard, RepoSummary, ReleaseBoundary, ReleaseCacheState } from '../shared/types';
+import { FolderGit2 } from 'lucide-react';
+import type { Dashboard, RepoSummary, ReleaseBoundary } from '../shared/types';
 import { api } from './api';
 import { Monitoring } from './Monitoring';
-import { ReleaseCacheNote } from './ReleaseCacheNote';
+import { ScheduledReleaseNote } from './ScheduledReleaseNote';
 const when = (at: number) =>
   new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -30,15 +30,8 @@ export function ProjectData({
   const [data, setData] = useState<Dashboard | null>(null);
   const [choices, setChoices] = useState<ReleaseBoundary[]>([]);
   const [error, setError] = useState('');
-  const [syncError, setSyncError] = useState('');
-  const [catalogCache, setCatalogCache] = useState<ReleaseCacheState | null>(null);
-  const [refreshVersion, setRefreshVersion] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [nextPage, setNextPage] = useState<number | null>(null);
   const requestId = useRef(0);
-  const syncId = useRef(0);
-  const syncBusy = useRef(false);
   const pendingRange = useRef(false);
   const selected = repositories.find((r) => r.id === projectId);
   useEffect(() => {
@@ -53,18 +46,17 @@ export function ProjectData({
     ...(mode === 'releases' ? { fromRelease: from, toRelease: to } : {}),
   }).toString();
   const refresh = useCallback(async () => {
-    if (!projectId || !valid) return;
+    if (!projectId) return;
     const id = ++requestId.current;
-    const catalogRequest = syncId.current;
     setBusy(true);
     try {
-      const next = await api<Dashboard>(`/dashboard?${query}`);
+      const parameters = valid
+        ? query
+        : new URLSearchParams({ repo: projectId, scope: 'project', days: '30' }).toString();
+      const next = await api<Dashboard>(`/dashboard?${parameters}`);
       if (id === requestId.current) {
         setData(next);
-        if (catalogRequest === syncId.current && !syncBusy.current) {
-          setChoices(next.releaseChoices);
-          setNextPage(next.releaseCatalog.nextPage);
-        }
+        setChoices(next.releaseChoices);
         setError('');
       }
     } catch (e) {
@@ -72,7 +64,7 @@ export function ProjectData({
     } finally {
       if (id === requestId.current) setBusy(false);
     }
-  }, [projectId, valid, query, refreshVersion]);
+  }, [projectId, valid, query]);
   useEffect(() => {
     setData(null);
   }, [projectId, query]);
@@ -84,49 +76,9 @@ export function ProjectData({
       window.clearInterval(timer);
     };
   }, [refresh]);
-  const sync = useCallback(
-    async (page = 1) => {
-      if (!projectId || syncBusy.current) return;
-      const id = ++syncId.current;
-      syncBusy.current = true;
-      setSyncing(true);
-      setSyncError('');
-      try {
-        const result = await api<{ nextPage: number | null; cache?: ReleaseCacheState }>(
-          `/repositories/${projectId}/releases/sync`,
-          { method: 'POST', body: { page } },
-        );
-        if (id !== syncId.current) return;
-        setCatalogCache(result.cache ?? null);
-        const catalog = await api<Dashboard>(
-          `/dashboard?${new URLSearchParams({ repo: projectId, scope: 'project', days: '30' })}`,
-        );
-        if (id !== syncId.current) return;
-        setChoices(catalog.releaseChoices);
-        setNextPage(result.nextPage);
-      } catch (e) {
-        if (id === syncId.current)
-          setSyncError(e instanceof Error ? e.message : '同步失败，请稍后重试。');
-      } finally {
-        if (id === syncId.current) {
-          syncBusy.current = false;
-          setSyncing(false);
-          setRefreshVersion((value) => value + 1);
-        }
-      }
-    },
-    [projectId],
-  );
   useEffect(() => {
     setChoices([]);
-    setCatalogCache(null);
-    setNextPage(null);
-    void sync();
-    return () => {
-      syncId.current++;
-      syncBusy.current = false;
-    };
-  }, [sync]);
+  }, [projectId]);
   useEffect(() => {
     if (mode !== 'releases' || !pendingRange.current) return;
     const end = choices[0];
@@ -168,16 +120,11 @@ export function ProjectData({
               aria-label="项目数据选择项目"
               value={projectId}
               onChange={(e) => {
-                syncId.current++;
-                syncBusy.current = false;
-                setSyncError('');
-                setSyncing(false);
                 setMode('days');
                 setFrom('');
                 setTo('');
                 pendingRange.current = false;
                 setChoices([]);
-                setNextPage(null);
                 setError('');
                 onProjectChange(e.target.value);
               }}
@@ -202,23 +149,8 @@ export function ProjectData({
             </select>
           </div>
         </div>
-        <div className="project-sync-actions">
-          <button
-            className="button secondary"
-            disabled={syncing || !selected}
-            onClick={() => void sync()}
-          >
-            <RefreshCw size={14} className={syncing ? 'spin' : ''} />
-            {syncing ? '正在读取公开 Release…' : '刷新公开 Release'}
-          </button>
-          {nextPage !== null && (
-            <button className="text-button" disabled={syncing} onClick={() => void sync(nextPage)}>
-              加载更早 Release
-            </button>
-          )}
-        </div>
       </div>
-      <ReleaseCacheNote cache={catalogCache} />
+      <ScheduledReleaseNote cache={data?.releaseCatalog} />
       {mode === 'releases' && (
         <div className="release-range panel">
           <label>
@@ -261,15 +193,14 @@ export function ProjectData({
             </select>
           </label>
           <p>
-            按发布时间统计：包含起始时刻，不含结束时刻。版本在打开页面时读取，可刷新或加载更早
-            Release；历史事件只能覆盖已经收到的数据。
+            按发布时间统计：包含起始时刻，不含结束时刻。版本目录每小时更新；历史事件只能覆盖已经收到的数据。
           </p>
         </div>
       )}
-      {(error || syncError) && (
+      {error && (
         <div className="error-banner" role="alert">
-          <span>{syncError || error}</span>
-          <button onClick={() => void (syncError ? sync() : refresh())}>重试</button>
+          <span>{error}</span>
+          <button onClick={() => void refresh()}>重试</button>
         </div>
       )}
       {!valid ? (
@@ -308,9 +239,6 @@ export function ProjectData({
             repositories={repositories}
             dashboard={data}
             rangeQuery={query}
-            refreshVersion={refreshVersion}
-            syncingReleases={syncing}
-            onRefreshReleases={() => sync()}
           />
         </>
       )}

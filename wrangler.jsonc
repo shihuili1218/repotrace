@@ -11,7 +11,7 @@
   },
   "d1_databases": [{ "binding": "DB", "database_name": "repotrace-db" }],
   "kv_namespaces": [{ "binding": "WEBHOOK_KEYS" }],
-  "triggers": { "crons": [] },
+  "triggers": { "crons": ["0 * * * *"] },
   "build": { "command": "npm run build" },
   "observability": { "enabled": true },
 }

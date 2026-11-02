@@ -1,46 +1,45 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import type { DownloadSummary } from '../shared/types';
 import { api } from './api';
-import { ReleaseCacheNote } from './ReleaseCacheNote';
-import { downloadNumber } from './DownloadCharts';
-export function ReleaseDownloads({ repo }: { repo: string }) {
+import { ScheduledReleaseNote } from './ScheduledReleaseNote';
+import { DownloadGrowth, downloadNumber } from './DownloadCharts';
+
+export function ReleaseDownloads({
+  repo,
+  rangeQuery,
+  cache,
+}: {
+  repo: string;
+  rangeQuery: string;
+  cache: DownloadSummary['cache'];
+}) {
   const [data, setData] = useState<DownloadSummary | null>(null);
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [retry, setRetry] = useState(0);
   const fence = useRef(0);
-  const read = useCallback(async () => {
-    const id = ++fence.current;
-    setBusy(true);
-    setError('');
-    try {
-      const next = await api<DownloadSummary>(`/repositories/${repo}/releases/downloads`);
-      if (id === fence.current) setData(next);
-    } catch (error) {
-      if (id === fence.current)
-        setError(error instanceof Error ? error.message : '下载量缓存读取失败。');
-    } finally {
-      if (id === fence.current) setBusy(false);
-    }
-  }, [repo]);
   useEffect(() => {
+    const id = ++fence.current;
     setData(null);
-    void read();
+    setError('');
+    void api<DownloadSummary>(`/repositories/${repo}/releases/downloads?${rangeQuery}`)
+      .then((next) => {
+        if (id === fence.current) setData(next);
+      })
+      .catch((error: unknown) => {
+        if (id === fence.current)
+          setError(error instanceof Error ? error.message : '下载量读取失败。');
+      });
     return () => {
       fence.current++;
     };
-  }, [read]);
+  }, [repo, rangeQuery, cache.updatedAt, cache.error, retry]);
   return (
     <section className="panel" aria-label="项目下载量">
       <div className="panel-header">
         <div>
           <h2>项目下载量</h2>
-          <p>GitHub 各产物下载量汇总 · 当前累计值</p>
+          <p>GitHub 各产物下载量汇总 · 最近一次采集的累计值</p>
         </div>
-        <button className="button secondary" disabled={busy} onClick={() => void read()}>
-          <RefreshCw size={14} className={busy ? 'spin' : ''} />
-          读取下载量缓存
-        </button>
       </div>
       <div className="module-metrics pair">
         <article className="module-metric">
@@ -54,11 +53,21 @@ export function ReleaseDownloads({ repo }: { repo: string }) {
           <small>Latest Downloads</small>
         </article>
       </div>
-      <ReleaseCacheNote cache={data?.cache} />
+      <ScheduledReleaseNote cache={data?.cache} />
       {error && (
-        <p className="field-note" role="alert">
-          {error}
-        </p>
+        <div className="error-banner" role="alert">
+          <span>{error}</span>
+          <button onClick={() => setRetry((value) => value + 1)}>重试</button>
+        </div>
+      )}
+      {data ? (
+        <DownloadGrowth history={data.history} />
+      ) : (
+        !error && (
+          <p className="small-empty" role="status">
+            正在读取下载量…
+          </p>
+        )
       )}
     </section>
   );

@@ -155,6 +155,20 @@ export const migrations = [
     `UPDATE releases SET assets_seen_at=NULL,assets_source=NULL,assets_snapshot_id=NULL WHERE assets_source='shields'`,
     `ALTER TABLE release_assets DROP COLUMN download_display`,
   ],
+  [
+    `CREATE TABLE download_snapshots (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      hour INTEGER NOT NULL, observed_at INTEGER NOT NULL, total TEXT NOT NULL,
+      PRIMARY KEY(project_id,hour)
+    )`,
+    `CREATE INDEX download_history ON download_snapshots(project_id,observed_at)`,
+    `ALTER TABLE release_refresh ADD COLUMN scheduled_hour INTEGER`,
+    `DELETE FROM release_refresh WHERE resource LIKE 'catalog:%'`,
+    `DROP TABLE release_catalog_sync`,
+    // Keep the last successful totals; old visit-driven retry state no longer applies.
+    `UPDATE release_refresh SET error=NULL,retry_at=0,lease_token=NULL,lease_until=0 WHERE resource='downloads'`,
+    `UPDATE public_api_backoff SET error='GitHub 公开接口暂时不可用。'`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

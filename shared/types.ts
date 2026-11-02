@@ -126,7 +126,7 @@ export interface Dashboard {
   repositories: RepoSummary[];
   range: StatisticsRange;
   releaseChoices: ReleaseBoundary[];
-  releaseCatalog: { nextPage: number | null; updatedAt: number | null };
+  releaseCatalog: ScheduledReleaseState;
   starNet: { added: number; removed: number };
   history: {
     day: string;
@@ -227,7 +227,13 @@ export interface DownloadSummary {
   latest: string | null;
   source: 'github';
   releases: ReleaseDownload[];
-  cache: ReleaseCacheState;
+  cache: ScheduledReleaseState;
+  history: { observedAt: number; total: string }[];
+}
+
+export interface ScheduledReleaseState {
+  updatedAt: number | null;
+  error: string | null;
 }
 
 export interface ReleaseDownload {
