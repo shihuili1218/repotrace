@@ -32,7 +32,7 @@ export function ReleaseDownloads({
     return () => {
       fence.current++;
     };
-  }, [repo, rangeQuery, cache.updatedAt, cache.error, retry]);
+  }, [repo, rangeQuery, cache.updatedAt, retry]);
   return (
     <section className="panel" aria-label="项目下载量">
       <div className="panel-header">

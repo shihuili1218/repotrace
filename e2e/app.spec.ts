@@ -442,8 +442,9 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   const summary = page.getByRole('region', { name: '项目下载量' });
   await page.getByLabel('项目统计时间').selectOption('7');
   await page.getByRole('tab', { name: 'Release', exact: true }).click();
-  await expect(summary.getByRole('alert')).toContainText('HTTP 403');
-  await expect(summary).toContainText('上次成功采集的数据');
+  await expect(summary.getByRole('alert')).toHaveCount(0);
+  await expect(summary).not.toContainText('HTTP 403');
+  await expect(summary).not.toContainText('上次成功采集的数据');
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '项目动态', exact: true }).click();
   await expect(page.getByRole('heading', { name: '项目动态', exact: true })).toBeVisible();
@@ -934,6 +935,12 @@ test('reads hourly Release snapshots and graphs exact download history while onl
     observedAt: downloadReads ? now : null,
     source: downloadReads ? 'github' : null,
     deleted: false,
+    cache: {
+      updatedAt: downloadReads ? now : null,
+      error: collectionError,
+      retryAt: collectionError ? now + 3600 : null,
+      refreshRequested: !collectionError,
+    },
     assets: downloadReads
       ? [
           {
@@ -1083,11 +1090,15 @@ test('reads hourly Release snapshots and graphs exact download history while onl
   await expect(panel.getByRole('heading', { name: 'public-v1 的产物下载量' })).toBeVisible();
   expect(downloadReads).toBe(readsBeforeRefresh + 2);
   const listsAfterCollection = releaseLists;
-  collectionError = '定时采集失败，将在下一次采集时重试。';
+  const summariesAfterCollection = summaryQueries.length;
+  collectionError = 'GitHub 公开接口暂时限流。';
   await page.clock.fastForward(15000);
-  await expect(summary.getByRole('alert')).toContainText(collectionError);
+  await page.waitForLoadState('networkidle');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText('当前展示上次成功采集的数据。', { exact: false })).toHaveCount(0);
   await expect(summary).toContainText((huge + 5n).toLocaleString('zh-CN'));
   expect(releaseLists).toBe(listsAfterCollection);
+  expect(summaryQueries).toHaveLength(summariesAfterCollection);
   expect(catalogReads).toBe(0);
   versions.shift();
   await page.getByRole('button', { name: '项目总览', exact: true }).click();
@@ -1100,5 +1111,10 @@ test('reads hourly Release snapshots and graphs exact download history while onl
   expect(catalogReads).toBe(0);
   await page.getByRole('tab', { name: 'Release', exact: true }).click();
   await expect(panel.getByRole('heading', { name: 'public-v2 的产物下载量' })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  await expect(panel.getByRole('alert')).toContainText(collectionError);
+  await expect(panel.getByRole('alert')).toContainText('当前展示上次成功读取的缓存。');
+  await expect(summary.getByRole('alert')).toHaveCount(0);
+  await expect(releaseList.getByRole('alert')).toHaveCount(0);
   expect(downloadReads).toBe(readsBeforeRefresh + 3);
 });

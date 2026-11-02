@@ -16,14 +16,6 @@ export function ScheduledReleaseNote({ cache }: { cache?: DownloadSummary['cache
       <p className="field-note" role="status">
         {when ? `每小时更新 · 最近采集于 ${when}。` : '尚无采集数据，等待下一次每小时采集。'}
       </p>
-      {cache.error && (
-        <div className="error-banner" role="alert">
-          <span>
-            {cache.error}
-            {when ? ' 当前展示上次成功采集的数据。' : ''}
-          </span>
-        </div>
-      )}
     </div>
   );
 }
