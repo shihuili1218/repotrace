@@ -89,6 +89,10 @@ Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和�
 
 `release_refresh` 保存上次错误、重试时间和租约。GitHub 的 403 / 429 按响应头区分限流，所有采集与产物刷新共享主机级退避；目录和总量由后续定时任务重试，产物明细在退避结束后的访问中重试。所有数据固定访问 GitHub 官方 HTTPS JSON 接口，限制响应大小且不读取文件二进制；重定向使用 Workers 支持的 `manual`，不访问上游提供的任意地址。失败保留上次成功的 GitHub 缓存，不切换数据源；定时数据区域只显示最近成功采集时间，上游错误只在产物明细区域显示。
 
+GitHub 出站诊断使用结构化日志：每次实际调用 `fetch` 前记录一个 `github_request`，响应或网络异常记录同一 `requestId` 的 `github_response`；退避直接返回缓存错误时只记录 `github_backoff`。按小时统计真实请求次数只计 `github_request`，不要把响应和退避日志重复计入。响应日志包含路径、状态、耗时、GitHub Request ID、`X-RateLimit-Limit / Used / Remaining / Reset / Resource` 和 `Retry-After`。错误正文最多读取 4 KiB，只提取最多 500 字符的 JSON `message`，不记录完整响应正文或请求凭据；正文不可读时仍保留 HTTP 和配额证据。
+
+403 本身不是限流证据：403 / 429 且 `Remaining=0` 标记 `primary_rate_limit`，正文明确说明 secondary rate limit 或 abuse detection 时标记 `secondary_rate_limit`，429 或明确的 API rate limit exceeded 消息标记 `rate_limit`；只有 `Retry-After` 的 403 仍标记 `forbidden`。退避同时尊重 `Retry-After` 和主限流的重置时间。GitHub 的 `Used` 是上游配额使用量，不等于当前 Worker 的请求数。
+
 产物对比只绘制已知计数，占比图要求全量计数可用；未知数据不绘制为 0。图表用 BigInt 比较、累加与计算比例。
 
 `src/DownloadCharts.tsx` 提供可点击查看名称和数字的横向对比图及带图例的产物占比图。产物图表在移动端自动纵向排列。Release 列表由服务端按发布时间倒序限制为 5 条，`total` 保留当前筛选条件下的缓存总数；默认展开最新已发布且未删除版本的产物，手动选择或关闭后保留用户选择。

@@ -6,6 +6,36 @@ import { statisticsRange } from './range';
 import type { AssetReport, ReleaseAsset, DownloadSummary, ReleaseDownload } from '../shared/types';
 import { readReleaseCache, cacheState, refreshInBackground, UpstreamError } from './release-cache';
 
+async function githubErrorMessage(response: Response) {
+  const reader = response.body?.getReader();
+  if (!reader) return { message: null, bodyState: 'empty' };
+  const decoder = new TextDecoder();
+  let size = 0;
+  let body = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 4096) return { message: null, bodyState: 'too_large' };
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    const value: unknown = JSON.parse(body);
+    const message = value && typeof value === 'object' && 'message' in value ? value.message : null;
+    return {
+      message: typeof message === 'string' ? message.replace(/[\r\n\t]/g, ' ').slice(0, 500) : null,
+      bodyState: 'json',
+    };
+  } catch {
+    // Diagnostics must not replace the upstream HTTP status with a parsing error.
+    return { message: null, bodyState: 'unreadable' };
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 async function github(
   env: Env,
   path: string,
@@ -17,8 +47,14 @@ async function github(
   )
     .bind('api.github.com')
     .first<{ retry_at: number; error: string }>();
-  if (cooldown && cooldown.retry_at > nowSeconds())
+  if (cooldown && cooldown.retry_at > nowSeconds()) {
+    console.info({ event: 'github_backoff', path, retryAt: cooldown.retry_at });
     throw new UpstreamError(cooldown.error, cooldown.retry_at);
+  }
+  const requestId = crypto.randomUUID();
+  const started = Date.now();
+  // Count only this event to count actual outbound attempts, including transport failures.
+  console.info({ event: 'github_request', requestId, method: 'GET', path });
   let response: Response;
   try {
     response = await fetch(`https://api.github.com${path}`, {
@@ -34,32 +70,67 @@ async function github(
         ? AbortSignal.any([signal, AbortSignal.timeout(8000)])
         : AbortSignal.timeout(8000),
     });
-  } catch {
+  } catch (error) {
+    console.info({
+      event: 'github_response',
+      requestId,
+      path,
+      status: null,
+      elapsedMs: Date.now() - started,
+      classification: 'transport_error',
+      error: error instanceof Error ? error.name : 'Error',
+    });
     throw new AppError(502, 'GitHub 公开 Release 接口暂时无法访问，请稍后刷新。');
   }
+  const rateLimit = {
+    limit: response.headers.get('X-RateLimit-Limit'),
+    used: response.headers.get('X-RateLimit-Used'),
+    remaining: response.headers.get('X-RateLimit-Remaining'),
+    reset: response.headers.get('X-RateLimit-Reset'),
+    resource: response.headers.get('X-RateLimit-Resource'),
+    retryAfter: response.headers.get('Retry-After'),
+  };
+  const missing = response.status === 404 && allowMissing;
+  const detail = !response.ok && !missing ? await githubErrorMessage(response) : null;
+  const canLimit = response.status === 403 || response.status === 429;
+  const primary = canLimit && rateLimit.remaining === '0';
+  const secondary = canLimit && /secondary rate limit|abuse detection/i.test(detail?.message ?? '');
+  const limited =
+    primary ||
+    secondary ||
+    (canLimit && /API rate limit exceeded/i.test(detail?.message ?? '')) ||
+    response.status === 429;
+  let classification = 'http_error';
+  if (primary) classification = 'primary_rate_limit';
+  else if (secondary) classification = 'secondary_rate_limit';
+  else if (limited) classification = 'rate_limit';
+  else if (response.status === 403) classification = 'forbidden';
+  else if (missing) classification = 'not_found';
+  else if (response.ok) classification = 'ok';
+  console.info({
+    event: 'github_response',
+    requestId,
+    path,
+    status: response.status,
+    elapsedMs: Date.now() - started,
+    classification,
+    rateLimit,
+    githubRequestId: response.headers.get('X-GitHub-Request-Id'),
+    ...detail,
+  });
   if (response.status === 404 && allowMissing) {
     await response.body?.cancel();
     return { data: null, next: false };
   }
   if (!response.ok) {
-    const remaining = response.headers.get('X-RateLimit-Remaining');
-    const limited =
-      response.status === 429 ||
-      (response.status === 403 && (remaining === '0' || response.headers.has('Retry-After')));
-    const reset = Number(response.headers.get('X-RateLimit-Reset'));
-    const after = response.headers.get('Retry-After');
+    const reset = Number(rateLimit.reset);
+    const after = rateLimit.retryAfter;
+    const retryAfter = after && /^\d+$/.test(after) ? Number(after) : 120;
     const retry = Math.max(
       nowSeconds() + 60,
-      Math.min(
-        nowSeconds() + 3600,
-        limited && reset > nowSeconds()
-          ? reset
-          : after && /^\d+$/.test(after)
-            ? nowSeconds() + Number(after)
-            : nowSeconds() + 120,
-      ),
+      nowSeconds() + retryAfter,
+      primary && Number.isFinite(reset) ? reset : 0,
     );
-    await response.body?.cancel();
     const message = limited
       ? 'GitHub 公开接口暂时限流。'
       : response.status === 403

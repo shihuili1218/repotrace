@@ -1694,6 +1694,266 @@ describe('hourly Release collection and live asset cache', () => {
     });
     expect(outgoing).toHaveBeenCalledTimes(1);
   });
+  it('logs quota evidence for an actual scheduled GitHub request and does not count a backoff skip', async () => {
+    const session = await setup();
+    await add(session);
+    await add(session, 'another/project');
+    const reset = String(nowSeconds() + 600);
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json(
+        {
+          message: 'API rate limit exceeded.',
+          private_details: 'must-not-appear-in-diagnostics',
+        },
+        {
+          status: 403,
+          headers: {
+            'X-RateLimit-Limit': '60',
+            'X-RateLimit-Used': '60',
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Reset': reset,
+            'X-RateLimit-Resource': 'core',
+            'X-GitHub-Request-Id': 'TEST:PRIMARY:LIMIT',
+          },
+        },
+      ),
+    );
+    await collect();
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    const requests = entries.filter((entry) => entry.event === 'github_request');
+    const responses = entries.filter((entry) => entry.event === 'github_response');
+    const skipped = entries.filter((entry) => entry.event === 'github_backoff');
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    expect(requests).toHaveLength(1);
+    const url = new URL(String(outgoing.mock.calls[0][0]));
+    const path = url.pathname + url.search;
+    expect(requests[0]).toMatchObject({ requestId: expect.any(String), path, method: 'GET' });
+    expect(responses).toEqual([
+      expect.objectContaining({
+        requestId: requests[0].requestId,
+        path,
+        status: 403,
+        elapsedMs: expect.any(Number),
+        classification: 'primary_rate_limit',
+        rateLimit: {
+          limit: '60',
+          used: '60',
+          remaining: '0',
+          reset,
+          resource: 'core',
+          retryAfter: null,
+        },
+        githubRequestId: 'TEST:PRIMARY:LIMIT',
+        message: 'API rate limit exceeded.',
+      }),
+    ]);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toMatchObject({ path: expect.any(String), retryAt: Number(reset) });
+    expect(skipped[0].path).not.toBe(path);
+    expect(JSON.stringify(entries)).not.toContain('must-not-appear-in-diagnostics');
+  });
+  it('honors a primary rate limit Retry-After longer than the quota reset and one hour', async () => {
+    const session = await setup();
+    await add(session);
+    const at = nowSeconds();
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      Response.json(
+        { message: 'API rate limit exceeded.' },
+        {
+          status: 403,
+          headers: {
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Reset': String(at + 3600),
+            'Retry-After': '7200',
+          },
+        },
+      ),
+    );
+    await collect(at);
+    expect(
+      await env.DB.prepare('SELECT retry_at FROM public_api_backoff WHERE host=?')
+        .bind('api.github.com')
+        .first<number>('retry_at'),
+    ).toBe(at + 7200);
+    await collect(at + 3601);
+    expect(outgoing).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    {
+      name: '403 with Retry-After but no rate limit evidence',
+      status: 403,
+      message: 'Resource access is forbidden.',
+      classification: 'forbidden',
+      limited: false,
+    },
+    {
+      name: 'explicit secondary rate limit',
+      status: 403,
+      message: 'You have exceeded a secondary rate limit.',
+      classification: 'secondary_rate_limit',
+      limited: true,
+    },
+    {
+      name: 'explicit abuse detection limit',
+      status: 403,
+      message: 'You have triggered an abuse detection mechanism.',
+      classification: 'secondary_rate_limit',
+      limited: true,
+    },
+    {
+      name: 'explicit API rate limit without a quota header',
+      status: 403,
+      message: 'API rate limit exceeded.',
+      classification: 'rate_limit',
+      limited: true,
+    },
+    {
+      name: '429 without a quota header',
+      status: 429,
+      message: 'Too many requests.',
+      classification: 'rate_limit',
+      limited: true,
+    },
+  ])('distinguishes $name in live asset diagnostics', async (failure) => {
+    const session = await setup();
+    const config = await add(session);
+    await seedPublicRelease(config, { release: release(2001, { assets: [artifact(1, 42)] }) });
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(
+        Response.json(
+          { message: failure.message, extra: 'do-not-log-the-complete-response' },
+          { status: failure.status, headers: { 'Retry-After': '90' } },
+        ),
+      );
+    await assets(session, config);
+    const cached = await (await assets(session, config)).json<{ cache: { error: string } }>();
+    expect(cached.cache.error).toContain(failure.limited ? '限流' : 'HTTP 403');
+    if (!failure.limited) expect(cached.cache.error).not.toContain('限流');
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    expect(entries.filter((entry) => entry.event === 'github_request')).toHaveLength(1);
+    expect(entries.filter((entry) => entry.event === 'github_response')).toEqual([
+      expect.objectContaining({
+        path: '/repos/owner/repo',
+        status: failure.status,
+        classification: failure.classification,
+        rateLimit: expect.objectContaining({ retryAfter: '90', remaining: null }),
+        message: failure.message,
+      }),
+    ]);
+    expect(JSON.stringify(entries)).not.toContain('do-not-log-the-complete-response');
+    expect(outgoing).toHaveBeenCalledTimes(1);
+  });
+  it('bounds the upstream error message and omits the rest of the response body from diagnostics', async () => {
+    const session = await setup();
+    await add(session);
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json(
+        { message: 'x'.repeat(800), extra: 'private-response-detail' },
+        { status: 403 },
+      ),
+    );
+    await collect();
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    const response = entries.find((entry) => entry.event === 'github_response');
+    expect(response).toMatchObject({ status: 403, classification: 'forbidden' });
+    expect(response.message).toBe('x'.repeat(500));
+    expect(JSON.stringify(entries)).not.toContain('private-response-detail');
+  });
+  it.each([
+    { name: 'invalid JSON', body: '<html>private-response-detail</html>' },
+    {
+      name: 'oversized JSON',
+      body: JSON.stringify({ message: 'private-response-detail'.repeat(300) }),
+    },
+  ])('preserves HTTP and quota evidence when the error body is $name', async ({ body }) => {
+    const session = await setup();
+    const config = await add(session);
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(body, {
+        status: 403,
+        headers: { 'X-RateLimit-Remaining': '0', 'X-GitHub-Request-Id': 'TEST:BODY:ERROR' },
+      }),
+    );
+    await collect();
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    const response = entries.find((entry) => entry.event === 'github_response');
+    expect(response).toMatchObject({
+      status: 403,
+      classification: 'primary_rate_limit',
+      rateLimit: expect.objectContaining({ remaining: '0' }),
+      githubRequestId: 'TEST:BODY:ERROR',
+    });
+    expect(JSON.stringify(entries)).not.toContain('private-response-detail');
+    const cached = await (
+      await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+    ).json<{ cache: { error: string } }>();
+    expect(cached.cache.error).toContain('限流');
+    expect(outgoing).toHaveBeenCalledTimes(1);
+  });
+  it('records a transport failure as an attempted request without inventing an HTTP status', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new TypeError('transport-error-private-detail'));
+    await collect();
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    const requests = entries.filter((entry) => entry.event === 'github_request');
+    expect(requests).toHaveLength(1);
+    expect(entries.filter((entry) => entry.event === 'github_response')).toEqual([
+      expect.objectContaining({
+        requestId: requests[0].requestId,
+        path: requests[0].path,
+        status: null,
+        classification: 'transport_error',
+        elapsedMs: expect.any(Number),
+      }),
+    ]);
+    expect(JSON.stringify(entries)).not.toContain('transport-error-private-detail');
+    expect(entries.filter((entry) => entry.event === 'github_backoff')).toHaveLength(0);
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    const cached = await (
+      await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
+    ).json<{ cache: { error: string } }>();
+    expect(cached.cache.error).not.toContain('限流');
+    expect(cached.cache.error).toContain('无法访问');
+  });
+  it('logs one request and response for each successful scheduled GitHub call', async () => {
+    const session = await setup();
+    await add(session);
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const version = release(2001, { assets: [artifact(1, 42)] });
+    const outgoing = publicGitHub((url) =>
+      Response.json(url.endsWith('/latest') ? version : [version]),
+    );
+    const at = nowSeconds();
+    await collect(at);
+    await collect(at);
+    const entries = logs.mock.calls.map(([entry]) => entry);
+    const requests = entries.filter((entry) => entry.event === 'github_request');
+    const responses = entries.filter((entry) => entry.event === 'github_response');
+    expect(outgoing).toHaveBeenCalledTimes(2);
+    expect(requests).toHaveLength(2);
+    expect(responses).toHaveLength(2);
+    expect(new Set(requests.map((entry) => entry.requestId)).size).toBe(2);
+    for (const entry of requests)
+      expect(responses).toContainEqual(
+        expect.objectContaining({
+          requestId: entry.requestId,
+          path: entry.path,
+          status: 200,
+          classification: 'ok',
+          elapsedMs: expect.any(Number),
+        }),
+      );
+  });
   it('preserves cached totals and leaves unknown totals null when scheduled collection fails', async () => {
     const session = await setup();
     const config = await add(session);
