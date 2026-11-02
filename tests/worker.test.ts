@@ -13,6 +13,7 @@ import { localDay, localMidnight } from '../worker/time';
 import { parseRepository } from '../worker/projects';
 import { nowSeconds, type Env } from '../worker/types';
 import { assetSnapshotStatements, normalizeAssets } from '../worker/release-assets';
+import { collectProjectReleases } from '../worker/public-releases';
 import type { Dashboard, MonitorData, WebhookConfig } from '../shared/types';
 
 const env = bindings as unknown as Env;
@@ -1591,11 +1592,12 @@ async function seedPublicRelease(config: WebhookConfig, patch: Record<string, un
 }
 
 async function collect(at = nowSeconds()) {
-  const ctx = createExecutionContext();
   const clock = vi.spyOn(Date, 'now').mockReturnValue(at * 1000);
   try {
-    await worker.scheduled({ scheduledTime: at * 1000, cron: '0 * * * *', noRetry() {} }, env, ctx);
-    await waitOnExecutionContext(ctx);
+    const projects = await env.DB.prepare(
+      'SELECT id,full_name FROM projects WHERE enabled=1 ORDER BY id',
+    ).all<{ id: string; full_name: string }>();
+    for (const project of projects.results) await collectProjectReleases(env, project);
   } finally {
     clock.mockRestore();
   }
@@ -1647,6 +1649,147 @@ describe('hourly Release collection and live asset cache', () => {
     expect(await scalar('SELECT COUNT(*) AS count FROM project_events')).toBe(0);
     expect((await getWebhookCredentials(env, config.id))?.secret).toBe(config.secret);
   });
+  it.each([403, 429, 502])(
+    'retries HTTP %s after one second until a collection succeeds',
+    async (status) => {
+      const session = await setup();
+      const config = await add(session);
+      const started = Math.floor(Date.now() / 1000) * 1000 + 123;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+      const failure = () =>
+        Response.json(
+          { message: status === 403 ? 'API rate limit exceeded.' : 'Upstream unavailable.' },
+          {
+            status,
+            headers: {
+              'X-RateLimit-Remaining': '0',
+              'X-RateLimit-Reset': String(Math.floor(started / 1000) + 7200),
+              'Retry-After': '7200',
+            },
+          },
+        );
+      const outgoing = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementationOnce(async () => failure())
+        .mockImplementationOnce(async () => failure())
+        .mockImplementation(async () => Response.json([]));
+      expect(await collectProjectReleases(env, config)).toBe(started + 1000);
+      expect(
+        await env.DB.prepare(
+          "SELECT next_at FROM release_refresh WHERE project_id=? AND resource='downloads'",
+        )
+          .bind(config.id)
+          .first<number>('next_at'),
+      ).toBe(started + 1000);
+      expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
+      clock.mockReturnValue(started + 999);
+      expect(await collectProjectReleases(env, config)).toBe(started + 1000);
+      expect(outgoing).toHaveBeenCalledTimes(1);
+      clock.mockReturnValue(started + 1000);
+      expect(await collectProjectReleases(env, config)).toBe(started + 2000);
+      expect(outgoing).toHaveBeenCalledTimes(2);
+      expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
+      clock.mockReturnValue(started + 2000);
+      expect(await collectProjectReleases(env, config)).toBe(started + 2000 + 3600000);
+      expect(outgoing).toHaveBeenCalledTimes(3);
+      expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(1);
+      expect(
+        await env.DB.prepare(
+          "SELECT next_at,error,lease_token,lease_until FROM release_refresh WHERE project_id=? AND resource='downloads'",
+        )
+          .bind(config.id)
+          .first(),
+      ).toEqual({
+        next_at: started + 2000 + 3600000,
+        error: null,
+        lease_token: null,
+        lease_until: 0,
+      });
+    },
+  );
+  it('starts the one-second retry delay after a failed request finishes', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const started = Math.floor(Date.now() / 1000) * 1000 + 123;
+    const finished = started + 8123;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(async () => {
+        clock.mockReturnValue(finished);
+        throw new TypeError('network unavailable');
+      })
+      .mockImplementation(async () => Response.json([]));
+    expect(await collectProjectReleases(env, config)).toBe(finished + 1000);
+    clock.mockReturnValue(finished + 999);
+    expect(await collectProjectReleases(env, config)).toBe(finished + 1000);
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(finished + 1000);
+    expect(await collectProjectReleases(env, config)).toBe(finished + 1000 + 3600000);
+    expect(outgoing).toHaveBeenCalledTimes(2);
+  });
+  it('starts the next hour from the successful response completion time', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const started = Math.floor(Date.now() / 1000) * 1000 + 123;
+    const completed = started + 20567;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(async () => {
+        clock.mockReturnValue(completed);
+        return Response.json([]);
+      })
+      .mockImplementation(async () => Response.json([]));
+    expect(await collectProjectReleases(env, config)).toBe(completed + 3600000);
+    clock.mockReturnValue(started + 3600000);
+    expect(await collectProjectReleases(env, config)).toBe(completed + 3600000);
+    clock.mockReturnValue(completed + 3600000 - 1);
+    expect(await collectProjectReleases(env, config)).toBe(completed + 3600000);
+    expect(outgoing).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(completed + 3600000);
+    expect(await collectProjectReleases(env, config)).toBe(completed + 7200000);
+    expect(outgoing).toHaveBeenCalledTimes(2);
+    expect(
+      await env.DB.prepare(
+        'SELECT observed_at FROM download_snapshots WHERE project_id=? ORDER BY observed_at',
+      )
+        .bind(config.id)
+        .all(),
+    ).toMatchObject({
+      results: [
+        { observed_at: Math.floor(completed / 1000) },
+        { observed_at: Math.floor((completed + 3600000) / 1000) },
+      ],
+    });
+  });
+  it('does not let one project failure move another project successful deadline', async () => {
+    const session = await setup();
+    const failed = await add(session, 'owner/failing');
+    const successful = await add(session, 'owner/successful');
+    const started = Math.floor(Date.now() / 1000) * 1000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    const outgoing = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async (input) =>
+        String(input).includes('/failing/')
+          ? new Response(null, { status: 502 })
+          : Response.json([]),
+      );
+    expect(await collectProjectReleases(env, successful)).toBe(started + 3600000);
+    expect(await collectProjectReleases(env, failed)).toBe(started + 1000);
+    clock.mockReturnValue(started + 1000);
+    expect(await collectProjectReleases(env, failed)).toBe(started + 2000);
+    expect(await collectProjectReleases(env, successful)).toBe(started + 3600000);
+    expect(outgoing).toHaveBeenCalledTimes(3);
+    expect(
+      await env.DB.prepare(
+        "SELECT next_at FROM release_refresh WHERE project_id=? AND resource='downloads'",
+      )
+        .bind(successful.id)
+        .first<number>('next_at'),
+    ).toBe(started + 3600000);
+  });
   it('refreshes full paginated asset metadata behind an unchanged immediate cached response', async () => {
     const session = await setup();
     const config = await add(session);
@@ -1694,13 +1837,13 @@ describe('hourly Release collection and live asset cache', () => {
     });
     expect(outgoing).toHaveBeenCalledTimes(1);
   });
-  it('logs quota evidence for an actual scheduled GitHub request and does not count a backoff skip', async () => {
+  it('logs quota evidence for each scheduled project without sharing the asset backoff', async () => {
     const session = await setup();
     await add(session);
     await add(session, 'another/project');
     const reset = String(nowSeconds() + 600);
     const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
-    const outgoing = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       Response.json(
         {
           message: 'API rate limit exceeded.',
@@ -1724,39 +1867,41 @@ describe('hourly Release collection and live asset cache', () => {
     const requests = entries.filter((entry) => entry.event === 'github_request');
     const responses = entries.filter((entry) => entry.event === 'github_response');
     const skipped = entries.filter((entry) => entry.event === 'github_backoff');
-    expect(outgoing).toHaveBeenCalledTimes(1);
-    expect(requests).toHaveLength(1);
-    const url = new URL(String(outgoing.mock.calls[0][0]));
-    const path = url.pathname + url.search;
-    expect(requests[0]).toMatchObject({ requestId: expect.any(String), path, method: 'GET' });
-    expect(responses).toEqual([
-      expect.objectContaining({
-        requestId: requests[0].requestId,
-        path,
-        status: 403,
-        elapsedMs: expect.any(Number),
-        classification: 'primary_rate_limit',
-        rateLimit: {
-          limit: '60',
-          used: '60',
-          remaining: '0',
-          reset,
-          resource: 'core',
-          retryAfter: null,
-        },
-        githubRequestId: 'TEST:PRIMARY:LIMIT',
-        message: 'API rate limit exceeded.',
-      }),
-    ]);
-    expect(skipped).toHaveLength(1);
-    expect(skipped[0]).toMatchObject({ path: expect.any(String), retryAt: Number(reset) });
-    expect(skipped[0].path).not.toBe(path);
+    expect(outgoing).toHaveBeenCalledTimes(2);
+    expect(requests).toHaveLength(2);
+    expect(responses).toHaveLength(2);
+    expect(new Set(requests.map((entry) => entry.path)).size).toBe(2);
+    for (const request of requests) {
+      expect(request).toMatchObject({ requestId: expect.any(String), method: 'GET' });
+      expect(responses).toContainEqual(
+        expect.objectContaining({
+          requestId: request.requestId,
+          path: request.path,
+          status: 403,
+          elapsedMs: expect.any(Number),
+          classification: 'primary_rate_limit',
+          rateLimit: {
+            limit: '60',
+            used: '60',
+            remaining: '0',
+            reset,
+            resource: 'core',
+            retryAfter: null,
+          },
+          githubRequestId: 'TEST:PRIMARY:LIMIT',
+          message: 'API rate limit exceeded.',
+        }),
+      );
+    }
+    expect(skipped).toHaveLength(0);
     expect(JSON.stringify(entries)).not.toContain('must-not-appear-in-diagnostics');
   });
-  it('honors a primary rate limit Retry-After longer than the quota reset and one hour', async () => {
+  it('keeps honoring a long primary rate limit Retry-After for live asset requests', async () => {
     const session = await setup();
-    await add(session);
+    const config = await add(session);
+    await seedPublicRelease(config, { release: release() });
     const at = nowSeconds();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(at * 1000);
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const outgoing = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       Response.json(
@@ -1771,13 +1916,14 @@ describe('hourly Release collection and live asset cache', () => {
         },
       ),
     );
-    await collect(at);
+    await assets(session, config);
     expect(
       await env.DB.prepare('SELECT retry_at FROM public_api_backoff WHERE host=?')
         .bind('api.github.com')
         .first<number>('retry_at'),
     ).toBe(at + 7200);
-    await collect(at + 3601);
+    clock.mockReturnValue((at + 3601) * 1000);
+    await assets(session, config);
     expect(outgoing).toHaveBeenCalledTimes(1);
   });
   it.each([
@@ -2105,7 +2251,7 @@ describe('hourly Release collection and live asset cache', () => {
     expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
     expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
   });
-  it('keeps a complete snapshot unchanged if a later page fails and retries only next hour', async () => {
+  it('keeps a complete snapshot unchanged across one-second retries when a later page fails', async () => {
     const session = await setup();
     const config = await add(session);
     const at = Math.floor(nowSeconds() / 3600) * 3600 - 7200;
@@ -2124,8 +2270,10 @@ describe('hourly Release collection and live asset cache', () => {
       return new Response('upstream failed', { status: 502 });
     });
     await collect(at + 3600);
-    await collect(at + 3601);
+    await collect(at + 3600.999);
     expect(outgoing).toHaveBeenCalledTimes(4);
+    await collect(at + 3601);
+    expect(outgoing).toHaveBeenCalledTimes(6);
     const cached = await (
       await request(`/repositories/${config.id}/releases/downloads`, 'GET', undefined, session)
     ).json();
@@ -2146,8 +2294,8 @@ describe('hourly Release collection and live asset cache', () => {
     outgoing.mockImplementation(async (input) =>
       Response.json(String(input).endsWith('/latest') ? recovered : [recovered]),
     );
-    await collect(at + 7200);
-    expect(outgoing).toHaveBeenCalledTimes(6);
+    await collect(at + 3602);
+    expect(outgoing).toHaveBeenCalledTimes(8);
     const data = await dashboard(session, `?scope=project&repo=${config.id}`);
     expect(data.releaseChoices.map((r) => r.github_id)).toEqual([2002]);
     expect(
@@ -2193,9 +2341,9 @@ describe('hourly Release collection and live asset cache', () => {
       [],
     );
   });
-  it('coalesces concurrent and repeated scheduled deliveries for the same hour', async () => {
+  it('coalesces concurrent collection attempts and repeated alarms before the next due time', async () => {
     const session = await setup();
-    await add(session);
+    const config = await add(session);
     let started!: () => void;
     let unblock!: () => void;
     const entered = new Promise<void>((resolve) => {
@@ -2209,17 +2357,12 @@ describe('hourly Release collection and live asset cache', () => {
       await gate;
       return Response.json([]);
     });
-    const controller = { scheduledTime: Date.now(), cron: '0 * * * *', noRetry() {} };
-    const a = createExecutionContext();
-    const first = worker.scheduled(controller, env, a);
+    const first = collectProjectReleases(env, config);
     await entered;
-    const b = createExecutionContext();
-    await worker.scheduled(controller, env, b);
-    await waitOnExecutionContext(b);
+    await collectProjectReleases(env, config);
     unblock();
     await first;
-    await waitOnExecutionContext(a);
-    await collect(Math.floor(controller.scheduledTime / 1000));
+    await collectProjectReleases(env, config);
     expect(outgoing).toHaveBeenCalledTimes(1);
     expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(1);
   });
@@ -2270,12 +2413,7 @@ describe('hourly Release collection and live asset cache', () => {
         await gate;
         return Response.json(url.endsWith('/latest') ? version : [version]);
       });
-      const ctx = createExecutionContext();
-      const work = worker.scheduled(
-        { scheduledTime: Date.now(), cron: '0 * * * *', noRetry() {} },
-        env,
-        ctx,
-      );
+      const work = collectProjectReleases(env, config);
       await entered;
       try {
         if (change === 'paused')
@@ -2295,8 +2433,8 @@ describe('hourly Release collection and live asset cache', () => {
       } finally {
         unblock();
       }
-      await work;
-      await waitOnExecutionContext(ctx);
+      const next = await work;
+      if (change !== 'renamed') expect(next).toBeNull();
       expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
       expect(await scalar('SELECT COUNT(*) AS count FROM download_snapshots')).toBe(0);
       const response = await request(
@@ -2369,6 +2507,53 @@ describe('hourly Release collection and live asset cache', () => {
       expect(outgoing).toHaveBeenCalledTimes(failure === 'missing asset count' ? 1 : 2);
     },
   );
+  it('migrates successful collections to an hour after success and failed collections to immediately due', async () => {
+    const session = await setup();
+    const successful = await add(session, 'owner/successful');
+    const failed = await add(session, 'owner/failed');
+    const empty = await add(session, 'owner/empty');
+    const updated = nowSeconds() - 30;
+    const payload = JSON.stringify({ total: '42', latest: '42', source: 'github', releases: [] });
+    await env.DB.batch([
+      env.DB.prepare('ALTER TABLE release_refresh DROP COLUMN next_at'),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload,updated_at) VALUES (?,?,?,?)',
+      ).bind(successful.id, 'downloads', payload, updated),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload,updated_at,error) VALUES (?,?,?,?,?)',
+      ).bind(failed.id, 'downloads', payload, updated, 'HTTP 502'),
+      env.DB.prepare('INSERT INTO release_refresh(project_id,resource) VALUES (?,?)').bind(
+        empty.id,
+        'downloads',
+      ),
+      env.DB.prepare(
+        'INSERT INTO release_refresh(project_id,resource,payload,updated_at) VALUES (?,?,?,?)',
+      ).bind(successful.id, 'assets:2001', '{}', updated),
+    ]);
+    await env.DB.batch(migrations[9].map((sql) => env.DB.prepare(sql)));
+    expect(
+      await env.DB.prepare(
+        'SELECT resource,next_at,payload,updated_at FROM release_refresh WHERE project_id=? ORDER BY resource',
+      )
+        .bind(successful.id)
+        .all(),
+    ).toMatchObject({
+      results: [
+        { resource: 'assets:2001', next_at: 0, payload: '{}', updated_at: updated },
+        { resource: 'downloads', next_at: (updated + 3600) * 1000, payload, updated_at: updated },
+      ],
+    });
+    expect(
+      await env.DB.prepare('SELECT next_at,payload,error FROM release_refresh WHERE project_id=?')
+        .bind(failed.id)
+        .first(),
+    ).toEqual({ next_at: 0, payload, error: 'HTTP 502' });
+    expect(
+      await env.DB.prepare('SELECT next_at,payload FROM release_refresh WHERE project_id=?')
+        .bind(empty.id)
+        .first(),
+    ).toEqual({ next_at: 0, payload: null });
+  });
   it('retires catalog cursors while keeping existing GitHub totals and live asset caches during migration', async () => {
     const session = await setup();
     const config = await add(session);

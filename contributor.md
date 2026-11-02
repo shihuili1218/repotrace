@@ -47,8 +47,9 @@ worker/dashboard.ts        实时 Star 净变化、总量趋势、统一动态
 worker/monitoring.ts       单项目指标的统计、筛选及分页
 worker/range.ts            版本边界校验、半开区间与图表分组
 worker/release-assets.ts   产物验证与原子快照替换
-worker/public-releases.ts  每小时 Release 目录与下载量采集、下载历史、产物明细刷新
+worker/public-releases.ts  Release 目录与下载量采集、下载历史、产物明细刷新
 worker/release-cache.ts    缓存状态、D1 刷新租约与后台任务
+worker/release-scheduler.ts 每项目 Durable Object alarm 与采集重试调度
 tests/                     Workers + D1 集成测试
 e2e/                       Chromium 浏览器验证
 ```
@@ -61,7 +62,7 @@ Webhook 接收入口独立于管理员会话。原始正文限制为 1 MiB，先
 
 Fork 按仓库 ID 去重，计数采用首次收到时间；GitHub 没有完整的 Fork 删除事件。Issue 与 PR 按项目、类型和仓库内编号保存并关联事件，避免 PR 评论携带的 Issue ID 与 PR / 评审事件的 PR ID 被当成两条记录；`github_id` 仅保留首次观测的来源 ID。更新状态时比较上游 `updated_at` 和投递顺序，防止较旧报文覆盖新状态。首条回复排除作者自身和机器人，耗时基于上游创建与回复时间。PR 由 `merged` / `merged_at` 判断合并，普通关闭不计入合并数，PR 下的普通评论归属 PR。新代码到达会清除旧评审显示。
 
-Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和删除动态；不写版本目录、产物、下载量或仓库 Star / Fork 总量。公开版本目录由每小时采集更新，图表版本节点来自目录缓存中的发布时间。
+Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和删除动态；不写版本目录、产物、下载量或仓库 Star / Fork 总量。公开版本目录由自动采集更新，图表版本节点来自目录缓存中的发布时间。
 
 暂停期间仍验证并确认投递，但不记录业务事件或更新总量，定时采集也跳过该项目；已确认投递不会在恢复后因重投而补入。事件列表、状态和指标只覆盖已收到的事件，不补齐历史积压。公开 Release 目录和产物下载量是独立的数据来源，匿名读取 GitHub 官方接口，不请求 Star 用户名单。事件时间、接收时间和上游更新时间各自用于对应口径，不假定所有 GitHub 事件都带完整发生时间。
 
@@ -73,25 +74,29 @@ Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和�
 
 迁移版本 9 将 `work_items` 的主键改为项目、类型、编号，保留所有已有状态与事件。旧版本因 PR ID / Issue ID 冲突返回 500 的投递，可在升级后通过 GitHub Recent Deliveries 重新投递。
 
+迁移版本 10 为 `release_refresh` 增加毫秒单位的 `next_at`，保存每项目的下一次采集时间；保留已有缓存、下载历史与 `scheduled_hour` 兼容字段。
+
 新增指标时在 `shared/monitors.ts` 注册事件，为 `worker/events.ts` 添加独立处理逻辑，并在 `worker/db.ts` 追加迁移。复用签名验证、仓库身份和事务去重；不要为未支持的事件建立假统计。
 
 ## 项目范围、Release 区间与下载量
 
 总览默认汇总所有项目，可按项目筛选；版本信息与发布标记只出现在单项目数据。`scope=project` 的 Dashboard 和 `/api/monitoring` 需要项目 ID。Release 区间使用该项目两个已发布版本的 `published_at`，验证身份、先后顺序和非未来时间，并将同一 `[since,until)` 应用于事件计数、图表、Star 净变化与列表。事件图表在长区间自动按多天分组，最多约 90 个图表点；对监控启用前的时间显示覆盖不足提示。Issue / PR 仅筛出区间内有事件的条目，显示其当前已记录状态，不将其当成历史状态快照。
 
-`wrangler.jsonc` 的 Cron 为 `0 * * * *`，每小时采集所有已启用项目的完整 Release 目录和下载量。项目数据、Release 下拉、版本列表和下载总量接口只读取 D1，不触发 GitHub 请求；旧 `/api/repositories/:id/releases/sync` 路由已移除。浏览器定期读取本站数据，不直接轮询 GitHub。首次无缓存时返回未知值，等待下一轮采集；失败保留旧数据和更新时间，不将未知数据写成 0。
+每个已启用项目独立采集完整 Release 目录和下载量：完整采集成功后等待一小时再采集，失败则在该次尝试结束一秒后重试，持续到成功。D1 的 `release_refresh.next_at` 保存下一次采集时间，单位为毫秒，是调度的权威状态；每项目一个 Durable Object，通过 alarm 持续唤醒。`wrangler.jsonc` 的 Cron 为 `* * * * *`，每分钟只检查和恢复项目 alarm，不直接请求 GitHub，也不改变已保存的下一次采集时间。
 
-定时任务每页读取 100 个 Release，从列表内嵌的 `assets.download_count` 用 BigInt 精确累加总量，不逐版本查询产物接口；有已发布版本时再调用 `/releases/latest`，维护最新正式版卡片。定时采集按项目保存的 `owner/repo` 读取，不额外请求仓库身份接口，正常成功采集需要 `P + 1` 次 GitHub 请求，其中 `P` 是 Release 列表页数；没有已发布版本时不请求 latest。完整分页和 latest 全部成功后，目录、下载量缓存及该小时历史点原子保存，不写入部分结果。
+项目数据、Release 下拉、版本列表和下载总量接口只读取 D1，不触发 GitHub 请求；旧 `/api/repositories/:id/releases/sync` 路由已移除。浏览器定期读取本站数据，不直接轮询 GitHub。首次无缓存时返回未知值，等待自动采集；失败保留旧数据和更新时间，不将未知数据写成 0。
 
-`download_snapshots` 保存成功采集的累计总量，每项目每小时最多一个点，`scheduled_hour` 防止同一小时重复采集。增长图按所选时间范围绘制真实小时快照，不补造启用前的历史，也不在失败时沿用旧值生成新点。版本或产物被删除后累计总量可能下降，应保留真实变化。公开下载量缓存仍保存逐版本计数与发布时间。
+采集任务每页读取 100 个 Release，从列表内嵌的 `assets.download_count` 用 BigInt 精确累加总量，不逐版本查询产物接口；有已发布版本时再调用 `/releases/latest`，维护最新正式版卡片。采集按项目保存的 `owner/repo` 读取，不额外请求仓库身份接口，正常成功采集需要 `P + 1` 次 GitHub 请求，其中 `P` 是 Release 列表页数；没有已发布版本时不请求 latest。完整分页和 latest 全部成功后，目录、下载量缓存及该小时历史点原子保存，不写入部分结果。
+
+`download_snapshots` 保存成功采集的累计总量，按实际成功时刻所属小时保存，每项目每小时最多一个点。`scheduled_hour` 只保留兼容，不再参与调度或去重；下一次采集时间从本次完整成功时刻计算。增长图按所选时间范围绘制真实快照，不补造启用前的历史，也不在失败时沿用旧值生成新点。版本或产物被删除后累计总量可能下降，应保留真实变化。公开下载量缓存仍保存逐版本计数与发布时间。
 
 产物明细保留按需刷新：请求先返回 D1 缓存，再通过 `ctx.waitUntil` 刷新。刷新时验证仓库身份、查询版本元数据，并完整分页读取产物，只替换产物快照，不更新版本目录。仓库身份校验缓存复用 5 分钟；D1 原子租约合并并发刷新，租约 35 秒，后台外部请求总预算 25 秒。
 
-`release_refresh` 保存上次错误、重试时间和租约。GitHub 的 403 / 429 按响应头区分限流，所有采集与产物刷新共享主机级退避；目录和总量由后续定时任务重试，产物明细在退避结束后的访问中重试。所有数据固定访问 GitHub 官方 HTTPS JSON 接口，限制响应大小且不读取文件二进制；重定向使用 Workers 支持的 `manual`，不访问上游提供的任意地址。失败保留上次成功的 GitHub 缓存，不切换数据源；定时数据区域只显示最近成功采集时间，上游错误只在产物明细区域显示。
+`release_refresh` 保存上次错误、重试时间和租约。目录和汇总下载量采集不受主机级退避阻止，所有失败均按一秒间隔继续重试，仍保持匿名请求；产物明细继续遵守原主机退避，在退避结束后的访问中重试。所有数据固定访问 GitHub 官方 HTTPS JSON 接口，限制响应大小且不读取文件二进制；重定向使用 Workers 支持的 `manual`，不访问上游提供的任意地址。失败保留上次成功的 GitHub 缓存，不切换数据源；自动采集数据区域只显示最近成功采集时间，上游错误只在产物明细区域显示。
 
 GitHub 出站诊断使用结构化日志：每次实际调用 `fetch` 前记录一个 `github_request`，响应或网络异常记录同一 `requestId` 的 `github_response`；退避直接返回缓存错误时只记录 `github_backoff`。按小时统计真实请求次数只计 `github_request`，不要把响应和退避日志重复计入。响应日志包含路径、状态、耗时、GitHub Request ID、`X-RateLimit-Limit / Used / Remaining / Reset / Resource` 和 `Retry-After`。错误正文最多读取 4 KiB，只提取最多 500 字符的 JSON `message`，不记录完整响应正文或请求凭据；正文不可读时仍保留 HTTP 和配额证据。
 
-403 本身不是限流证据：403 / 429 且 `Remaining=0` 标记 `primary_rate_limit`，正文明确说明 secondary rate limit 或 abuse detection 时标记 `secondary_rate_limit`，429 或明确的 API rate limit exceeded 消息标记 `rate_limit`；只有 `Retry-After` 的 403 仍标记 `forbidden`。退避同时尊重 `Retry-After` 和主限流的重置时间。GitHub 的 `Used` 是上游配额使用量，不等于当前 Worker 的请求数。
+403 本身不是限流证据：403 / 429 且 `Remaining=0` 标记 `primary_rate_limit`，正文明确说明 secondary rate limit 或 abuse detection 时标记 `secondary_rate_limit`，429 或明确的 API rate limit exceeded 消息标记 `rate_limit`；只有 `Retry-After` 的 403 仍标记 `forbidden`。产物明细的退避同时尊重 `Retry-After` 和主限流的重置时间；目录和汇总下载量采集按上述一秒重试策略执行。GitHub 的 `Used` 是上游配额使用量，不等于当前 Worker 的请求数。
 
 产物对比只绘制已知计数，占比图要求全量计数可用；未知数据不绘制为 0。图表用 BigInt 比较、累加与计算比例。
 

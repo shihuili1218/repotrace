@@ -185,6 +185,13 @@ export const migrations = [
     `ALTER TABLE work_items_number RENAME TO work_items`,
     `CREATE INDEX work_status ON work_items(project_id,kind,state,updated_at)`,
   ],
+  [
+    // The next attempt is measured from completion, independently for each project.
+    // Keep scheduled_hour for compatibility with previously deployed code.
+    `ALTER TABLE release_refresh ADD COLUMN next_at INTEGER NOT NULL DEFAULT 0`,
+    `UPDATE release_refresh SET next_at=(updated_at+3600)*1000
+      WHERE resource='downloads' AND updated_at IS NOT NULL AND error IS NULL`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

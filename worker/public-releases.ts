@@ -39,17 +39,28 @@ async function githubErrorMessage(response: Response) {
 async function github(
   env: Env,
   path: string,
-  signal?: AbortSignal,
-  allowMissing = false,
+  {
+    signal,
+    allowMissing = false,
+    scheduled = false,
+  }: {
+    signal?: AbortSignal;
+    allowMissing?: boolean;
+    scheduled?: boolean;
+  } = {},
 ): Promise<{ data: unknown; next: boolean }> {
-  const cooldown = await env.DB.prepare(
-    'SELECT retry_at,error FROM public_api_backoff WHERE host=?',
-  )
-    .bind('api.github.com')
-    .first<{ retry_at: number; error: string }>();
-  if (cooldown && cooldown.retry_at > nowSeconds()) {
-    console.info({ event: 'github_backoff', path, retryAt: cooldown.retry_at });
-    throw new UpstreamError(cooldown.error, cooldown.retry_at);
+  // Automatic collections use their persisted one-second retry schedule.
+  // On-demand asset refreshes retain the existing shared-host backoff.
+  if (!scheduled) {
+    const cooldown = await env.DB.prepare(
+      'SELECT retry_at,error FROM public_api_backoff WHERE host=?',
+    )
+      .bind('api.github.com')
+      .first<{ retry_at: number; error: string }>();
+    if (cooldown && cooldown.retry_at > nowSeconds()) {
+      console.info({ event: 'github_backoff', path, retryAt: cooldown.retry_at });
+      throw new UpstreamError(cooldown.error, cooldown.retry_at);
+    }
   }
   const requestId = crypto.randomUUID();
   const started = Date.now();
@@ -195,7 +206,7 @@ async function source(env: Env, id: string, signal?: AbortSignal) {
       await github(
         env,
         `/repos/${project.full_name.split('/').map(encodeURIComponent).join('/')}`,
-        signal,
+        { signal },
       )
     ).data,
   );
@@ -283,7 +294,7 @@ export async function refreshPublicAssets(
   if (existing.deleted) return existing;
   const repo = await source(env, project, signal);
   const metadata = publicMetadata(
-    (await github(env, `${repo.path}/releases/${release}`, signal)).data,
+    (await github(env, `${repo.path}/releases/${release}`, { signal })).data,
   );
   if (metadata.id !== release) throw new AppError(502, 'GitHub 返回的版本身份不一致。');
   const assets: unknown[] = [];
@@ -291,7 +302,7 @@ export async function refreshPublicAssets(
     const result = await github(
       env,
       `${repo.path}/releases/${release}/assets?per_page=100&page=${page}`,
-      signal,
+      { signal },
     );
     if (!Array.isArray(result.data) || result.data.length > 100)
       throw new AppError(502, 'GitHub 返回的产物清单无效。');
@@ -351,22 +362,36 @@ function sumDownloads(input: unknown): bigint {
   }, 0n);
 }
 
-async function collectProjectReleases(
+export async function readCollectionSchedule(env: Env, project: string) {
+  return env.DB.prepare(
+    `SELECT p.id,p.full_name,COALESCE(f.next_at,0) AS next_at,COALESCE(f.lease_until,0) AS lease_until
+    FROM projects p LEFT JOIN release_refresh f ON f.project_id=p.id AND f.resource='downloads'
+    WHERE p.id=? AND p.enabled=1`,
+  )
+    .bind(project)
+    .first<{ id: string; full_name: string; next_at: number; lease_until: number }>();
+}
+
+export async function collectProjectReleases(
   env: Env,
   project: { id: string; full_name: string },
-  hour: number,
-) {
+): Promise<number | null> {
   const started = nowSeconds();
   const token = crypto.randomUUID();
   const lease = await env.DB.prepare(
-    `INSERT INTO release_refresh(project_id,resource,lease_token,lease_until,scheduled_hour)
-    SELECT ?,'downloads',?,?,? WHERE EXISTS(SELECT 1 FROM projects WHERE id=? AND enabled=1 AND full_name=?)
-    ON CONFLICT(project_id,resource) DO UPDATE SET lease_token=excluded.lease_token,lease_until=excluded.lease_until,scheduled_hour=excluded.scheduled_hour
-    WHERE release_refresh.lease_until<=? AND (release_refresh.scheduled_hour IS NULL OR release_refresh.scheduled_hour<?) RETURNING lease_token`,
+    `INSERT INTO release_refresh(project_id,resource,lease_token,lease_until)
+    SELECT ?,'downloads',?,? WHERE EXISTS(SELECT 1 FROM projects WHERE id=? AND enabled=1 AND full_name=?)
+    ON CONFLICT(project_id,resource) DO UPDATE SET lease_token=excluded.lease_token,lease_until=excluded.lease_until
+    WHERE release_refresh.lease_until<=? AND release_refresh.next_at<=? RETURNING lease_token`,
   )
-    .bind(project.id, token, started + 35, hour, project.id, project.full_name, started, hour)
+    .bind(project.id, token, started + 35, project.id, project.full_name, started, Date.now())
     .first();
-  if (!lease) return;
+  if (!lease) {
+    const schedule = await readCollectionSchedule(env, project.id);
+    if (!schedule) return null;
+    const next = Math.max(schedule.next_at, schedule.lease_until * 1000);
+    return next > Date.now() ? next : Date.now() + 1000;
+  }
   try {
     const signal = AbortSignal.timeout(25000);
     const path = `/repos/${project.full_name.split('/').map(encodeURIComponent).join('/')}`;
@@ -375,7 +400,10 @@ async function collectProjectReleases(
     let total = 0n;
     for (let page = 1; ; page++) {
       signal.throwIfAborted();
-      const result = await github(env, `${path}/releases?per_page=100&page=${page}`, signal);
+      const result = await github(env, `${path}/releases?per_page=100&page=${page}`, {
+        signal,
+        scheduled: true,
+      });
       if (!Array.isArray(result.data) || result.data.length > 100)
         throw new AppError(502, 'GitHub 返回的版本清单无效。');
       for (const raw of result.data) {
@@ -397,7 +425,13 @@ async function collectProjectReleases(
       if (!result.next) break;
     }
     const latest = versions.length
-      ? (await github(env, `${path}/releases/latest`, signal, true)).data
+      ? (
+          await github(env, `${path}/releases/latest`, {
+            signal,
+            allowMissing: true,
+            scheduled: true,
+          })
+        ).data
       : null;
     const payload = {
       total: String(total),
@@ -405,13 +439,16 @@ async function collectProjectReleases(
       source: 'github',
       releases: versions,
     };
-    const at = nowSeconds();
+    const completed = Date.now();
+    const at = Math.floor(completed / 1000);
+    const hour = Math.floor(completed / 3600000) * 3600;
+    const next = completed + 3600000;
     // A complete collection replaces all three views together. A rename, pause,
     // deletion or newer lease while fetching must not publish this stale result.
     const guard = `EXISTS(SELECT 1 FROM release_refresh f JOIN projects p ON p.id=f.project_id
       WHERE f.project_id=? AND f.resource='downloads' AND f.lease_token=? AND p.enabled=1 AND p.full_name=?)`;
     const params = [project.id, token, project.full_name];
-    await env.DB.batch([
+    const saved = await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO releases(project_id,github_id,tag_name,name,author_login,prerelease,draft,created_at,published_at,first_seen_at,last_delivery_seq,metadata_observed_at)
         SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.tag'),json_extract(value,'$.name'),json_extract(value,'$.author'),json_extract(value,'$.prerelease'),json_extract(value,'$.draft'),json_extract(value,'$.created'),json_extract(value,'$.published'),?,0,?
@@ -427,37 +464,28 @@ async function collectProjectReleases(
         SELECT ?,?,?,? WHERE ${guard}`,
       ).bind(project.id, hour, at, payload.total, ...params),
       env.DB.prepare(
-        `UPDATE release_refresh SET updated_at=?,error=NULL,retry_at=0,lease_token=NULL,lease_until=0,payload=?
+        `UPDATE release_refresh SET updated_at=?,error=NULL,retry_at=0,lease_token=NULL,lease_until=0,payload=?,next_at=?
         WHERE project_id=? AND resource='downloads' AND ${guard}`,
-      ).bind(at, JSON.stringify(payload), project.id, ...params),
+      ).bind(at, JSON.stringify(payload), next, project.id, ...params),
     ]);
+    if (saved[3].meta.changes) return next;
+    // Invalidate this lease when a rename or pause made its result obsolete.
+    await env.DB.prepare(
+      "UPDATE release_refresh SET lease_token=NULL,lease_until=0 WHERE project_id=? AND resource='downloads' AND lease_token=?",
+    )
+      .bind(project.id, token)
+      .run();
+    return (await readCollectionSchedule(env, project.id)) ? Date.now() + 1000 : null;
   } catch (error) {
+    const next = Date.now() + 1000;
     const message = error instanceof AppError ? error.message : 'Release 定时采集失败。';
     await env.DB.prepare(
-      `UPDATE release_refresh SET error=?,retry_at=0,lease_token=NULL,lease_until=0
+      `UPDATE release_refresh SET error=?,retry_at=0,lease_token=NULL,lease_until=0,next_at=?
       WHERE project_id=? AND resource='downloads' AND lease_token=?`,
     )
-      .bind(message, project.id, token)
+      .bind(message, next, project.id, token)
       .run();
-  }
-}
-
-export async function collectScheduledReleases(env: Env, scheduledTime: number) {
-  const hour = Math.floor(scheduledTime / 3600000) * 3600;
-  const projects = await env.DB.prepare(
-    'SELECT id,full_name FROM projects WHERE enabled=1 ORDER BY id',
-  ).all<{ id: string; full_name: string }>();
-  for (const project of projects.results) {
-    try {
-      await collectProjectReleases(env, project, hour);
-    } catch (error) {
-      // Database errors must not prevent the remaining projects from collecting.
-      console.error(
-        'Release collection failed:',
-        project.id,
-        error instanceof Error ? error.name : 'UnknownError',
-      );
-    }
+    return (await readCollectionSchedule(env, project.id)) ? next : null;
   }
 }
 

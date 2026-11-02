@@ -14,7 +14,9 @@ export function ScheduledReleaseNote({ cache }: { cache?: DownloadSummary['cache
   return (
     <div className="release-cache-note">
       <p className="field-note" role="status">
-        {when ? `每小时更新 · 最近采集于 ${when}。` : '尚无采集数据，等待下一次每小时采集。'}
+        {when
+          ? `每次采集成功后，间隔一小时再采集 · 最近采集于 ${when}。`
+          : '尚无采集数据，等待自动采集。'}
       </p>
     </div>
   );

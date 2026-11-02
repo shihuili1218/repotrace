@@ -1199,7 +1199,7 @@ function WebhookDialog({
       </div>
       <p className="field-note">
         Releases
-        只用于记录发版动态。版本目录和汇总下载量每小时采集；查看单个版本的产物下载量时，返回缓存并请求后台刷新。
+        只用于记录发版动态。版本目录和汇总下载量在每次采集成功一小时后再次采集，失败会自动重试；查看单个版本的产物下载量时，返回缓存并请求后台刷新。
       </p>
       <div className="dialog-tip">
         <HelpCircle size={16} />
@@ -1651,7 +1651,7 @@ function SettingsView({
             Fork 只记录新增；Issue / PR 待办仅覆盖已收到的条目。新模块请在 GitHub 编辑现有
             Webhook，增加勾选 Forks、Issues、Issue comments、Pull requests、Pull request
             reviews、Releases。Release
-            事件只记录动态；版本目录和汇总下载量每小时采集，单个版本的产物下载量在读取缓存后后台更新。
+            事件只记录动态；版本目录和汇总下载量在每次采集成功一小时后再次采集，失败会自动重试。单个版本的产物下载量在读取缓存后后台更新。
           </p>
         </section>
       </div>

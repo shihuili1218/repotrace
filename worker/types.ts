@@ -1,7 +1,10 @@
+import type { ReleaseScheduler } from './release-scheduler';
+
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
   WEBHOOK_KEYS: KVNamespace;
+  RELEASE_SCHEDULER: DurableObjectNamespace<ReleaseScheduler>;
   SETUP_TOKEN?: string;
 }
 

@@ -15,7 +15,9 @@ import { parseRepository } from './projects';
 import { sealWebhookSecret, secretStatement } from './webhook-secrets';
 import { newWebhookSecret, receiveWebhook } from './webhooks';
 import { monitoring } from './monitoring';
-import { cachedAssets, cachedDownloads, collectScheduledReleases } from './public-releases';
+import { cachedAssets, cachedDownloads } from './public-releases';
+import { ensureReleaseSchedules } from './release-scheduler';
+export { ReleaseScheduler } from './release-scheduler';
 import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
 
@@ -209,9 +211,9 @@ function webhookConfig(origin: string, id: string, name: string, secret?: string
 }
 
 export default {
-  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
     await initDB(env.DB);
-    await collectScheduledReleases(env, controller.scheduledTime);
+    await ensureReleaseSchedules(env);
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     let response: Response;

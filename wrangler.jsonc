@@ -11,7 +11,11 @@
   },
   "d1_databases": [{ "binding": "DB", "database_name": "repotrace-db" }],
   "kv_namespaces": [{ "binding": "WEBHOOK_KEYS" }],
-  "triggers": { "crons": ["0 * * * *"] },
+  "durable_objects": {
+    "bindings": [{ "name": "RELEASE_SCHEDULER", "class_name": "ReleaseScheduler" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReleaseScheduler"] }],
+  "triggers": { "crons": ["* * * * *"] },
   "build": { "command": "npm run build" },
   "observability": { "enabled": true },
 }

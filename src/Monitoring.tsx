@@ -439,7 +439,7 @@ export function Monitoring({
               {type === 'forks'
                 ? 'GitHub 只通知新增 Fork，无法据此追踪删除。'
                 : type === 'releases'
-                  ? '版本目录每小时更新，展示最近一次采集结果；产物下载量可实时刷新。'
+                  ? '版本目录展示最近一次采集结果；产物下载量可实时刷新。'
                   : '只展示所选期间有事件的条目，状态为当前已记录状态。'}
             </p>
           </div>
@@ -500,7 +500,7 @@ export function Monitoring({
         ) : !data.total ? (
           <Empty>
             {type === 'releases'
-              ? '暂无已采集的公开 Release，等待下一次每小时采集。'
+              ? '暂无已采集的公开 Release，等待自动采集。'
               : '在 GitHub Webhook 中勾选对应事件，收到新事件后会出现在这里。'}
           </Empty>
         ) : (

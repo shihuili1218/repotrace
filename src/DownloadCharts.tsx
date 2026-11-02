@@ -48,7 +48,7 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
         <figcaption>
           <h3>总下载量增长</h3>
         </figcaption>
-        <p className="small-empty">所选时间范围内暂无下载量记录，等待每小时采集后查看。</p>
+        <p className="small-empty">所选时间范围内暂无下载量记录，等待自动采集后查看。</p>
       </figure>
     );
   const values = data.map((p) => BigInt(p.total));
@@ -70,7 +70,7 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
       <figcaption>
         <h3>总下载量增长</h3>
         <p>
-          每小时采集 · 所选时间范围内的累计下载量
+          所选时间范围内的累计下载量
           {offsetAxis ? ` · 纵轴显示相对 ${downloadNumber(String(min))} 次的增量` : ''}
         </p>
       </figcaption>
