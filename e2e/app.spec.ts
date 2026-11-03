@@ -548,6 +548,7 @@ test('renders overview charts and the latest five mixed events on desktop and mo
     changeTotal: 1,
     page: 1,
     eventCounts: { added: 28, removed: 3 },
+    eventTotal: 73,
     metrics: metricFixture,
     releaseMarkers: [metricFixture.latestRelease],
     timeline: [],
@@ -581,6 +582,20 @@ test('renders overview charts and the latest five mixed events on desktop and mo
     timelineTotal: 0,
   });
   await page.goto('/');
+  const stats = page.getByRole('region', { name: '监控统计' });
+  await expect(stats.getByRole('article')).toHaveCount(6);
+  for (const [title, labels, values] of [
+    ['Stars', ['总数', '新增', '取消'], ['1,248', '28', '3']],
+    ['Issues', ['新增', '关闭'], ['6', '4']],
+    ['PRs', ['新增', '合并', '关闭'], ['5', '3', '1']],
+    ['近 30 天新增 Fork', ['新增'], ['8']],
+    ['近 30 天事件', ['总数'], ['73']],
+    ['已连接项目', ['已连接 / 全部'], ['1 / 1']],
+  ] as const) {
+    const card = stats.getByRole('article', { name: title, exact: true });
+    await expect(card.locator('dt')).toHaveText([...labels]);
+    await expect(card.locator('dd')).toHaveText([...values]);
+  }
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
   const recent = page.getByRole('region', { name: '最近项目动态' });
@@ -591,12 +606,32 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   await expect(recent.getByRole('button', { name: '下一页' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Star 事件记录' })).toHaveCount(0);
   await page.screenshot({ path: 'test-results/dashboard-desktop.png', fullPage: true });
+  for (const width of [1151, 1024, 768]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect
+      .poll(() =>
+        stats
+          .locator('dd')
+          .evaluateAll((values) =>
+            values.every(
+              (el) =>
+                el.getBoundingClientRect().height <=
+                parseFloat(getComputedStyle(el).lineHeight) + 1,
+            ),
+          ),
+      )
+      .toBe(true);
+  }
+  await stats.screenshot({ path: 'test-results/dashboard-tablet-stats.png' });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect
     .poll(() => page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().right))
     .toBeLessThanOrEqual(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/dashboard-mobile.png', fullPage: true });
+  await page.getByLabel('统计范围').selectOption('7');
+  await expect(stats.getByRole('article', { name: '近 7 天新增 Fork', exact: true })).toBeVisible();
+  await expect(stats.getByRole('article', { name: '近 7 天事件', exact: true })).toBeVisible();
 });
 
 test('guides a migrated project through first-time signing setup and lists the new event choices', async ({
@@ -623,6 +658,7 @@ test('guides a migrated project through first-time signing setup and lists the n
     changeTotal: 0,
     page: 1,
     eventCounts: { added: 0, removed: 0 },
+    eventTotal: 0,
     metrics: { ...metricFixture, latestRelease: null },
     releaseMarkers: [],
     timeline: [],

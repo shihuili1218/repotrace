@@ -627,62 +627,62 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <>
                   <section className="stats-grid" aria-label="监控统计">
                     <Stat
-                      title="最近上报 Stars"
-                      value={known.length ? number(total) : '—'}
+                      title="Stars"
+                      values={[
+                        { label: '总数', value: known.length ? number(total) : '—' },
+                        { label: '新增', value: number(data.eventCounts.added) },
+                        { label: '取消', value: number(data.eventCounts.removed) },
+                      ]}
                       icon={<Star size={20} />}
-                      note={`${known.length} / ${shown.length} 个项目已有 Webhook 总量`}
+                      note={`${known.length} / ${shown.length} 个项目有总数 · 增减为近 ${days} 天`}
                       tone="purple"
                     />
                     <Stat
-                      title={`近 ${days} 天新增事件`}
-                      value={`+${number(data.eventCounts.added)}`}
-                      icon={<ArrowUpRight size={20} />}
-                      note="按收到的 Star 事件计数"
+                      title="Issues"
+                      values={[
+                        { label: '新增', value: number(data.metrics.issuesOpened) },
+                        { label: '关闭', value: number(data.metrics.issuesClosed) },
+                      ]}
+                      icon={<MessageCircle size={20} />}
+                      note={`近 ${days} 天新增 / 关闭的 Issue`}
                       tone="green"
                     />
                     <Stat
-                      title={`近 ${days} 天取消事件`}
-                      value={`−${number(data.eventCounts.removed)}`}
-                      icon={<ArrowDownRight size={20} />}
-                      note="自然日净变化在图表中实时计算"
-                      tone="red"
+                      title="PRs"
+                      values={[
+                        { label: '新增', value: number(data.metrics.prsOpened) },
+                        { label: '合并', value: number(data.metrics.prsMerged) },
+                        { label: '关闭', value: number(data.metrics.prsClosed) },
+                      ]}
+                      icon={<GitPullRequest size={20} />}
+                      note={`近 ${days} 天 · 关闭不含已合并`}
+                      tone="blue"
+                    />
+                    <Stat
+                      title={`近 ${days} 天新增 Fork`}
+                      values={[{ label: '新增', value: number(data.metrics.forks) }]}
+                      icon={<GitFork size={20} />}
+                      note="统计期间新建的 Fork 仓库"
+                      tone="purple"
+                    />
+                    <Stat
+                      title={`近 ${days} 天事件`}
+                      values={[{ label: '总数', value: number(data.eventTotal) }]}
+                      icon={<Activity size={20} />}
+                      note="Star、Fork、Issue、PR、Release 全部事件"
+                      tone="green"
                     />
                     <Stat
                       title="已连接项目"
-                      value={`${shown.filter((r) => r.enabled && r.last_received_at).length} / ${shown.length}`}
+                      values={[
+                        {
+                          label: '已连接 / 全部',
+                          value: `${shown.filter((r) => r.enabled && r.last_received_at).length} / ${shown.length}`,
+                        },
+                      ]}
                       icon={<FolderGit2 size={20} />}
                       note="已启用且收到过签名事件"
                       tone="blue"
-                    />
-                  </section>
-                  <section className="stats-grid" aria-label="更多项目统计">
-                    <Stat
-                      title={`近 ${days} 天新增 Fork`}
-                      value={number(data.metrics.forks)}
-                      icon={<GitFork size={20} />}
-                      note="查看新 Fork 的用户和仓库"
-                      tone="purple"
-                    />
-                    <Stat
-                      title={`近 ${days} 天新建 Issue`}
-                      value={number(data.metrics.issuesOpened)}
-                      icon={<MessageCircle size={20} />}
-                      note={`${data.metrics.unansweredIssues} 个已记录的 Issue 待回复`}
-                      tone="green"
-                    />
-                    <Stat
-                      title={`近 ${days} 天合并 PR`}
-                      value={number(data.metrics.prsMerged)}
-                      icon={<GitPullRequest size={20} />}
-                      note={`${data.metrics.awaitingReview} 个已记录的 PR 待评审`}
-                      tone="blue"
-                    />
-                    <Stat
-                      title="当前已记录未关闭 Issue"
-                      value={number(data.metrics.openIssues)}
-                      icon={<MessageCircle size={20} />}
-                      note="所选项目当前已记录的反馈队列"
-                      tone="purple"
                     />
                   </section>
                   <div className="chart-grid">
@@ -1496,24 +1496,31 @@ function Changes({
 }
 function Stat({
   title,
-  value,
+  values,
   icon,
   note,
   tone,
 }: {
   title: string;
-  value: string;
+  values: { label: string; value: string }[];
   icon: ReactNode;
   note: string;
   tone: string;
 }) {
   return (
-    <article className={`stat-card ${tone}`}>
+    <article className={`stat-card ${tone}`} aria-label={title}>
       <div className="stat-top">
         <span>{title}</span>
         <span className="stat-icon">{icon}</span>
       </div>
-      <strong className="stat-value">{value}</strong>
+      <dl className="stat-metrics">
+        {values.map(({ label, value }) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd className="stat-value">{value}</dd>
+          </div>
+        ))}
+      </dl>
       <p>{note}</p>
     </article>
   );

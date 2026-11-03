@@ -129,8 +129,8 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
   const feed = `SELECT * FROM(
     SELECT 'star:'||e.delivery_seq AS id,e.delivery_seq AS seq,e.project_id,p.full_name,'star' AS category,CASE e.kind WHEN 'added' THEN 'created' ELSE 'deleted' END AS action,e.user_id AS actor_id,e.login AS actor_login,p.full_name AS title,NULL AS number,'https://github.com/'||p.full_name AS url,e.received_at FROM star_events e JOIN projects p ON p.id=e.project_id
     UNION ALL SELECT 'event:'||e.delivery_seq,e.delivery_seq,e.project_id,p.full_name,e.category,e.action,e.actor_id,e.actor_login,e.title,e.number,e.url,e.received_at FROM project_events e JOIN projects p ON p.id=e.project_id
-    ) WHERE (? IS NULL OR project_id=?) AND received_at>=? AND received_at<? AND (?='all' OR category=?)`;
-  const feedParams = [project, project, since, until, category, category];
+    ) WHERE (? IS NULL OR project_id=?) AND received_at>=? AND received_at<?`;
+  const feedParams = [project, project, since, until];
   const [changes, count, timeline, timelineCount, recent] = await Promise.all([
     db
       .prepare(`${selected} ORDER BY observed_at DESC,id DESC LIMIT 30 OFFSET ?`)
@@ -141,18 +141,22 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
       .bind(...params)
       .first<number>('count'),
     db
-      .prepare(`${feed} ORDER BY received_at DESC,seq DESC LIMIT 30 OFFSET ?`)
-      .bind(...feedParams, (page - 1) * 30)
+      .prepare(
+        `${feed} AND (?='all' OR category=?) ORDER BY received_at DESC,seq DESC LIMIT 30 OFFSET ?`,
+      )
+      .bind(...feedParams, category, category, (page - 1) * 30)
       .all<ActivityRecord>(),
     db
-      .prepare(`SELECT COUNT(*) AS count FROM (${feed})`)
-      .bind(...feedParams)
-      .first<number>('count'),
+      .prepare(
+        `SELECT COUNT(*) AS total,COALESCE(SUM(?='all' OR category=?),0) AS filtered FROM (${feed})`,
+      )
+      .bind(category, category, ...feedParams)
+      .first<{ total: number; filtered: number }>(),
     category === 'all' && page === 1
       ? Promise.resolve(null)
       : db
           .prepare(`${feed} ORDER BY received_at DESC,seq DESC LIMIT 5`)
-          .bind(project, project, since, until, 'all', 'all')
+          .bind(...feedParams)
           .all<ActivityRecord>(),
   ]);
   const [net, choices, catalog] = await Promise.all([
@@ -196,10 +200,11 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     changeTotal: count ?? 0,
     page,
     eventCounts: eventCounts ?? { added: 0, removed: 0 },
+    eventTotal: timelineCount?.total ?? 0,
     metrics,
     releaseMarkers: markers.results,
     timeline: timeline.results,
     recentEvents: (recent?.results ?? timeline.results).slice(0, 5),
-    timelineTotal: timelineCount ?? 0,
+    timelineTotal: timelineCount?.filtered ?? 0,
   };
 }

@@ -711,6 +711,65 @@ describe('live webhook analytics', () => {
     expect(data.recentEvents[4].actor_login).toBe('visitor-8');
     expect((await dashboard(session)).recentEvents).toHaveLength(5);
   });
+  it('counts every recorded event in the selected project and range independently of list filters', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const other = await add(session, 'another/project');
+    expect((await dashboard(session)).eventTotal).toBe(0);
+    const since = localMidnight(nowSeconds()) - 6 * 86400;
+    await signed(config, 'ping');
+    await signed(config, 'star', {}, crypto.randomUUID(), since);
+    await signed(config, 'star', { action: 'deleted', starred_at: null });
+    await signed(config, 'issues', { action: 'opened', issue: item() });
+    const comment = {
+      action: 'created',
+      issue: item(),
+      comment: { user: { id: 30, login: 'helper' }, created_at: iso(nowSeconds()) },
+    };
+    const delivery = crypto.randomUUID();
+    await signed(config, 'issue_comment', comment, delivery);
+    await signed(config, 'issue_comment', comment, delivery);
+    await signed(config, 'pull_request', { action: 'opened', pull_request: item(1002) });
+    await signed(config, 'pull_request_review', {
+      action: 'submitted',
+      pull_request: item(1002),
+      review: {
+        state: 'approved',
+        user: { id: 30, login: 'reviewer' },
+        submitted_at: iso(nowSeconds()),
+      },
+    });
+    await signed(config, 'fork', {
+      forkee: {
+        id: 201,
+        full_name: 'forker/repo',
+        owner: { id: 30, login: 'forker' },
+        created_at: iso(nowSeconds()),
+      },
+    });
+    await signed(config, 'release', { action: 'published', release: release() });
+    await signed(config, 'star', {}, crypto.randomUUID(), since - 1);
+    await signed(config, 'issue_comment', comment, crypto.randomUUID(), since - 1);
+    await signed(other, 'star', {
+      repository: { id: 101, full_name: 'another/project' },
+    });
+    await env.DB.prepare(
+      "INSERT INTO summaries(id,project_id,kind,source,day,period_start,period_end,computed_at) VALUES ('older-summary',?,'daily','legacy',?,100,200,200)",
+    )
+      .bind(config.id, localDay(since - 86400))
+      .run();
+    const data = await dashboard(
+      session,
+      `?repo=${config.id}&days=7&category=issue&kind=removed&page=2&summary=older-summary`,
+    );
+    expect(data.eventTotal).toBe(8);
+    expect(data.timelineTotal).toBe(2);
+    expect(data.timeline).toEqual([]);
+    expect(data.eventCounts).toEqual({ added: 1, removed: 1 });
+    expect(data.metrics).toMatchObject({ forks: 1, issuesOpened: 1, prsOpened: 1 });
+    expect((await dashboard(session, '?days=7')).eventTotal).toBe(9);
+    expect((await dashboard(session, `?repo=${config.id}&days=30`)).eventTotal).toBe(10);
+  });
 });
 
 describe('fork growth', () => {
@@ -1481,6 +1540,7 @@ describe('project scope and Release intervals', () => {
     expect(data.range).toMatchObject({ since: start, until: end });
     expect(data.eventCounts).toEqual({ added: 2, removed: 2 });
     expect(data.starNet).toEqual({ added: 1, removed: 1 });
+    expect(data.eventTotal).toBe(5);
     expect(data.history.at(-1)).toMatchObject({ total: 50, issue_opened: 1 });
     expect(data.metrics.issuesOpened).toBe(1);
     expect(data.releaseMarkers.map((r) => r.github_id)).toEqual([2001]);
