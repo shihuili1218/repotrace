@@ -390,6 +390,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const shown = repositories.filter((r) => !repo || r.id === repo);
   const known = shown.filter((r) => r.current_total !== null);
   const total = known.reduce((n, r) => n + r.current_total!, 0);
+  const knownForks = shown.filter((r) => r.current_forks !== null);
+  const forkTotal = knownForks.reduce((n, r) => n + r.current_forks!, 0);
   const pending = repositories.filter((r) => !r.webhookConfigured || !r.last_received_at).length;
   const navs = [
     { view: 'overview' as const, label: '项目总览', icon: <LayoutDashboard size={19} /> },
@@ -627,59 +629,43 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <>
                   <section className="stats-grid" aria-label="监控统计">
                     <Stat
-                      title="Stars"
-                      values={[
-                        { label: '总数', value: known.length ? number(total) : '—' },
-                        { label: '新增', value: number(data.eventCounts.added) },
-                        { label: '取消', value: number(data.eventCounts.removed) },
-                      ]}
+                      title="Stars(总数 / 新增 / 取消)"
+                      value={`${known.length ? number(total) : '—'}/${number(data.eventCounts.added)}/${number(data.eventCounts.removed)}`}
                       icon={<Star size={20} />}
                       note={`${known.length} / ${shown.length} 个项目有总数 · 增减为近 ${days} 天`}
                       tone="purple"
                     />
                     <Stat
-                      title="Issues"
-                      values={[
-                        { label: '新增', value: number(data.metrics.issuesOpened) },
-                        { label: '关闭', value: number(data.metrics.issuesClosed) },
-                      ]}
+                      title="Issues(新增 / 关闭)"
+                      value={`${number(data.metrics.issuesOpened)}/${number(data.metrics.issuesClosed)}`}
                       icon={<MessageCircle size={20} />}
                       note={`近 ${days} 天新增 / 关闭的 Issue`}
                       tone="green"
                     />
                     <Stat
-                      title="PRs"
-                      values={[
-                        { label: '新增', value: number(data.metrics.prsOpened) },
-                        { label: '合并', value: number(data.metrics.prsMerged) },
-                        { label: '关闭', value: number(data.metrics.prsClosed) },
-                      ]}
+                      title="PRs(新增 / 合并 / 关闭)"
+                      value={`${number(data.metrics.prsOpened)}/${number(data.metrics.prsMerged)}/${number(data.metrics.prsClosed)}`}
                       icon={<GitPullRequest size={20} />}
                       note={`近 ${days} 天 · 关闭不含已合并`}
                       tone="blue"
                     />
                     <Stat
-                      title={`近 ${days} 天新增 Fork`}
-                      values={[{ label: '新增', value: number(data.metrics.forks) }]}
+                      title="Forks(总数 / 新增)"
+                      value={`${knownForks.length ? number(forkTotal) : '—'}/${number(data.metrics.forks)}`}
                       icon={<GitFork size={20} />}
-                      note="统计期间新建的 Fork 仓库"
+                      note={`${knownForks.length} / ${shown.length} 个项目有总数 · 新增为近 ${days} 天`}
                       tone="purple"
                     />
                     <Stat
                       title={`近 ${days} 天事件`}
-                      values={[{ label: '总数', value: number(data.eventTotal) }]}
+                      value={number(data.eventTotal)}
                       icon={<Activity size={20} />}
                       note="Star、Fork、Issue、PR、Release 全部事件"
                       tone="green"
                     />
                     <Stat
-                      title="已连接项目"
-                      values={[
-                        {
-                          label: '已连接 / 全部',
-                          value: `${shown.filter((r) => r.enabled && r.last_received_at).length} / ${shown.length}`,
-                        },
-                      ]}
+                      title="已连接项目(已连接 / 全部)"
+                      value={`${shown.filter((r) => r.enabled && r.last_received_at).length}/${shown.length}`}
                       icon={<FolderGit2 size={20} />}
                       note="已启用且收到过签名事件"
                       tone="blue"
@@ -1496,13 +1482,13 @@ function Changes({
 }
 function Stat({
   title,
-  values,
+  value,
   icon,
   note,
   tone,
 }: {
   title: string;
-  values: { label: string; value: string }[];
+  value: string;
   icon: ReactNode;
   note: string;
   tone: string;
@@ -1513,14 +1499,7 @@ function Stat({
         <span>{title}</span>
         <span className="stat-icon">{icon}</span>
       </div>
-      <dl className="stat-metrics">
-        {values.map(({ label, value }) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd className="stat-value">{value}</dd>
-          </div>
-        ))}
-      </dl>
+      <strong className="stat-value">{value}</strong>
       <p>{note}</p>
     </article>
   );

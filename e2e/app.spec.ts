@@ -516,8 +516,8 @@ test('renders overview charts and the latest five mixed events on desktop and mo
 }) => {
   const day = (offset: number) =>
     new Date((now + 8 * 3600 - offset * 86400) * 1000).toISOString().slice(0, 10);
-  await fixture(page, {
-    repositories: [visualRepo],
+  const data = {
+    repositories: [visualRepo] as Dashboard['repositories'],
     history: Array.from({ length: 30 }, (_, i) => ({
       day: day(29 - i),
       total: 714 + i * 18 + Math.round(Math.sin(i / 4) * 35),
@@ -580,21 +580,21 @@ test('renders overview charts and the latest five mixed events on desktop and mo
       }),
     ),
     timelineTotal: 0,
-  });
+  };
+  await fixture(page, data);
   await page.goto('/');
   const stats = page.getByRole('region', { name: '监控统计' });
   await expect(stats.getByRole('article')).toHaveCount(6);
-  for (const [title, labels, values] of [
-    ['Stars', ['总数', '新增', '取消'], ['1,248', '28', '3']],
-    ['Issues', ['新增', '关闭'], ['6', '4']],
-    ['PRs', ['新增', '合并', '关闭'], ['5', '3', '1']],
-    ['近 30 天新增 Fork', ['新增'], ['8']],
-    ['近 30 天事件', ['总数'], ['73']],
-    ['已连接项目', ['已连接 / 全部'], ['1 / 1']],
+  for (const [title, value] of [
+    ['Stars(总数 / 新增 / 取消)', '1,248/28/3'],
+    ['Issues(新增 / 关闭)', '6/4'],
+    ['PRs(新增 / 合并 / 关闭)', '5/3/1'],
+    ['Forks(总数 / 新增)', '86/8'],
+    ['近 30 天事件', '73'],
+    ['已连接项目(已连接 / 全部)', '1/1'],
   ] as const) {
     const card = stats.getByRole('article', { name: title, exact: true });
-    await expect(card.locator('dt')).toHaveText([...labels]);
-    await expect(card.locator('dd')).toHaveText([...values]);
+    await expect(card.locator('.stat-value')).toHaveText(value);
   }
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
@@ -611,7 +611,7 @@ test('renders overview charts and the latest five mixed events on desktop and mo
     await expect
       .poll(() =>
         stats
-          .locator('dd')
+          .locator('.stat-value')
           .evaluateAll((values) =>
             values.every(
               (el) =>
@@ -630,8 +630,31 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/dashboard-mobile.png', fullPage: true });
   await page.getByLabel('统计范围').selectOption('7');
-  await expect(stats.getByRole('article', { name: '近 7 天新增 Fork', exact: true })).toBeVisible();
+  const forks = stats.getByRole('article', { name: 'Forks(总数 / 新增)', exact: true });
+  await expect(forks.locator('p')).toContainText('近 7 天');
   await expect(stats.getByRole('article', { name: '近 7 天事件', exact: true })).toBeVisible();
+
+  data.repositories.push(
+    { ...visualRepo, id: 'other', full_name: 'example/other', current_forks: 14 },
+    { ...visualRepo, id: 'zero', full_name: 'example/zero', current_forks: 0 },
+    {
+      ...visualRepo,
+      id: 'unknown',
+      full_name: 'example/unknown',
+      current_forks: null,
+      forks_reported_at: null,
+    },
+  );
+  await page.reload();
+  await expect(forks.locator('.stat-value')).toHaveText('100/8');
+  for (const [project, value] of [
+    ['visual', '86/8'],
+    ['zero', '0/8'],
+    ['unknown', '—/8'],
+  ]) {
+    await page.getByLabel('选择项目').selectOption(project);
+    await expect(forks.locator('.stat-value')).toHaveText(value);
+  }
 });
 
 test('guides a migrated project through first-time signing setup and lists the new event choices', async ({
