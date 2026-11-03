@@ -2889,6 +2889,9 @@ td small {
   gap: 12px;
   border-top: 1px solid #edf0f5;
 }
+.download-growth-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
 .download-bars {
   display: grid;
   gap: 6px;
@@ -3011,7 +3014,7 @@ td small {
   overflow-x: auto;
 }
 .download-growth .trend-svg {
-  min-width: 620px;
+  min-width: 0;
   height: auto;
   font-variant-numeric: tabular-nums;
 }
@@ -3029,4 +3032,12 @@ td small {
 }
 .download-growth .download-chart-detail {
   font-variant-numeric: tabular-nums;
+}
+@media (max-width: 600px) {
+  .download-growth .axis-label {
+    font-size: 14px;
+  }
+  .download-time-middle {
+    display: none;
+  }
 }

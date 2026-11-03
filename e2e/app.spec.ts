@@ -921,6 +921,7 @@ test('reads hourly Release snapshots and graphs exact download history while onl
   let collected = false;
   let collectionAt = now;
   let collectionError: string | null = null;
+  let flatAndDecreasing = false;
   let releaseLists = 0;
   let assetReads = 0;
   let downloadReads = 0;
@@ -951,11 +952,17 @@ test('reads hourly Release snapshots and graphs exact download history while onl
       !query.has('fromRelease') && query.get('days') === '90'
         ? []
         : !query.has('fromRelease') && query.get('days') === '7'
-          ? [{ observedAt: now, total: String(huge + 4n) }]
+          ? flatAndDecreasing
+            ? [
+                { observedAt: now, total: String(huge + 2n) },
+                { observedAt: now - 4 * 3600, total: String(huge + 4n) },
+                { observedAt: now - 3 * 3600, total: String(huge + 4n) },
+              ]
+            : [{ observedAt: now, total: String(huge + 4n) }]
           : [
+              { observedAt: now, total: String(huge + 4n) },
               { observedAt: now - 4 * 3600, total: String(huge) },
               { observedAt: now - 3 * 3600, total: String(huge + 1n) },
-              { observedAt: now, total: String(huge + 4n) },
             ];
     if (collectionAt > now) history.push({ observedAt: collectionAt, total: String(huge + 5n) });
     return route.fulfill({
@@ -1062,8 +1069,12 @@ test('reads hourly Release snapshots and graphs exact download history while onl
   await expect(summary.getByRole('button', { name: '重试', exact: true })).toHaveCount(0);
   await expect(summary.getByRole('button', { name: '读取下载量缓存' })).toHaveCount(0);
   await expect(summary).toContainText((huge + 4n).toLocaleString('zh-CN'));
-  const chart = summary.getByRole('img', { name: '总下载量增长图' });
+  const growth = summary.getByRole('figure', { name: '总下载量增长', exact: true });
+  const increments = summary.getByRole('figure', { name: '下载量增量', exact: true });
+  const chart = growth.getByRole('img', { name: '总下载量增长图' });
+  const bars = increments.getByRole('img', { name: '下载量增量图' });
   await expect(chart).toBeVisible();
+  await expect(bars).toBeVisible();
   const points = await chart.locator('circle').evaluateAll((nodes) =>
     nodes.map((node) => ({
       x: Number(node.getAttribute('cx')),
@@ -1079,9 +1090,37 @@ test('reads hourly Release snapshots and graphs exact download history while onl
     (huge + 1n).toLocaleString('zh-CN'),
     (huge + 4n).toLocaleString('zh-CN'),
   ]);
-  await summary.getByRole('slider', { name: '下载量采集时间' }).focus();
+  await expect(bars.locator('rect')).toHaveCount(2);
+  await expect(bars.locator('rect title')).toContainText(['较上次 +1 次下载', '较上次 +3 次下载']);
+  await increments.getByRole('slider', { name: '下载量增量采集时间' }).focus();
   await page.keyboard.press('Home');
-  await expect(summary.locator('.download-chart-detail')).toContainText(
+  await expect(increments.locator('.download-chart-detail')).toContainText('较上次 +1 次下载');
+  await page.keyboard.press('End');
+  await expect(increments.locator('.download-chart-detail')).toContainText('较上次 +3 次下载');
+  const positiveBars = await bars.locator('rect').evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      x: Number(node.getAttribute('x')),
+      y: Number(node.getAttribute('y')),
+      width: Number(node.getAttribute('width')),
+      height: Number(node.getAttribute('height')),
+    })),
+  );
+  expect(positiveBars[0].x + positiveBars[0].width / 2).toBeCloseTo(points[1].x);
+  expect(positiveBars[1].x + positiveBars[1].width / 2).toBeCloseTo(points[2].x);
+  expect(positiveBars[0].height).toBeGreaterThan(0);
+  expect(positiveBars[1].height / positiveBars[0].height).toBeCloseTo(3, 2);
+  expect(positiveBars[0].y + positiveBars[0].height).toBeCloseTo(
+    positiveBars[1].y + positiveBars[1].height,
+  );
+  const desktopGrowth = await growth.boundingBox();
+  const desktopIncrements = await increments.boundingBox();
+  expect(desktopIncrements).not.toBeNull();
+  expect(desktopGrowth).not.toBeNull();
+  expect(desktopIncrements!.x + desktopIncrements!.width).toBeLessThanOrEqual(desktopGrowth!.x);
+  expect(desktopIncrements!.y).toBeCloseTo(desktopGrowth!.y);
+  await growth.getByRole('slider', { name: '下载量采集时间' }).focus();
+  await page.keyboard.press('Home');
+  await expect(growth.locator('.download-chart-detail')).toContainText(
     huge.toLocaleString('zh-CN'),
   );
   await expect(summary).toContainText('采集于');
@@ -1093,16 +1132,54 @@ test('reads hourly Release snapshots and graphs exact download history while onl
     .poll(() => page.locator('.sidebar').evaluate((el) => el.getBoundingClientRect().right))
     .toBeLessThanOrEqual(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  const mobileGrowth = await growth.boundingBox();
+  const mobileIncrements = await increments.boundingBox();
+  expect(
+    await summary
+      .locator('.download-growth-scroll')
+      .evaluateAll((nodes) => nodes.every((node) => node.scrollWidth <= node.clientWidth)),
+  ).toBe(true);
+  expect(mobileIncrements).not.toBeNull();
+  expect(mobileGrowth).not.toBeNull();
+  expect(mobileIncrements!.y + mobileIncrements!.height).toBeLessThanOrEqual(mobileGrowth!.y);
+  expect(mobileIncrements!.x).toBeCloseTo(mobileGrowth!.x);
   await chart.scrollIntoViewIfNeeded();
   await page.screenshot({ path: 'test-results/download-growth-mobile.png', fullPage: true });
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.getByLabel('项目统计时间').selectOption('7');
   await page.getByRole('tab', { name: 'Release', exact: true }).click();
   await expect(chart.locator('circle')).toHaveCount(1);
-  await expect(summary).toContainText('已有 1 次采集');
+  await expect(increments).toContainText('需要至少两次采集');
+  await expect(increments.locator('rect')).toHaveCount(0);
+  flatAndDecreasing = true;
+  await page.getByLabel('项目统计时间').selectOption('30');
+  await page.getByLabel('项目统计时间').selectOption('7');
+  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(bars.locator('rect')).toHaveCount(2);
+  await expect(bars.locator('rect title').nth(0)).toContainText('较上次 0 次下载');
+  await expect(bars.locator('rect title').nth(1)).toContainText('较上次 -2 次下载');
+  const [zeroBar, negativeBar] = await bars.locator('rect').evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      x: Number(node.getAttribute('x')),
+      y: Number(node.getAttribute('y')),
+      width: Number(node.getAttribute('width')),
+      height: Number(node.getAttribute('height')),
+    })),
+  );
+  expect([zeroBar, negativeBar].every((bar) => Object.values(bar).every(Number.isFinite))).toBe(
+    true,
+  );
+  expect(zeroBar.height).toBeGreaterThan(0);
+  expect(zeroBar.height).toBeLessThan(negativeBar.height / 10);
+  expect(negativeBar.y).toBeCloseTo(zeroBar.y + zeroBar.height / 2);
+  expect(negativeBar.y + negativeBar.height).toBeGreaterThan(zeroBar.y + zeroBar.height);
+  await increments.screenshot({ path: 'test-results/download-delta-negative.png' });
+  flatAndDecreasing = false;
   await page.getByLabel('项目统计时间').selectOption('90');
   await page.getByRole('tab', { name: 'Release', exact: true }).click();
-  await expect(summary).toContainText('所选时间范围内暂无下载量记录');
+  await expect(increments).toContainText('所选时间范围内暂无下载量记录');
+  await expect(growth).toContainText('所选时间范围内暂无下载量记录');
+  await expect(increments.locator('rect')).toHaveCount(0);
   await expect(summary).toContainText((huge + 4n).toLocaleString('zh-CN'));
   await page.getByLabel('项目统计时间').selectOption('releases');
   await page.getByRole('tab', { name: 'Release', exact: true }).click();

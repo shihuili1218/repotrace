@@ -29,7 +29,8 @@ const downloadDate = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 });
 const downloadTime = (at: number) => downloadDate.format(new Date(at * 1000));
-const axisNumber = (value: bigint) => {
+const axisNumber = (value: bigint): string => {
+  if (value < 0n) return `−${axisNumber(-value)}`;
   const unit = value >= 100000000n ? 100000000n : value >= 10000n ? 10000n : 1n;
   if (unit === 1n) return value.toLocaleString('zh-CN');
   const decimal = ((value % unit) * 10n) / unit;
@@ -37,11 +38,128 @@ const axisNumber = (value: bigint) => {
 };
 
 export function DownloadGrowth({ history }: { history: DownloadSummary['history'] }) {
-  const [selected, setSelected] = useState<number | null>(null);
   const data = history
     .filter((p) => valueOf(p.total) !== null)
     .slice()
     .sort((a, b) => a.observedAt - b.observedAt);
+  return (
+    <div className="download-chart-grid download-growth-grid">
+      <DownloadDelta history={data} />
+      <DownloadTotal history={data} />
+    </div>
+  );
+}
+
+function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
+  const [selected, setSelected] = useState<number | null>(null);
+  const data = history.slice(1).map((p, i) => ({
+    observedAt: p.observedAt,
+    previousAt: history[i].observedAt,
+    change: BigInt(p.total) - BigInt(history[i].total),
+  }));
+  if (!data.length)
+    return (
+      <figure className="download-chart" aria-label="下载量增量">
+        <figcaption>
+          <h3>下载量增量</h3>
+        </figcaption>
+        <p className="small-empty">
+          {history.length
+            ? '需要至少两次采集，才能对比下载量增量。'
+            : '所选时间范围内暂无下载量记录，等待自动采集后查看。'}
+        </p>
+      </figure>
+    );
+  const min = data.reduce((n, p) => (p.change < n ? p.change : n), 0n);
+  const max = data.reduce((n, p) => (p.change > n ? p.change : n), 0n);
+  const span = max - min;
+  const ticks = [...new Set([min, min / 2n, 0n, max / 2n, max])];
+  const first = history[0].observedAt;
+  const duration = history[history.length - 1].observedAt - first;
+  const x = (at: number) => (duration ? 104 + ((at - first) / duration) * 348 : 278);
+  const y = (value: bigint) => (span ? 196 - Number(((value - min) * 164000n) / span) / 1000 : 114);
+  const width = Math.max(
+    1,
+    Math.min(24, ...data.map((p) => (x(p.observedAt) - x(p.previousAt)) * 0.7)),
+  );
+  const active = Math.min(selected ?? data.length - 1, data.length - 1);
+  const detail = (i: number) => {
+    const p = data[i];
+    return `${downloadTime(p.previousAt)} → ${downloadTime(p.observedAt)} · 较上次 ${p.change > 0n ? '+' : ''}${p.change.toLocaleString('zh-CN')} 次下载`;
+  };
+  return (
+    <figure className="download-chart download-growth" aria-label="下载量增量">
+      <figcaption>
+        <h3>下载量增量</h3>
+        <p>每次采集与上一次采集的差值 · 首次记录作为对比基准</p>
+      </figcaption>
+      <div className="download-growth-scroll">
+        <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="下载量增量图">
+          {ticks.map((tick) => (
+            <g key={String(tick)}>
+              <line
+                x1="104"
+                x2="452"
+                y1={y(tick)}
+                y2={y(tick)}
+                className="grid-line"
+                style={tick === 0n ? { strokeWidth: 2, strokeDasharray: 'none' } : undefined}
+              />
+              <text x="92" y={y(tick) + 5} textAnchor="end" className="axis-label">
+                {axisNumber(tick)}
+              </text>
+            </g>
+          ))}
+          {data.map((p, i) => (
+            <rect
+              key={p.observedAt}
+              x={x(p.observedAt) - width / 2}
+              y={p.change === 0n ? y(0n) - 1 : Math.min(y(0n), y(p.change))}
+              width={width}
+              height={p.change === 0n ? 2 : Math.abs(y(p.change) - y(0n))}
+              fill={p.change < 0n ? '#dc8282' : p.change > 0n ? '#38a686' : '#9ba4bd'}
+              opacity={i === active ? 1 : 0.65}
+            >
+              <title>{detail(i)}</title>
+            </rect>
+          ))}
+          <DownloadTimeAxis first={first} duration={duration} />
+        </svg>
+      </div>
+      <label className="download-growth-control">
+        <span>查看采集时间点</span>
+        <input
+          type="range"
+          aria-label="下载量增量采集时间"
+          min="0"
+          max={data.length - 1}
+          value={active}
+          onChange={(event) => setSelected(Number(event.target.value))}
+        />
+      </label>
+      <p className="download-chart-detail" aria-live="polite">
+        {detail(active)}
+      </p>
+    </figure>
+  );
+}
+
+function DownloadTimeAxis({ first, duration }: { first: number; duration: number }) {
+  return (duration ? [0, 0.5, 1] : [0.5]).map((fraction) => (
+    <text
+      key={fraction}
+      x={104 + fraction * 348}
+      y="231"
+      textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'}
+      className={`axis-label${duration && fraction === 0.5 ? ' download-time-middle' : ''}`}
+    >
+      {downloadTime(first + duration * fraction)}
+    </text>
+  ));
+}
+
+function DownloadTotal({ history: data }: { history: DownloadSummary['history'] }) {
+  const [selected, setSelected] = useState<number | null>(null);
   if (!data.length)
     return (
       <figure className="download-chart" aria-label="总下载量增长">
@@ -60,7 +178,7 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
   const first = data[0].observedAt;
   const duration = data[data.length - 1].observedAt - first;
   const point = (i: number) => [
-    duration ? 104 + ((data[i].observedAt - first) / duration) * 648 : 428,
+    duration ? 104 + ((data[i].observedAt - first) / duration) * 348 : 278,
     span ? 196 - Number(((values[i] - min) * 164000n) / span) / 1000 : 114,
   ];
   const active = Math.min(selected ?? data.length - 1, data.length - 1);
@@ -75,12 +193,12 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
         </p>
       </figcaption>
       <div className="download-growth-scroll">
-        <svg className="trend-svg" viewBox="0 0 800 250" role="img" aria-label="总下载量增长图">
+        <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="总下载量增长图">
           {ticks.map((tick) => {
             const y = span ? 196 - Number((tick * 164000n) / span) / 1000 : 114;
             return (
               <g key={String(tick)}>
-                <line x1="104" x2="752" y1={y} y2={y} className="grid-line" />
+                <line x1="104" x2="452" y1={y} y2={y} className="grid-line" />
                 <text x="92" y={y + 5} textAnchor="end" className="axis-label">
                   {offsetAxis ? `+${axisNumber(tick)}` : axisNumber(min + tick)}
                 </text>
@@ -110,17 +228,7 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
               </title>
             </circle>
           ))}
-          {(duration ? [0, 0.5, 1] : [0.5]).map((fraction) => (
-            <text
-              key={fraction}
-              x={104 + fraction * 648}
-              y="231"
-              textAnchor="middle"
-              className="axis-label"
-            >
-              {downloadTime(first + duration * fraction)}
-            </text>
-          ))}
+          <DownloadTimeAxis first={first} duration={duration} />
         </svg>
       </div>
       {data.length > 1 ? (
