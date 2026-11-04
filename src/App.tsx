@@ -392,6 +392,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const total = known.reduce((n, r) => n + r.current_total!, 0);
   const knownForks = shown.filter((r) => r.current_forks !== null);
   const forkTotal = knownForks.reduce((n, r) => n + r.current_forks!, 0);
+  const knownOpenItems = shown.filter((r) => r.current_open_items != null);
+  const openItemsTotal = knownOpenItems.reduce((n, r) => n + r.current_open_items!, 0);
   const pending = repositories.filter((r) => !r.webhookConfigured || !r.last_received_at).length;
   const navs = [
     { view: 'overview' as const, label: '项目总览', icon: <LayoutDashboard size={19} /> },
@@ -636,10 +638,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                       tone="purple"
                     />
                     <Stat
-                      title="Issues(新增 / 关闭)"
-                      value={`${number(data.metrics.issuesOpened)}/${number(data.metrics.issuesClosed)}`}
+                      title="Issues(未关闭 / 新增 / 关闭)"
+                      value={`${knownOpenItems.length ? number(openItemsTotal) : '—'}/${number(data.metrics.issuesOpened)}/${number(data.metrics.issuesClosed)}`}
                       icon={<MessageCircle size={20} />}
-                      note={`近 ${days} 天新增 / 关闭的 Issue`}
+                      note={`未关闭含 PR · ${knownOpenItems.length} / ${shown.length} 个项目有总数 · 新增 / 关闭为近 ${days} 天 Issue`}
                       tone="green"
                     />
                     <Stat

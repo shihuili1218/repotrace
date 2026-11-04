@@ -192,6 +192,11 @@ export const migrations = [
     `UPDATE release_refresh SET next_at=(updated_at+3600)*1000
       WHERE resource='downloads' AND updated_at IS NOT NULL AND error IS NULL`,
   ],
+  [
+    // GitHub's repository.open_issues_count includes open pull requests.
+    `ALTER TABLE webhook_connections ADD COLUMN current_open_items INTEGER`,
+    `ALTER TABLE webhook_connections ADD COLUMN open_items_reported_at INTEGER`,
+  ],
 ];
 
 const initialized = new WeakMap<D1Database, Promise<void>>();

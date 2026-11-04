@@ -15,6 +15,9 @@ export interface RepoSummary {
   total_reported_at: number | null;
   current_forks: number | null;
   forks_reported_at: number | null;
+  /** GitHub's reported open Issue + PR total. */
+  current_open_items: number | null;
+  open_items_reported_at: number | null;
   event_count: number;
   receivedEvents: string[];
 }

@@ -470,6 +470,8 @@ const visualRepo = {
   total_reported_at: now,
   current_forks: 86,
   forks_reported_at: now,
+  current_open_items: 15,
+  open_items_reported_at: now,
   event_count: 360,
   receivedEvents: ['star', 'fork', 'issues', 'pull_request', 'release'],
 };
@@ -587,7 +589,7 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   await expect(stats.getByRole('article')).toHaveCount(6);
   for (const [title, value] of [
     ['Stars(总数 / 新增 / 取消)', '1,248/28/3'],
-    ['Issues(新增 / 关闭)', '6/4'],
+    ['Issues(未关闭 / 新增 / 关闭)', '15/6/4'],
     ['PRs(新增 / 合并 / 关闭)', '5/3/1'],
     ['Forks(总数 / 新增)', '86/8'],
     ['近 30 天事件', '73'],
@@ -596,6 +598,12 @@ test('renders overview charts and the latest five mixed events on desktop and mo
     const card = stats.getByRole('article', { name: title, exact: true });
     await expect(card.locator('.stat-value')).toHaveText(value);
   }
+  const issues = stats.getByRole('article', { name: 'Issues(未关闭 / 新增 / 关闭)', exact: true });
+  await expect(issues.locator('p')).toContainText('1 / 1 个项目有总数');
+  await expect(issues.locator('p')).toContainText('未关闭含 PR');
+  await expect(issues.locator('p')).toContainText('近 30 天');
+  await expect(issues.locator('p')).toContainText('新增');
+  await expect(issues.locator('p')).toContainText('关闭');
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
   const recent = page.getByRole('region', { name: '最近项目动态' });
@@ -632,28 +640,60 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   await page.getByLabel('统计范围').selectOption('7');
   const forks = stats.getByRole('article', { name: 'Forks(总数 / 新增)', exact: true });
   await expect(forks.locator('p')).toContainText('近 7 天');
+  await expect(issues.locator('.stat-value')).toHaveText('15/6/4');
+  await expect(issues.locator('p')).toContainText('近 7 天');
   await expect(stats.getByRole('article', { name: '近 7 天事件', exact: true })).toBeVisible();
 
+  const legacyRepo = {
+    ...visualRepo,
+    id: 'legacy',
+    full_name: 'example/legacy',
+    current_forks: null,
+    forks_reported_at: null,
+  };
+  Reflect.deleteProperty(legacyRepo, 'current_open_items');
+  Reflect.deleteProperty(legacyRepo, 'open_items_reported_at');
   data.repositories.push(
-    { ...visualRepo, id: 'other', full_name: 'example/other', current_forks: 14 },
-    { ...visualRepo, id: 'zero', full_name: 'example/zero', current_forks: 0 },
+    {
+      ...visualRepo,
+      id: 'other',
+      full_name: 'example/other',
+      current_forks: 14,
+      current_open_items: 5,
+    },
+    {
+      ...visualRepo,
+      id: 'zero',
+      full_name: 'example/zero',
+      current_forks: 0,
+      current_open_items: 0,
+    },
     {
       ...visualRepo,
       id: 'unknown',
       full_name: 'example/unknown',
       current_forks: null,
       forks_reported_at: null,
+      current_open_items: null,
+      open_items_reported_at: null,
     },
+    legacyRepo,
   );
   await page.reload();
   await expect(forks.locator('.stat-value')).toHaveText('100/8');
-  for (const [project, value] of [
-    ['visual', '86/8'],
-    ['zero', '0/8'],
-    ['unknown', '—/8'],
+  await expect(issues.locator('.stat-value')).toHaveText('20/6/4');
+  await expect(issues.locator('p')).toContainText('3 / 5 个项目有总数');
+  for (const [project, forksValue, issuesValue, coverage] of [
+    ['visual', '86/8', '15/6/4', '1 / 1'],
+    ['other', '14/8', '5/6/4', '1 / 1'],
+    ['zero', '0/8', '0/6/4', '1 / 1'],
+    ['unknown', '—/8', '—/6/4', '0 / 1'],
+    ['legacy', '—/8', '—/6/4', '0 / 1'],
   ]) {
     await page.getByLabel('选择项目').selectOption(project);
-    await expect(forks.locator('.stat-value')).toHaveText(value);
+    await expect(forks.locator('.stat-value')).toHaveText(forksValue);
+    await expect(issues.locator('.stat-value')).toHaveText(issuesValue);
+    await expect(issues.locator('p')).toContainText(`${coverage} 个项目有总数`);
   }
 });
 

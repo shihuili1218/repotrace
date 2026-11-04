@@ -272,6 +272,8 @@ describe('project setup without outgoing GitHub requests', () => {
     expect(data.repositories[0]).toMatchObject({
       github_id: null,
       current_total: null,
+      current_open_items: null,
+      open_items_reported_at: null,
       webhookConfigured: true,
       last_received_at: null,
     });
@@ -813,6 +815,89 @@ describe('fork growth', () => {
 });
 
 describe('issues and pull requests', () => {
+  it('stores the reported open Issue and PR total separately from observed issue metrics', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const outbound = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('No outgoing request allowed'));
+    const at = nowSeconds() - 10;
+    const repository = { id: 100, full_name: 'owner/repo', open_issues_count: 23 };
+    expect(
+      (
+        await signed(
+          config,
+          'issues',
+          { action: 'opened', issue: item(), repository },
+          crypto.randomUUID(),
+          at,
+        )
+      ).status,
+    ).toBe(200);
+    const data = await dashboard(session);
+    expect(data.repositories[0]).toMatchObject({
+      current_open_items: 23,
+      open_items_reported_at: at,
+    });
+    expect(data.metrics).toMatchObject({ openIssues: 1, openPRs: 0, issuesOpened: 1 });
+
+    await signed(config, 'ping', {}, crypto.randomUUID(), at + 1);
+    expect(
+      (
+        await signed(config, 'ping', {
+          repository: { ...repository, open_issues_count: -1 },
+        })
+      ).status,
+    ).toBe(400);
+    expect((await dashboard(session)).repositories[0]).toMatchObject({
+      current_open_items: 23,
+      open_items_reported_at: at,
+    });
+
+    await signed(
+      config,
+      'ping',
+      { repository: { ...repository, open_issues_count: 0 } },
+      crypto.randomUUID(),
+      at + 2,
+    );
+    expect((await dashboard(session)).repositories[0]).toMatchObject({
+      current_open_items: 0,
+      open_items_reported_at: at + 2,
+    });
+    expect(outbound).not.toHaveBeenCalled();
+  });
+  it('preserves the latest open item total across duplicate, older, unsupported and paused deliveries', async () => {
+    const session = await setup();
+    const config = await add(session);
+    const at = nowSeconds() - 20;
+    const delivery = crypto.randomUUID();
+    const repository = { id: 100, full_name: 'owner/repo', open_issues_count: 7 };
+    await signed(config, 'ping', { repository }, delivery, at);
+    await signed(
+      config,
+      'ping',
+      { repository: { ...repository, open_issues_count: 9 } },
+      crypto.randomUUID(),
+      at + 2,
+    );
+    await signed(config, 'ping', { repository }, delivery, at + 3);
+    await signed(
+      config,
+      'ping',
+      { repository: { ...repository, open_issues_count: 8 } },
+      crypto.randomUUID(),
+      at + 1,
+    );
+    await signed(config, 'push', { repository });
+    await request(`/repositories/${config.id}`, 'PATCH', { enabled: false }, session);
+    const paused = await signed(config, 'ping', { repository });
+    expect(await paused.json()).toMatchObject({ ok: true, paused: true });
+    expect((await dashboard(session)).repositories[0]).toMatchObject({
+      current_open_items: 9,
+      open_items_reported_at: at + 2,
+    });
+  });
   it('merges a PR first observed through an issue comment with a different GitHub ID', async () => {
     const session = await setup();
     const config = await add(session);
@@ -1168,7 +1253,15 @@ describe('release activity', () => {
   it('records release events only as deduplicated activity without changing catalog, assets or totals', async () => {
     const session = await setup();
     const config = await add(session);
-    await signed(config, 'ping');
+    await signed(config, 'ping', {
+      repository: {
+        id: 100,
+        full_name: 'owner/repo',
+        stargazers_count: 10,
+        forks_count: 2,
+        open_issues_count: 7,
+      },
+    });
     const delivery = crypto.randomUUID();
     const source = release(2001, { assets: [{ invalid: 'ignored for activity' }] });
     await signed(
@@ -1177,7 +1270,13 @@ describe('release activity', () => {
       {
         action: 'published',
         release: source,
-        repository: { id: 100, full_name: 'owner/repo', stargazers_count: 999, forks_count: 999 },
+        repository: {
+          id: 100,
+          full_name: 'owner/repo',
+          stargazers_count: 999,
+          forks_count: 999,
+          open_issues_count: 999,
+        },
       },
       delivery,
     );
@@ -1187,6 +1286,7 @@ describe('release activity', () => {
     expect(data.timeline.filter((e) => e.category === 'release')).toHaveLength(2);
     expect(data.repositories[0].current_total).toBe(10);
     expect(data.repositories[0].current_forks).toBe(2);
+    expect(data.repositories[0].current_open_items).toBe(7);
     expect(data.releaseChoices).toEqual([]);
     expect(data.releaseMarkers).toEqual([]);
     expect(await scalar('SELECT COUNT(*) AS count FROM releases')).toBe(0);
@@ -1261,6 +1361,11 @@ it('upgrades the webhook/nightly version preserving encrypted secrets, raw event
   expect(
     (await db.prepare('SELECT current_forks FROM webhook_connections').first())?.current_forks,
   ).toBeNull();
+  expect(
+    await db
+      .prepare('SELECT current_open_items,open_items_reported_at FROM webhook_connections')
+      .first(),
+  ).toEqual({ current_open_items: null, open_items_reported_at: null });
 });
 
 it('never treats an approval of an old commit as a current PR approval', async () => {

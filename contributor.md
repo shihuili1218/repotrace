@@ -62,7 +62,9 @@ Webhook 接收入口独立于管理员会话。原始正文限制为 1 MiB，先
 
 Fork 按仓库 ID 去重，计数采用首次收到时间；GitHub 没有完整的 Fork 删除事件。Issue 与 PR 按项目、类型和仓库内编号保存并关联事件，避免 PR 评论携带的 Issue ID 与 PR / 评审事件的 PR ID 被当成两条记录；`github_id` 仅保留首次观测的来源 ID。更新状态时比较上游 `updated_at` 和投递顺序，防止较旧报文覆盖新状态。首条回复排除作者自身和机器人，耗时基于上游创建与回复时间。PR 由 `merged` / `merged_at` 判断合并，普通关闭不计入合并数，PR 下的普通评论归属 PR。新代码到达会清除旧评审显示。
 
-Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和删除动态；不写版本目录、产物、下载量或仓库 Star / Fork 总量。公开版本目录由自动采集更新，图表版本节点来自目录缓存中的发布时间。
+总览 Issues 的未关闭数取自 Webhook 的 `repository.open_issues_count`，包含未关闭 Issue 和 PR，不等于纯 Issue 数；新增 / 关闭仍仅统计所选期间的 Issue 事件。合计与更新时间缓存于 `webhook_connections`，缺失字段保留旧值，尚未收到时显示未知，不通过额外 API 查询或本地部分 PR 列表推算。
+
+Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和删除动态；不写版本目录、产物、下载量或仓库 Star / Fork / 未关闭 Issue 与 PR 总量。公开版本目录由自动采集更新，图表版本节点来自目录缓存中的发布时间。
 
 暂停期间仍验证并确认投递，但不记录业务事件或更新总量，定时采集也跳过该项目；已确认投递不会在恢复后因重投而补入。事件列表、状态和指标只覆盖已收到的事件，不补齐历史积压。公开 Release 目录和产物下载量是独立的数据来源，匿名读取 GitHub 官方接口，不请求 Star 用户名单。事件时间、接收时间和上游更新时间各自用于对应口径，不假定所有 GitHub 事件都带完整发生时间。
 
@@ -75,6 +77,8 @@ Release Webhook 只写入 `project_events`，记录发版、编辑、撤回和�
 迁移版本 9 将 `work_items` 的主键改为项目、类型、编号，保留所有已有状态与事件。旧版本因 PR ID / Issue ID 冲突返回 500 的投递，可在升级后通过 GitHub Recent Deliveries 重新投递。
 
 迁移版本 10 为 `release_refresh` 增加毫秒单位的 `next_at`，保存每项目的下一次采集时间；保留已有缓存、下载历史与 `scheduled_hour` 兼容字段。
+
+迁移版本 11 增加 `current_open_items` 和 `open_items_reported_at`，保存 Webhook 上报的未关闭 Issue 与 PR 合计；已有项目初始为未知，收到新的有效投递后更新，不补造历史事件。
 
 新增指标时在 `shared/monitors.ts` 注册事件，为 `worker/events.ts` 添加独立处理逻辑，并在 `worker/db.ts` 追加迁移。复用签名验证、仓库身份和事务去重；不要为未支持的事件建立假统计。
 

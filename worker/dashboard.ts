@@ -75,7 +75,7 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     throw new AppError(400, '筛选参数无效。');
   const repositories = await db
     .prepare(
-      `SELECT p.*,c.first_received_at,c.last_received_at,c.last_star_at,c.current_total,c.total_reported_at,c.current_forks,c.forks_reported_at,
+      `SELECT p.*,c.first_received_at,c.last_received_at,c.last_star_at,c.current_total,c.total_reported_at,c.current_forks,c.forks_reported_at,c.current_open_items,c.open_items_reported_at,
     c.project_id IS NOT NULL AS webhookConfigured,
     (SELECT COUNT(*) FROM star_events WHERE project_id=p.id)+(SELECT COUNT(*) FROM project_events WHERE project_id=p.id) AS event_count,
     (SELECT json_group_array(event_name) FROM (SELECT DISTINCT event_name FROM webhook_deliveries WHERE project_id=p.id AND event_name<>'ping' AND recorded=1)) AS received_events

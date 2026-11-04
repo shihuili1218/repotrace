@@ -76,6 +76,7 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
   const name = parseRepository(repo.full_name);
   const stars = event === 'release' ? null : count(repo.stargazers_count);
   const forks = event === 'release' ? null : count(repo.forks_count);
+  const openItems = event === 'release' ? null : count(repo.open_issues_count);
   const at = nowSeconds();
   const normalized = normalizeEvent(event!, data, name, at);
   const project = await env.DB.prepare(
@@ -145,7 +146,9 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
       current_total=CASE WHEN ? IS NOT NULL AND ?>=COALESCE(total_reported_at,0) THEN ? ELSE current_total END,
       total_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(total_reported_at,?),?) ELSE total_reported_at END,
       current_forks=CASE WHEN ? IS NOT NULL AND ?>=COALESCE(forks_reported_at,0) THEN ? ELSE current_forks END,
-      forks_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(forks_reported_at,?),?) ELSE forks_reported_at END
+      forks_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(forks_reported_at,?),?) ELSE forks_reported_at END,
+      current_open_items=CASE WHEN ? IS NOT NULL AND ?>=COALESCE(open_items_reported_at,0) THEN ? ELSE current_open_items END,
+      open_items_reported_at=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(open_items_reported_at,?),?) ELSE open_items_reported_at END
       WHERE project_id=? AND ${fresh}
       AND EXISTS(SELECT 1 FROM webhook_deliveries WHERE project_id=? AND delivery_id=? AND recorded=1)`,
     ).bind(
@@ -162,6 +165,12 @@ export async function receiveWebhook(request: Request, env: Env, id: string) {
       at,
       forks,
       forks,
+      at,
+      at,
+      openItems,
+      at,
+      openItems,
+      openItems,
       at,
       at,
       id,
