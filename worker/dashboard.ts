@@ -11,11 +11,11 @@ import { statisticsRange } from './range';
 import { monitorMetrics } from './monitoring';
 import { AppError, nowSeconds } from './types';
 
+// Bind range values directly: nested parameter CTEs exceed production D1's subquery depth limit.
 const historySQL = `WITH RECURSIVE
-  params AS (SELECT ? AS project,? AS from_day,? AS to_day,? AS since,? AS until,? AS step),
-  days(day) AS (SELECT from_day FROM params UNION ALL SELECT date(day,'+'||(SELECT step FROM params)||' days') FROM days WHERE date(day,'+'||(SELECT step FROM params)||' days')<=(SELECT to_day FROM params)),
-  buckets AS (SELECT day,MAX(unixepoch(day,'-8 hours'),(SELECT since FROM params)) AS start,MIN(unixepoch(day,'+'||(SELECT step FROM params)||' days','-8 hours'),(SELECT until FROM params)) AS end FROM days),
-  chosen AS (SELECT * FROM projects WHERE (SELECT project FROM params) IS NULL OR id=(SELECT project FROM params)),
+  days(day) AS (SELECT ?2 UNION ALL SELECT date(day,'+'||?6||' days') FROM days WHERE date(day,'+'||?6||' days')<=?3),
+  buckets AS (SELECT day,MAX(unixepoch(day,'-8 hours'),?4) AS start,MIN(unixepoch(day,'+'||?6||' days','-8 hours'),?5) AS end FROM days),
+  chosen AS (SELECT * FROM projects WHERE ?1 IS NULL OR id=?1),
   ranked AS (
     SELECT e.*,b.day,
       ROW_NUMBER() OVER(PARTITION BY e.project_id,e.user_id,b.day ORDER BY received_at,delivery_seq) AS first_rank,
@@ -29,7 +29,7 @@ const historySQL = `WITH RECURSIVE
   ),
   old_changes AS (
     SELECT b.day,s.added,s.removed FROM summaries s JOIN buckets b ON s.period_end>=b.start AND s.period_end<b.end
-    WHERE source='legacy' AND kind='daily' AND project_id IN(SELECT id FROM chosen) AND s.period_start>=(SELECT since FROM params)
+    WHERE source='legacy' AND kind='daily' AND project_id IN(SELECT id FROM chosen) AND s.period_start>=?4
       AND NOT EXISTS(SELECT 1 FROM star_events e WHERE e.project_id=s.project_id AND e.received_at>=b.start AND e.received_at<b.end)
   ),
   daily_changes AS (SELECT day,SUM(added) AS added,SUM(removed) AS removed FROM(SELECT * FROM net UNION ALL SELECT * FROM old_changes) GROUP BY day),

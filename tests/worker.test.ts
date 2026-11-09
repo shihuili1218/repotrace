@@ -673,6 +673,35 @@ describe('live webhook analytics', () => {
     expect(data.repositories[0].receivedEvents).toContain('issues');
     expect(data.summaries).toHaveLength(0);
   });
+  it.each([7, 30, 90])('scopes history to the selected project over %i days', async (days) => {
+    const session = await setup();
+    const config = await add(session);
+    const other = await add(session, 'another/project');
+    const start = localMidnight(nowSeconds()) - (days - 1) * 86400;
+    await signed(config, 'star', {}, crypto.randomUUID(), start - 1);
+    await signed(config, 'star', {}, crypto.randomUUID(), start);
+    await signed(
+      other,
+      'star',
+      {
+        repository: {
+          id: 101,
+          full_name: 'another/project',
+          stargazers_count: 100,
+          forks_count: 20,
+        },
+      },
+      crypto.randomUUID(),
+      start,
+    );
+    const scoped = await dashboard(session, `?repo=${config.id}&days=${days}`);
+    const all = await dashboard(session, `?days=${days}`);
+    expect(scoped.history).toHaveLength(days);
+    expect(scoped.history[0]).toMatchObject({ day: localDay(start), added: 1, removed: 0 });
+    expect(scoped.history.slice(1).every((row) => row.added === 0 && row.removed === 0)).toBe(true);
+    expect(scoped.history.every((row) => row.total === 10 && row.fork_total === 2)).toBe(true);
+    expect(all.history[0]).toMatchObject({ added: 2, total: 110, fork_total: 22 });
+  });
   it('paginates and filters the unified activity feed and star list', async () => {
     const session = await setup();
     const config = await add(session);
