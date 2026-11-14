@@ -555,9 +555,11 @@ test('renders overview charts and the latest five mixed events on desktop and mo
       fork_new: i % 3,
       issue_opened: i % 4,
       issue_closed: i % 3,
+      issue_total: 20 + i,
       pr_opened: i % 2,
       pr_merged: i % 3,
       pr_closed: i % 4 === 0 ? 1 : 0,
+      pr_total: 12 + i,
     })),
     summaries: [],
     changes: [

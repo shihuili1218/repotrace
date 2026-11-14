@@ -197,6 +197,214 @@ export function ActivityTrendChart({ history }: { history: Dashboard['history'] 
   );
 }
 
+export interface CountTrendPoint {
+  day: string;
+  value: number | null;
+  detail?: string;
+}
+
+function countDomain(values: number[]) {
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const spread = maximum - minimum;
+  const padding = spread ? Math.max(1, Math.ceil(spread * 0.12)) : 2;
+  const rawStep = (spread + padding * 2) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(Math.max(1, rawStep)));
+  const step = Math.max(1, Math.ceil(rawStep / magnitude) * magnitude);
+  const lower = Math.max(0, Math.floor((minimum - padding) / step) * step);
+  const upper = Math.max(lower + step * 4, Math.ceil((maximum + padding) / step) * step);
+  const ticks = Array.from(
+    { length: Math.round((upper - lower) / step) + 1 },
+    (_, i) => lower + step * i,
+  );
+  return { lower, upper, ticks };
+}
+
+export function CountTrendChart({
+  points,
+  seriesLabel,
+  ariaLabel,
+  markers = [],
+  bucketDays = 1,
+  emptyTitle = '尚无总量记录',
+  emptyDescription = '收到可用的总量记录后显示趋势',
+}: {
+  points: CountTrendPoint[];
+  seriesLabel: string;
+  ariaLabel: string;
+  markers?: ReleaseRecord[];
+  bucketDays?: number;
+  emptyTitle?: string;
+  emptyDescription?: string;
+}) {
+  const chartId = useId();
+  const data = [...points].sort((a, b) => a.day.localeCompare(b.day));
+  const known = data.filter(
+    (point): point is CountTrendPoint & { value: number } =>
+      point.value !== null && Number.isFinite(point.value) && point.value >= 0,
+  );
+  if (!known.length)
+    return (
+      <div className="chart-empty">
+        <ChartNoAxesCombined size={32} />
+        <strong>{emptyTitle}</strong>
+        <span>{emptyDescription}</span>
+      </div>
+    );
+
+  const { lower, upper, ticks } = countDomain(known.map((point) => point.value));
+  const offsetAxis = new Set(ticks.map(axisNumber)).size < ticks.length;
+  const exact = (value: number) => value.toLocaleString('zh-CN');
+  const axisNote = offsetAxis
+    ? `纵轴从 ${exact(lower)} ${seriesLabel} 起 · +n 表示相对该基准的数量差`
+    : lower > 0
+      ? `纵轴局部范围 ${exact(lower)}–${exact(upper)} ${seriesLabel} · 未从 0 开始`
+      : `纵轴范围 0–${exact(upper)} ${seriesLabel}`;
+  const start = Date.parse(`${data[0].day}T00:00:00+08:00`);
+  const end = Date.parse(`${data[data.length - 1].day}T00:00:00+08:00`);
+  const x = (day: string) =>
+    end === start
+      ? 266
+      : 76 + ((Date.parse(`${day}T00:00:00+08:00`) - start) / (end - start)) * 380;
+  const y = (value: number) => 196 - ((value - lower) / (upper - lower)) * 164;
+  const segments: Array<Array<CountTrendPoint & { value: number }>> = [];
+  let segment: Array<CountTrendPoint & { value: number }> = [];
+  for (const point of data) {
+    if (point.value === null || !Number.isFinite(point.value) || point.value < 0) {
+      if (segment.length) segments.push(segment);
+      segment = [];
+    } else {
+      segment.push({ ...point, value: point.value });
+    }
+  }
+  if (segment.length) segments.push(segment);
+
+  return (
+    <div className="count-trend-chart">
+      <svg
+        className="trend-svg count-trend-svg"
+        viewBox="0 0 480 250"
+        role="img"
+        aria-label={ariaLabel}
+        aria-describedby={`${chartId}-axis-note`}
+      >
+        <defs>
+          <linearGradient id={`${chartId}-fill`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--chart-primary, #5fcfa4)" stopOpacity=".12" />
+            <stop offset="100%" stopColor="var(--chart-primary, #5fcfa4)" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {ticks.map((tick) => (
+          <g key={tick}>
+            <line x1="76" x2="456" y1={y(tick)} y2={y(tick)} className="grid-line" />
+            <text x="64" y={y(tick) + 5} textAnchor="end" className="axis-label">
+              {offsetAxis ? `+${axisNumber(tick - lower)}` : axisNumber(tick)}
+            </text>
+          </g>
+        ))}
+        {segments.map((part) => {
+          const line = part
+            .map((point, i) => `${i ? 'L' : 'M'}${x(point.day)},${y(point.value)}`)
+            .join(' ');
+          return (
+            <g key={part[0].day}>
+              <path
+                d={`${line} L${x(part[part.length - 1].day)},196 L${x(part[0].day)},196 Z`}
+                fill={`url(#${chartId}-fill)`}
+              />
+              <path
+                className="count-trend-line"
+                d={line}
+                fill="none"
+                stroke="var(--chart-primary, #5fcfa4)"
+                strokeWidth="2.5"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+            </g>
+          );
+        })}
+        {data.map((point) => {
+          const bucketStart = Date.parse(`${point.day}T00:00:00+08:00`) / 1000;
+          const bucketEnd = bucketStart + bucketDays * 86400;
+          const releases = markers.filter(
+            (release) =>
+              release.published_at !== null &&
+              release.published_at >= bucketStart &&
+              release.published_at < bucketEnd,
+          );
+          return releases.length ? (
+            <g key={`release-${point.day}`}>
+              <line
+                x1={x(point.day)}
+                x2={x(point.day)}
+                y1="25"
+                y2="196"
+                stroke="var(--chart-neutral, #81858d)"
+                strokeDasharray="3 5"
+              />
+              <path
+                d={`M${x(point.day) - 4},19 L${x(point.day) + 4},19 L${x(point.day) + 4},27 L${x(point.day) - 4},27 Z`}
+                fill="var(--surface, #1b1b1d)"
+                stroke="var(--chart-neutral, #81858d)"
+                strokeWidth="1.5"
+              >
+                <title>
+                  {releases
+                    .map(
+                      (release) =>
+                        `${release.full_name} ${release.tag_name}${release.prerelease ? '（预发布）' : ''}`,
+                    )
+                    .join('、')}
+                </title>
+              </path>
+            </g>
+          ) : null;
+        })}
+        {known.map((point, i) => (
+          <circle
+            key={point.day}
+            cx={x(point.day)}
+            cy={y(point.value)}
+            className="chart-point"
+            r={known.length < 10 || i === known.length - 1 ? 4 : 3}
+            opacity={known.length < 10 || i === 0 || i === known.length - 1 ? 1 : 0}
+            fill="var(--chart-primary, #5fcfa4)"
+            stroke="var(--surface, #1b1b1d)"
+            strokeWidth="1.5"
+          >
+            <title>
+              {bucketLabel(point.day, bucketDays)} · {exact(point.value)} {seriesLabel}
+              {point.detail ? ` · ${point.detail}` : ''}
+            </title>
+          </circle>
+        ))}
+        {[
+          ...new Set([
+            0,
+            Math.floor((data.length - 1) / 3),
+            Math.floor(((data.length - 1) * 2) / 3),
+            data.length - 1,
+          ]),
+        ].map((i) => (
+          <text
+            key={data[i].day}
+            x={x(data[i].day)}
+            y="229"
+            textAnchor={i === 0 ? 'start' : i === data.length - 1 ? 'end' : 'middle'}
+            className="axis-label"
+          >
+            {data[i].day.slice(5).replace('-', '/')}
+          </text>
+        ))}
+      </svg>
+      <p id={`${chartId}-axis-note`} className="count-axis-note">
+        {axisNote}
+      </p>
+    </div>
+  );
+}
+
 export function TrendChart({
   history,
   markers = [],
@@ -206,120 +414,20 @@ export function TrendChart({
   markers?: ReleaseRecord[];
   bucketDays?: number;
 }) {
-  const fillId = useId();
-  const data = history.filter((p) => p.repos > 0);
-  if (!data.length)
-    return (
-      <div className="chart-empty">
-        <ChartNoAxesCombined size={32} />
-        <strong>尚无 Star 总量记录</strong>
-        <span>收到包含仓库总量的 Webhook 后显示趋势</span>
-      </div>
-    );
-  const ceiling = countCeiling(Math.max(0, ...data.map((p) => p.total)));
-  const point = (i: number, total: number) => [
-    104 + (i / Math.max(1, data.length - 1)) * 656,
-    196 - (total / ceiling) * 164,
-  ];
-  const line = data.map((p, i) => `${i ? 'L' : 'M'}${point(i, p.total).join(',')}`).join(' ');
   return (
-    <svg
-      className="trend-svg"
-      viewBox="0 0 800 242"
-      role="img"
-      aria-label={bucketDays === 1 ? '每日 Star 总数趋势图' : `每 ${bucketDays} 天 Star 总数趋势图`}
-    >
-      <defs>
-        <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--chart-primary, #5fcfa4)" stopOpacity=".12" />
-          <stop offset="100%" stopColor="var(--chart-primary, #5fcfa4)" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      {[0, 1, 2, 3, 4].map((i) => (
-        <g key={i}>
-          <line x1="104" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
-          <text x="88" y={201 - i * 41} textAnchor="end" className="axis-label">
-            {axisNumber((ceiling / 4) * i)}
-          </text>
-        </g>
-      ))}
-      <path
-        d={`${line} L${point(data.length - 1, 0).join(',')} L104,196 Z`}
-        fill={`url(#${fillId})`}
-      />
-      <path
-        d={line}
-        fill="none"
-        stroke="var(--chart-primary, #5fcfa4)"
-        strokeWidth="3"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-      {data.map((p, i) => {
-        const bucketStart = Date.parse(`${p.day}T00:00:00+08:00`) / 1000;
-        const bucketEnd = bucketStart + bucketDays * 86400;
-        const releases = markers.filter(
-          (release) =>
-            release.published_at !== null &&
-            release.published_at >= bucketStart &&
-            release.published_at < bucketEnd,
-        );
-        return releases.length ? (
-          <g key={`release-${p.day}`}>
-            <line
-              x1={point(i, p.total)[0]}
-              x2={point(i, p.total)[0]}
-              y1="25"
-              y2="196"
-              stroke="var(--chart-neutral, #81858d)"
-              strokeDasharray="3 5"
-            />
-            <path
-              d={`M${point(i, p.total)[0] - 4},19 L${point(i, p.total)[0] + 4},19 L${point(i, p.total)[0] + 4},27 L${point(i, p.total)[0] - 4},27 Z`}
-              fill="var(--surface, #1b1b1d)"
-              stroke="var(--chart-neutral, #81858d)"
-              strokeWidth="1.5"
-            >
-              <title>
-                {releases
-                  .map((r) => `${r.full_name} ${r.tag_name}${r.prerelease ? '（预发布）' : ''}`)
-                  .join('、')}
-              </title>
-            </path>
-          </g>
-        ) : null;
-      })}
-      {data.map((p, i) => (
-        <circle
-          key={p.day}
-          cx={point(i, p.total)[0]}
-          cy={point(i, p.total)[1]}
-          className="chart-point"
-          r={data.length < 10 || i === data.length - 1 ? 4 : 3}
-          opacity={data.length < 10 || i === 0 || i === data.length - 1 ? 1 : 0}
-          fill="var(--chart-primary, #5fcfa4)"
-          stroke="var(--surface, #1b1b1d)"
-          strokeWidth="1.5"
-        >
-          <title>
-            {bucketLabel(p.day, bucketDays)} · {p.total.toLocaleString()} Stars · 已有 {p.repos}{' '}
-            个项目的上报数据
-          </title>
-        </circle>
-      ))}
-      {[
-        ...new Set([
-          0,
-          Math.floor((data.length - 1) / 3),
-          Math.floor(((data.length - 1) * 2) / 3),
-          data.length - 1,
-        ]),
-      ].map((i) => (
-        <text key={i} x={point(i, 0)[0]} y="229" textAnchor="middle" className="axis-label">
-          {data[i].day.slice(5).replace('-', '/')}
-        </text>
-      ))}
-    </svg>
+    <CountTrendChart
+      points={history.map((point) => ({
+        day: point.day,
+        value: point.repos > 0 ? point.total : null,
+        detail: `已有 ${point.repos} 个项目的上报数据`,
+      }))}
+      seriesLabel="Stars"
+      ariaLabel={bucketDays === 1 ? '每日 Star 总数趋势图' : `每 ${bucketDays} 天 Star 总数趋势图`}
+      markers={markers}
+      bucketDays={bucketDays}
+      emptyTitle="尚无 Star 总量记录"
+      emptyDescription="收到包含仓库总量的 Webhook 后显示趋势"
+    />
   );
 }
 
@@ -333,8 +441,8 @@ export function ChangesChart({
   bucketDays?: number;
 }) {
   const data = fullRange ? history : history.slice(-14);
-  const step = 320 / Math.max(1, data.length);
-  const barWidth = Math.min(10, step * 0.65);
+  const step = 380 / Math.max(1, data.length);
+  const barWidth = Math.min(14, step * 0.65);
   if (!data.length)
     return (
       <div className="chart-empty compact">
@@ -347,17 +455,17 @@ export function ChangesChart({
   return (
     <svg
       className="changes-svg"
-      viewBox="0 0 360 232"
+      viewBox="0 0 480 250"
       role="img"
       aria-label={`${fullRange ? '区间' : `近 ${14 * bucketDays} 天`} Star 新增与取消柱状图${bucketDays > 1 ? `（每 ${bucketDays} 天分组）` : ''}`}
     >
       {[42, 112, 182].map((y) => (
-        <line key={y} x1="20" x2="340" y1={y} y2={y} className="grid-line" />
+        <line key={y} x1="76" x2="456" y1={y} y2={y} className="grid-line" />
       ))}
       {data.map((p, i) => (
         <g key={p.day}>
           <rect
-            x={20 + (i + 0.5) * step - barWidth / 2}
+            x={76 + (i + 0.5) * step - barWidth / 2}
             y={112 - (p.added / max) * 66}
             width={barWidth}
             height={Math.max(p.added ? 2 : 0, (p.added / max) * 66)}
@@ -369,7 +477,7 @@ export function ChangesChart({
             </title>
           </rect>
           <rect
-            x={20 + (i + 0.5) * step - barWidth / 2}
+            x={76 + (i + 0.5) * step - barWidth / 2}
             y="115"
             width={barWidth}
             height={Math.max(p.removed ? 2 : 0, (p.removed / max) * 66)}
@@ -381,14 +489,14 @@ export function ChangesChart({
             </title>
           </rect>
           {(i === 0 || i === Math.floor((data.length - 1) / 2) || i === data.length - 1) && (
-            <text x={20 + (i + 0.5) * step} y="215" textAnchor="middle" className="axis-label">
+            <text x={76 + (i + 0.5) * step} y="229" textAnchor="middle" className="axis-label">
               {p.day.slice(5).replace('-', '/')}
             </text>
           )}
         </g>
       ))}
       {!data.some((p) => p.added || p.removed) && (
-        <text x="180" y="82" textAnchor="middle" className="axis-label">
+        <text x="266" y="82" textAnchor="middle" className="axis-label">
           所选时间内暂无分组净变化
         </text>
       )}
@@ -404,18 +512,18 @@ export function ForkChart({
   bucketDays?: number;
 }) {
   const ceiling = countCeiling(Math.max(0, ...history.map((p) => p.fork_new)));
-  const step = 656 / Math.max(1, history.length);
+  const step = 380 / Math.max(1, history.length);
   return (
     <svg
       className="trend-svg"
-      viewBox="0 0 800 242"
+      viewBox="0 0 480 250"
       role="img"
       aria-label={bucketDays === 1 ? '每日新增 Fork 趋势图' : `每 ${bucketDays} 天新增 Fork 趋势图`}
     >
       {[0, 1, 2, 3, 4].map((i) => (
         <g key={i}>
-          <line x1="104" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
-          <text x="88" y={201 - i * 41} textAnchor="end" className="axis-label">
+          <line x1="76" x2="456" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
+          <text x="64" y={201 - i * 41} textAnchor="end" className="axis-label">
             {axisNumber((ceiling * i) / 4)}
           </text>
         </g>
@@ -423,7 +531,7 @@ export function ForkChart({
       {history.map((p, i) => (
         <rect
           key={p.day}
-          x={104 + i * step + step * 0.18}
+          x={76 + i * step + step * 0.18}
           y={196 - (p.fork_new / ceiling) * 164}
           width={Math.max(1, step * 0.64)}
           height={p.fork_new ? (p.fork_new / ceiling) * 164 : 0}
@@ -440,7 +548,7 @@ export function ForkChart({
         .map((i) => (
           <text
             key={i}
-            x={104 + (i + 0.5) * step}
+            x={76 + (i + 0.5) * step}
             y="229"
             textAnchor="middle"
             className="axis-label"
@@ -449,7 +557,7 @@ export function ForkChart({
           </text>
         ))}
       {!history.some((p) => p.fork_new) && (
-        <text x="415" y="95" textAnchor="middle" className="axis-label">
+        <text x="266" y="95" textAnchor="middle" className="axis-label">
           所选时间内尚未记录到新增 Fork
         </text>
       )}
@@ -482,20 +590,20 @@ export function WorkChart({
           },
         ];
   const ceiling = countCeiling(Math.max(0, ...history.flatMap((p) => series.map((s) => p[s.key]))));
-  const step = 656 / Math.max(1, history.length);
+  const step = 380 / Math.max(1, history.length);
   const width = Math.min(14, (step * 0.75) / series.length);
   return (
     <>
       <svg
         className="trend-svg"
-        viewBox="0 0 800 242"
+        viewBox="0 0 480 250"
         role="img"
         aria-label={`${mode === 'issues' ? 'Issue' : 'PR'} ${bucketDays === 1 ? '每日' : `每 ${bucketDays} 天`}变化图`}
       >
         {[0, 1, 2, 3, 4].map((i) => (
           <g key={i}>
-            <line x1="104" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
-            <text x="88" y={201 - i * 41} textAnchor="end" className="axis-label">
+            <line x1="76" x2="456" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
+            <text x="64" y={201 - i * 41} textAnchor="end" className="axis-label">
               {axisNumber((ceiling * i) / 4)}
             </text>
           </g>
@@ -504,7 +612,7 @@ export function WorkChart({
           series.map((s, j) => (
             <rect
               key={`${p.day}:${s.key}`}
-              x={104 + (i + 0.5) * step + (j - series.length / 2) * width}
+              x={76 + (i + 0.5) * step + (j - series.length / 2) * width}
               y={196 - (p[s.key] / ceiling) * 164}
               width={Math.max(1, width - 1)}
               height={(p[s.key] / ceiling) * 164}
@@ -522,7 +630,7 @@ export function WorkChart({
           .map((i) => (
             <text
               key={i}
-              x={104 + (i + 0.5) * step}
+              x={76 + (i + 0.5) * step}
               y="229"
               textAnchor="middle"
               className="axis-label"
@@ -531,7 +639,7 @@ export function WorkChart({
             </text>
           ))}
         {!history.some((p) => series.some((s) => p[s.key])) && (
-          <text x="415" y="95" textAnchor="middle" className="axis-label">
+          <text x="266" y="95" textAnchor="middle" className="axis-label">
             所选时间内暂无对应变化
           </text>
         )}

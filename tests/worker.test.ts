@@ -1570,6 +1570,160 @@ it('computes Issue and PR daily changes immediately and counts direct PR closure
   });
 });
 
+it('retains recorded Issue and PR baselines across quiet days, state changes and project scopes', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const other = await add(session, 'another/project');
+  const since = localMidnight(nowSeconds()) - 6 * 86400;
+  const baseline = since - 86400;
+  const created = iso(since - 60 * 86400);
+  const firstIssue = item(1001, { created_at: created });
+  const firstPR = item(1002, { created_at: created, draft: true });
+  expect(
+    (
+      await signed(
+        config,
+        'issues',
+        { action: 'opened', issue: firstIssue },
+        crypto.randomUUID(),
+        baseline,
+      )
+    ).status,
+  ).toBe(200);
+  const delivery = crypto.randomUUID();
+  const prComment = {
+    action: 'created',
+    issue: { ...firstPR, id: 5002, pull_request: {} },
+    comment: { user: { id: 30, login: 'reviewer' }, created_at: iso(baseline) },
+  };
+  expect((await signed(config, 'issue_comment', prComment, delivery, baseline)).status).toBe(200);
+  expect((await signed(config, 'issue_comment', prComment, delivery, since)).status).toBe(200);
+  expect(
+    (
+      await signed(
+        config,
+        'issue_comment',
+        {
+          action: 'created',
+          issue: item(1003, { created_at: created }),
+          comment: { user: { id: 30, login: 'helper' }, created_at: iso(since + 2 * 86400) },
+        },
+        crypto.randomUUID(),
+        since + 2 * 86400,
+      )
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await signed(
+        config,
+        'pull_request',
+        {
+          action: 'closed',
+          pull_request: {
+            ...firstPR,
+            state: 'closed',
+            merged: true,
+            merged_at: iso(since + 3 * 86400),
+          },
+        },
+        crypto.randomUUID(),
+        since + 3 * 86400,
+      )
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await signed(
+        config,
+        'issues',
+        { action: 'deleted', issue: firstIssue },
+        crypto.randomUUID(),
+        since + 4 * 86400,
+      )
+    ).status,
+  ).toBe(200);
+  for (const event of ['issues', 'pull_request'])
+    expect(
+      (
+        await signed(
+          other,
+          event,
+          {
+            action: 'opened',
+            [event === 'issues' ? 'issue' : 'pull_request']: item(1001),
+            repository: { id: 101, full_name: 'another/project', open_issues_count: 999 },
+          },
+          crypto.randomUUID(),
+          baseline,
+        )
+      ).status,
+    ).toBe(200);
+
+  const upstream = vi.spyOn(globalThis, 'fetch');
+  const data = await dashboard(session, `?scope=project&repo=${config.id}&days=7`);
+  expect(data.history.map((point) => point.issue_total)).toEqual([1, 1, 2, 2, 2, 2, 2]);
+  expect(data.history.map((point) => point.pr_total)).toEqual([1, 1, 1, 1, 1, 1, 1]);
+  expect(data.history.at(-1)).toMatchObject({ issue_total: 2, pr_total: 1 });
+  expect(data.metrics.issuesOpened).toBe(0);
+  expect(
+    await scalar('SELECT COUNT(*) AS count FROM work_items WHERE project_id=?', config.id),
+  ).toBe(3);
+  const aggregate = await dashboard(session, '?days=7');
+  expect(aggregate.history.map((point) => point.issue_total)).toEqual([2, 2, 3, 3, 3, 3, 3]);
+  expect(aggregate.history.map((point) => point.pr_total)).toEqual([2, 2, 2, 2, 2, 2, 2]);
+  expect(upstream).not.toHaveBeenCalled();
+});
+
+it('clips recorded work totals to grouped Release bucket ends while retaining earlier observations', async () => {
+  const session = await setup();
+  const config = await add(session);
+  const start = localMidnight(nowSeconds()) - 180 * 86400 + 3600;
+  const end = localMidnight(nowSeconds()) - 3600;
+  const firstBucketEnd = localMidnight(start) + 2 * 86400;
+  await seedPublicRelease(config, { release: release(2001, { published_at: iso(start) }) });
+  await seedPublicRelease(config, { release: release(2002, { published_at: iso(end) }) });
+  for (const [kind, id, at] of [
+    ['issues', 1001, start - 1],
+    ['pull_request', 1001, start - 1],
+    ['issues', 1002, firstBucketEnd - 1],
+    ['pull_request', 1002, firstBucketEnd],
+    ['issues', 1003, end - 1],
+    ['pull_request', 1003, end],
+  ] as const)
+    expect(
+      (
+        await signed(
+          config,
+          kind,
+          {
+            action: 'opened',
+            [kind === 'issues' ? 'issue' : 'pull_request']: item(id),
+          },
+          crypto.randomUUID(),
+          at,
+        )
+      ).status,
+    ).toBe(200);
+  const upstream = vi.spyOn(globalThis, 'fetch');
+  const data = await dashboard(
+    session,
+    `?scope=project&repo=${config.id}&range=releases&fromRelease=2001&toRelease=2002`,
+  );
+  expect(data.range.bucketDays).toBe(2);
+  expect(data.history).toHaveLength(90);
+  expect(data.history[0]).toMatchObject({ issue_total: 2, pr_total: 1 });
+  expect(data.history[1]).toMatchObject({ issue_total: 2, pr_total: 2 });
+  expect(data.history.at(-1)).toMatchObject({ issue_total: 3, pr_total: 2 });
+  expect(data.metrics).toMatchObject({ issuesOpened: 2, prsOpened: 1 });
+  const empty = await add(session, 'empty/project');
+  const emptyData = await dashboard(session, `?scope=project&repo=${empty.id}&days=7`);
+  expect(emptyData.history.every((point) => point.issue_total === 0 && point.pr_total === 0)).toBe(
+    true,
+  );
+  expect(upstream).not.toHaveBeenCalled();
+});
+
 const artifact = (id = 1, count: number | null = 20) => ({
   id,
   name: `artifact-${id}.zip`,

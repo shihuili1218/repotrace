@@ -21,7 +21,7 @@ import type {
 } from '../shared/types';
 import { categoryLabels, type Category } from '../shared/monitors';
 import { api } from './api';
-import { ForkChart, WorkChart, TrendChart, ChangesChart } from './Charts';
+import { CountTrendChart, ForkChart, WorkChart, TrendChart, ChangesChart } from './Charts';
 import { ReleaseAssets } from './ReleaseAssets';
 import { ReleaseDownloads } from './ReleaseDownloads';
 
@@ -400,33 +400,93 @@ export function Monitoring({
           )}
         </div>
       )}
-      {type === 'forks' && (
-        <section className="panel module-chart">
+      {(type === 'forks' || type === 'issues' || type === 'pull_requests') && (
+        <section className="panel module-chart" aria-label="项目数量趋势">
           <div className="panel-header">
             <div>
-              <h2>Fork 新增趋势</h2>
+              <h2>{type === 'forks' ? 'Fork' : type === 'issues' ? 'Issue' : 'PR'} 趋势</h2>
               <p>
-                {grouping} · {period}
+                {period} · {grouping}
               </p>
             </div>
           </div>
-          <ForkChart history={history} bucketDays={dashboard.range.bucketDays} />
-        </section>
-      )}
-      {(type === 'issues' || type === 'pull_requests') && (
-        <section className="panel module-chart">
-          <div className="panel-header">
-            <div>
-              <h2>
-                {type === 'issues' ? 'Issue' : 'PR'}{' '}
-                {dashboard.range.bucketDays === 1
-                  ? '每日变化'
-                  : `每 ${dashboard.range.bucketDays} 天变化`}
-              </h2>
-              <p>{grouping} · 统计发生过对应操作的条目</p>
-            </div>
+          <div className="metric-chart-grid">
+            <figure className="metric-chart-slot">
+              <figcaption className="metric-chart-heading">
+                <h3>
+                  {type === 'forks'
+                    ? 'Fork 新增趋势'
+                    : `${type === 'issues' ? 'Issue' : 'PR'} ${dashboard.range.bucketDays === 1 ? '每日变化' : `每 ${dashboard.range.bucketDays} 天变化`}`}
+                </h3>
+                <p>
+                  {type === 'forks'
+                    ? '各分组内首次收到的 Fork 数量'
+                    : type === 'issues'
+                      ? '各分组内发生过新建或关闭的条目'
+                      : '各分组内发生过新建、关闭或合并的条目'}
+                </p>
+              </figcaption>
+              <div className="metric-chart-plot">
+                {type === 'forks' ? (
+                  <ForkChart history={history} bucketDays={dashboard.range.bucketDays} />
+                ) : (
+                  <WorkChart
+                    history={history}
+                    mode={type}
+                    bucketDays={dashboard.range.bucketDays}
+                  />
+                )}
+              </div>
+              <p className="metric-chart-footer">
+                {type === 'forks'
+                  ? '仅统计收到的新增 Fork，删除无法通过事件追踪'
+                  : '同一条目在同一分组内的同类操作只计一次'}
+              </p>
+            </figure>
+            <figure className="metric-chart-slot">
+              <figcaption className="metric-chart-heading">
+                <h3>
+                  {type === 'forks'
+                    ? 'Fork 总量趋势'
+                    : `累计已记录 ${type === 'issues' ? 'Issue' : 'PR'}`}
+                </h3>
+                <p>
+                  {type === 'forks'
+                    ? '各分组末最近上报的仓库 Fork 总量'
+                    : '截至各分组末首次收到的条目累计数'}
+                </p>
+              </figcaption>
+              <div className="metric-chart-plot">
+                <CountTrendChart
+                  points={history.map((point) => ({
+                    day: point.day,
+                    value:
+                      type === 'forks'
+                        ? point.fork_repos > 0
+                          ? point.fork_total
+                          : null
+                        : type === 'issues'
+                          ? (point.issue_total ?? null)
+                          : (point.pr_total ?? null),
+                  }))}
+                  seriesLabel={
+                    type === 'forks' ? 'Forks' : `已记录 ${type === 'issues' ? 'Issue' : 'PR'}`
+                  }
+                  ariaLabel={
+                    type === 'forks'
+                      ? 'Fork 总量趋势图'
+                      : `已记录 ${type === 'issues' ? 'Issue' : 'PR'} 总量趋势图`
+                  }
+                  bucketDays={dashboard.range.bucketDays}
+                />
+              </div>
+              <p className="metric-chart-footer">
+                {type === 'forks'
+                  ? '无新上报时沿用最近值；未知总量不按零显示'
+                  : '包含已关闭条目，仅覆盖已收到的数据，并非仓库完整总数'}
+              </p>
+            </figure>
           </div>
-          <WorkChart history={history} mode={type} bucketDays={dashboard.range.bucketDays} />
         </section>
       )}
       <section className="panel" aria-label={type === 'releases' ? 'Release 版本' : undefined}>

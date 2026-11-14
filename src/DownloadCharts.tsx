@@ -43,7 +43,7 @@ export function DownloadGrowth({ history }: { history: DownloadSummary['history'
     .slice()
     .sort((a, b) => a.observedAt - b.observedAt);
   return (
-    <div className="download-chart-grid download-growth-grid">
+    <div className="metric-chart-grid download-growth-grid">
       <DownloadDelta history={data} />
       <DownloadTotal history={data} />
     </div>
@@ -59,11 +59,12 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
   }));
   if (!data.length)
     return (
-      <figure className="download-chart" aria-label="下载量增量">
-        <figcaption>
+      <figure className="metric-chart-slot download-growth" aria-label="下载量增量">
+        <figcaption className="metric-chart-heading">
           <h3>下载量增量</h3>
+          <p>每次采集与上一次采集的差值 · 首次记录作为对比基准</p>
         </figcaption>
-        <p className="small-empty">
+        <p className="metric-chart-plot small-empty">
           {history.length
             ? '需要至少两次采集，才能对比下载量增量。'
             : '所选时间范围内暂无下载量记录，等待自动采集后查看。'}
@@ -88,12 +89,12 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
     return `${downloadTime(p.previousAt)} → ${downloadTime(p.observedAt)} · 较上次 ${p.change > 0n ? '+' : ''}${p.change.toLocaleString('zh-CN')} 次下载`;
   };
   return (
-    <figure className="download-chart download-growth" aria-label="下载量增量">
-      <figcaption>
+    <figure className="metric-chart-slot download-growth" aria-label="下载量增量">
+      <figcaption className="metric-chart-heading">
         <h3>下载量增量</h3>
         <p>每次采集与上一次采集的差值 · 首次记录作为对比基准</p>
       </figcaption>
-      <div className="download-growth-scroll">
+      <div className="metric-chart-plot download-growth-scroll">
         <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="下载量增量图">
           {ticks.map((tick) => (
             <g key={String(tick)}>
@@ -132,20 +133,22 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
           <DownloadTimeAxis first={first} duration={duration} />
         </svg>
       </div>
-      <label className="download-growth-control">
-        <span>查看采集时间点</span>
-        <input
-          type="range"
-          aria-label="下载量增量采集时间"
-          min="0"
-          max={data.length - 1}
-          value={active}
-          onChange={(event) => setSelected(Number(event.target.value))}
-        />
-      </label>
-      <p className="download-chart-detail" aria-live="polite">
-        {detail(active)}
-      </p>
+      <div className="metric-chart-footer">
+        <label className="download-growth-control">
+          <span>查看采集时间点</span>
+          <input
+            type="range"
+            aria-label="下载量增量采集时间"
+            min="0"
+            max={data.length - 1}
+            value={active}
+            onChange={(event) => setSelected(Number(event.target.value))}
+          />
+        </label>
+        <p className="download-chart-detail" aria-live="polite">
+          {detail(active)}
+        </p>
+      </div>
     </figure>
   );
 }
@@ -168,11 +171,14 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
   const [selected, setSelected] = useState<number | null>(null);
   if (!data.length)
     return (
-      <figure className="download-chart" aria-label="总下载量增长">
-        <figcaption>
+      <figure className="metric-chart-slot download-growth" aria-label="总下载量增长">
+        <figcaption className="metric-chart-heading">
           <h3>总下载量增长</h3>
+          <p>所选时间范围内的累计下载量</p>
         </figcaption>
-        <p className="small-empty">所选时间范围内暂无下载量记录，等待自动采集后查看。</p>
+        <p className="metric-chart-plot small-empty">
+          所选时间范围内暂无下载量记录，等待自动采集后查看。
+        </p>
       </figure>
     );
   const values = data.map((p) => BigInt(p.total));
@@ -190,15 +196,15 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
   const active = Math.min(selected ?? data.length - 1, data.length - 1);
   const line = data.map((_, i) => `${i ? 'L' : 'M'}${point(i).join(',')}`).join(' ');
   return (
-    <figure className="download-chart download-growth" aria-label="总下载量增长">
-      <figcaption>
+    <figure className="metric-chart-slot download-growth" aria-label="总下载量增长">
+      <figcaption className="metric-chart-heading">
         <h3>总下载量增长</h3>
         <p>
           所选时间范围内的累计下载量
           {offsetAxis ? ` · 纵轴显示相对 ${downloadNumber(String(min))} 次的增量` : ''}
         </p>
       </figcaption>
-      <div className="download-growth-scroll">
+      <div className="metric-chart-plot download-growth-scroll">
         <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="总下载量增长图">
           {ticks.map((tick) => {
             const y = span ? 196 - Number((tick * 164000n) / span) / 1000 : 114;
@@ -239,24 +245,26 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
           <DownloadTimeAxis first={first} duration={duration} />
         </svg>
       </div>
-      {data.length > 1 ? (
-        <label className="download-growth-control">
-          <span>查看采集时间点</span>
-          <input
-            type="range"
-            aria-label="下载量采集时间"
-            min="0"
-            max={data.length - 1}
-            value={active}
-            onChange={(event) => setSelected(Number(event.target.value))}
-          />
-        </label>
-      ) : (
-        <p className="field-note">已有 1 次采集，下一次采集后显示增长趋势。</p>
-      )}
-      <p className="download-chart-detail" aria-live="polite">
-        {downloadTime(data[active].observedAt)} · {downloadNumber(data[active].total)} 次下载
-      </p>
+      <div className="metric-chart-footer">
+        {data.length > 1 ? (
+          <label className="download-growth-control">
+            <span>查看采集时间点</span>
+            <input
+              type="range"
+              aria-label="下载量采集时间"
+              min="0"
+              max={data.length - 1}
+              value={active}
+              onChange={(event) => setSelected(Number(event.target.value))}
+            />
+          </label>
+        ) : (
+          <p className="field-note">已有 1 次采集，下一次采集后显示增长趋势。</p>
+        )}
+        <p className="download-chart-detail" aria-live="polite">
+          {downloadTime(data[active].observedAt)} · {downloadNumber(data[active].total)} 次下载
+        </p>
+      </div>
     </figure>
   );
 }

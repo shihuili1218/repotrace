@@ -42,6 +42,13 @@ const historySQL = `WITH RECURSIVE
       COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||object_id END) AS pr_closed
     FROM project_events e JOIN buckets b ON e.received_at>=b.start AND e.received_at<b.end WHERE project_id IN(SELECT id FROM chosen) GROUP BY b.day
   ),
+  recorded_work AS (
+    SELECT b.day,
+      COUNT(CASE WHEN w.kind='issue' THEN 1 END) AS issue_total,
+      COUNT(CASE WHEN w.kind='pull_request' THEN 1 END) AS pr_total
+    FROM buckets b LEFT JOIN work_items w ON w.first_seen_at<b.end AND w.project_id IN(SELECT id FROM chosen)
+    GROUP BY b.day
+  ),
   observed AS (
     SELECT b.day,p.id,COALESCE(
       (SELECT observed_total FROM webhook_deliveries w WHERE w.project_id=p.id AND recorded=1 AND observed_total>=0 AND received_at<b.end ORDER BY received_at DESC,seq DESC LIMIT 1),
@@ -54,8 +61,9 @@ const historySQL = `WITH RECURSIVE
     COALESCE(c.added,0) AS added,COALESCE(c.removed,0) AS removed,
     COALESCE(a.issue_opened,0) AS issue_opened,COALESCE(a.issue_closed,0) AS issue_closed,
     COALESCE(a.pr_opened,0) AS pr_opened,COALESCE(a.pr_merged,0) AS pr_merged,COALESCE(a.pr_closed,0) AS pr_closed,
+    COALESCE(w.issue_total,0) AS issue_total,COALESCE(w.pr_total,0) AS pr_total,
     (SELECT COUNT(*) FROM forks f WHERE project_id IN(SELECT id FROM chosen) AND received_at>=b.start AND received_at<b.end) AS fork_new
-  FROM buckets b LEFT JOIN observed o ON o.day=b.day LEFT JOIN daily_changes c ON c.day=b.day LEFT JOIN daily_activity a ON a.day=b.day GROUP BY b.day ORDER BY b.day`;
+  FROM buckets b LEFT JOIN observed o ON o.day=b.day LEFT JOIN daily_changes c ON c.day=b.day LEFT JOIN daily_activity a ON a.day=b.day LEFT JOIN recorded_work w ON w.day=b.day GROUP BY b.day ORDER BY b.day`;
 
 export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
   const project = url.searchParams.get('repo') || null;

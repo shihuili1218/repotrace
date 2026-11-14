@@ -811,7 +811,7 @@ svg.lucide {
 }
 .chart-grid {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 24px;
   margin-bottom: 24px;
 }
@@ -855,8 +855,14 @@ svg.lucide {
 .changes-svg {
   display: block;
   width: 100%;
-  height: 240px;
+  height: auto;
+  min-height: 0;
   padding: 8px 16px;
+}
+.count-trend-svg.trend-svg {
+  min-height: 0;
+  max-height: none;
+  height: auto;
 }
 .chart-point:hover {
   opacity: 1;
@@ -1193,6 +1199,59 @@ td small {
 .module-chart {
   margin-bottom: 24px;
 }
+.metric-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 32px;
+  padding: 24px;
+}
+.metric-chart-slot {
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 3;
+  min-width: 0;
+  margin: 0;
+}
+.metric-chart-heading h3 {
+  font-size: 14px;
+  margin: 0 0 4px;
+}
+.metric-chart-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.metric-chart-plot {
+  min-width: 0;
+}
+.metric-chart-plot .trend-svg,
+.metric-chart-plot .changes-svg {
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  padding: 0;
+}
+.metric-chart-plot .axis-label,
+.count-trend-svg .axis-label,
+.changes-svg .axis-label {
+  font-size: 14px;
+}
+.metric-chart-footer {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.count-axis-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.panel > .count-trend-chart .count-axis-note {
+  margin: 8px 24px 16px;
+}
 .monitor-view > .panel + .panel {
   margin-top: 24px;
 }
@@ -1427,7 +1486,7 @@ td small {
   border-top: 1px solid var(--line);
 }
 .download-growth-grid {
-  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  border-top: 1px solid var(--line);
 }
 .download-bars {
   display: grid;
@@ -1525,6 +1584,7 @@ td small {
   gap: 12px;
   color: var(--muted);
   font-size: 12px;
+  margin: 0;
 }
 .download-growth-control input {
   flex: 1;
@@ -2335,8 +2395,15 @@ article .hook-timestamp {
   .download-chart-grid {
     grid-template-columns: 1fr;
   }
+  .metric-chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 16px;
+  }
+  .metric-chart-slot + .metric-chart-slot {
+    padding-top: 16px;
+  }
   .chart-grid {
-    grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
   }
   .repo-management,
@@ -2520,7 +2587,7 @@ article .hook-timestamp {
   }
   .changes-svg {
     padding: 0 8px;
-    height: 224px;
+    height: auto;
   }
   .chart-footnote {
     margin: 0 16px;
@@ -2665,8 +2732,20 @@ article .hook-timestamp {
   .download-chart {
     margin: 20px 16px;
   }
+  .metric-chart-grid {
+    padding: 20px 16px;
+  }
+  .panel > .count-trend-chart .count-axis-note {
+    margin-right: 16px;
+    margin-left: 16px;
+  }
   .download-growth .axis-label {
-    font-size: 14px;
+    font-size: 18px;
+  }
+  .metric-chart-plot .axis-label,
+  .count-trend-svg .axis-label,
+  .changes-svg .axis-label {
+    font-size: 18px;
   }
   .download-time-middle {
     display: none;

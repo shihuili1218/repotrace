@@ -142,9 +142,13 @@ export interface Dashboard {
     fork_new: number;
     issue_opened: number;
     issue_closed: number;
+    /** Distinct locally recorded Issues first seen before this bucket ends, including closed/deleted items. */
+    issue_total: number;
     pr_opened: number;
     pr_merged: number;
     pr_closed: number;
+    /** Distinct locally recorded PRs first seen before this bucket ends, including closed/merged/draft items. */
+    pr_total: number;
   }[];
   summaries: Summary[];
   changes: StarChange[];
