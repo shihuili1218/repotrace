@@ -108,8 +108,8 @@ test('sets up admin, connects a webhook, rotates secrets and removes the nightly
     starred_at: null,
   });
   await page.getByRole('button', { name: '刷新页面数据' }).click();
-  await expect(page.locator('.repo-metrics')).toContainText('519');
-  await expect(page.locator('.repo-metrics')).toContainText('3');
+  await expect(page.locator('.repo-metrics').filter({ hasText: '519' })).toBeVisible();
+  await expect(page.locator('.repo-metrics').filter({ hasText: /^3$/ })).toBeVisible();
   await expect(page.locator('.hook-timestamp')).toContainText('已记录 2 条事件');
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '配置 Webhook', exact: true }).click();
@@ -145,7 +145,7 @@ test('sets up admin, connects a webhook, rotates secrets and removes the nightly
   await dialog.getByRole('button', { name: '完成', exact: true }).click();
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '项目动态', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '项目的每一步，都有记录' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '项目动态', level: 1 })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   expect(errors).toEqual([]);
 });
@@ -447,7 +447,7 @@ test('shows signed fork, issue, PR and release events in modules and the unified
   await expect(summary).not.toContainText('上次成功采集的数据');
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('button', { name: '项目动态', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '项目动态', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '项目动态', level: 1 })).toBeVisible();
   await page.getByRole('button', { name: 'PR', exact: true }).click();
   await expect(page.locator('.feed-title').first()).toContainText('优化终端体验');
   expect(errors).toEqual([]);
@@ -506,11 +506,35 @@ const metricFixture = {
     first_seen_at: now - 60,
   },
 };
-async function fixture(page: import('@playwright/test').Page, data: unknown) {
+function completeDashboardFixture(data: Record<string, unknown>) {
+  return {
+    range: {
+      mode: 'days',
+      since: now - 30 * 86400,
+      until: now,
+      bucketDays: 1,
+      days: 30,
+      label: '近 30 天',
+      fromRelease: null,
+      toRelease: null,
+      coverageStart: now - 30 * 86400,
+      partial: false,
+      startDay: '2026-10-16',
+      endDay: '2026-11-14',
+    },
+    starNet: { added: 25, removed: 2 },
+    releaseChoices: [],
+    releaseCatalog: { updatedAt: null, error: null },
+    ...data,
+  };
+}
+async function fixture(page: import('@playwright/test').Page, data: Record<string, unknown>) {
   await page.route('**/api/auth/status', (r) =>
     r.fulfill({ json: { initialized: true, authenticated: true, setupProtected: false } }),
   );
-  await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data }));
+  await page.route('**/api/dashboard?*', (r) =>
+    r.fulfill({ json: completeDashboardFixture(data) }),
+  );
 }
 
 test('renders overview charts and the latest five mixed events on desktop and mobile', async ({
@@ -586,24 +610,31 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   await fixture(page, data);
   await page.goto('/');
   const stats = page.getByRole('region', { name: '监控统计' });
-  await expect(stats.getByRole('article')).toHaveCount(6);
+  await expect(stats.getByRole('article')).toHaveCount(4);
   for (const [title, value] of [
-    ['Stars(总数 / 新增 / 取消)', '1,248/28/3'],
-    ['Issues(未关闭 / 新增 / 关闭)', '15/6/4'],
-    ['PRs(新增 / 合并 / 关闭)', '5/3/1'],
-    ['Forks(总数 / 新增)', '86/8'],
-    ['近 30 天事件', '73'],
-    ['已连接项目(已连接 / 全部)', '1/1'],
+    ['Stars', '1,248'],
+    ['未关闭事项', '15'],
+    ['已合并 PR', '3'],
+    ['Forks', '86'],
   ] as const) {
     const card = stats.getByRole('article', { name: title, exact: true });
     await expect(card.locator('.stat-value')).toHaveText(value);
   }
-  const issues = stats.getByRole('article', { name: 'Issues(未关闭 / 新增 / 关闭)', exact: true });
-  await expect(issues.locator('p')).toContainText('1 / 1 个项目有总数');
-  await expect(issues.locator('p')).toContainText('未关闭含 PR');
-  await expect(issues.locator('p')).toContainText('近 30 天');
-  await expect(issues.locator('p')).toContainText('新增');
-  await expect(issues.locator('p')).toContainText('关闭');
+  const stars = stats.getByRole('article', { name: 'Stars', exact: true });
+  await expect(stars).toContainText('新增事件 +28');
+  await expect(stars).toContainText('取消事件 3');
+  const issues = stats.getByRole('article', { name: '未关闭事项', exact: true });
+  await expect(issues.locator('p')).toContainText('1 / 1 个项目已上报');
+  await expect(issues.locator('p')).toContainText('Issue + PR');
+  await expect(issues).toContainText('新建 Issue 6');
+  await expect(issues).toContainText('关闭 Issue 4');
+  await expect(page.getByRole('heading', { name: '项目活动趋势', exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: '关注趋势' })).toContainText('73');
+  await page
+    .getByRole('group', { name: '趋势图表方式' })
+    .getByRole('button', { name: 'Star 总量', exact: true })
+    .click();
+  await expect(page.getByRole('region', { name: '关注趋势' })).toContainText('+23');
   await expect(page.getByRole('img', { name: '每日 Star 总数趋势图' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'octocat', exact: true })).toBeVisible();
   const recent = page.getByRole('region', { name: '最近项目动态' });
@@ -638,11 +669,12 @@ test('renders overview charts and the latest five mixed events on desktop and mo
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/dashboard-mobile.png', fullPage: true });
   await page.getByLabel('统计范围').selectOption('7');
-  const forks = stats.getByRole('article', { name: 'Forks(总数 / 新增)', exact: true });
-  await expect(forks.locator('p')).toContainText('近 7 天');
-  await expect(issues.locator('.stat-value')).toHaveText('15/6/4');
-  await expect(issues.locator('p')).toContainText('近 7 天');
-  await expect(stats.getByRole('article', { name: '近 7 天事件', exact: true })).toBeVisible();
+  const forks = stats.getByRole('article', { name: 'Forks', exact: true });
+  await expect(forks).toContainText('近 7 天');
+  await expect(issues.locator('.stat-value')).toHaveText('15');
+  await expect(page.getByRole('region', { name: '仓库一览' })).toContainText(
+    '近 7 天收到 73 条事件',
+  );
 
   const legacyRepo = {
     ...visualRepo,
@@ -680,20 +712,20 @@ test('renders overview charts and the latest five mixed events on desktop and mo
     legacyRepo,
   );
   await page.reload();
-  await expect(forks.locator('.stat-value')).toHaveText('100/8');
-  await expect(issues.locator('.stat-value')).toHaveText('20/6/4');
-  await expect(issues.locator('p')).toContainText('3 / 5 个项目有总数');
+  await expect(forks.locator('.stat-value')).toHaveText('100');
+  await expect(issues.locator('.stat-value')).toHaveText('20');
+  await expect(issues.locator('p')).toContainText('3 / 5 个项目已上报');
   for (const [project, forksValue, issuesValue, coverage] of [
-    ['visual', '86/8', '15/6/4', '1 / 1'],
-    ['other', '14/8', '5/6/4', '1 / 1'],
-    ['zero', '0/8', '0/6/4', '1 / 1'],
-    ['unknown', '—/8', '—/6/4', '0 / 1'],
-    ['legacy', '—/8', '—/6/4', '0 / 1'],
+    ['visual', '86', '15', '1 / 1'],
+    ['other', '14', '5', '1 / 1'],
+    ['zero', '0', '0', '1 / 1'],
+    ['unknown', '—', '—', '0 / 1'],
+    ['legacy', '—', '—', '0 / 1'],
   ]) {
     await page.getByLabel('选择项目').selectOption(project);
     await expect(forks.locator('.stat-value')).toHaveText(forksValue);
     await expect(issues.locator('.stat-value')).toHaveText(issuesValue);
-    await expect(issues.locator('p')).toContainText(`${coverage} 个项目有总数`);
+    await expect(issues.locator('p')).toContainText(`${coverage} 个项目已上报`);
   }
 });
 
@@ -729,7 +761,9 @@ test('guides a migrated project through first-time signing setup and lists the n
     timelineTotal: 0,
   });
   await fixture(page, data());
-  await page.route('**/api/dashboard?*', (r) => r.fulfill({ json: data() }));
+  await page.route('**/api/dashboard?*', (r) =>
+    r.fulfill({ json: completeDashboardFixture(data()) }),
+  );
   await page.route('**/api/repositories/visual/webhook', (r) => {
     if (r.request().method() === 'POST') configured = true;
     return r.fulfill({

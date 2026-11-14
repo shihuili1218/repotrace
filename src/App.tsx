@@ -4,9 +4,6 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
-  Tag,
-  MessageCircle,
-  GitPullRequest,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -29,15 +26,15 @@ import {
   Plus,
   RefreshCw,
   Settings2,
+  Search,
   ShieldCheck,
-  Sparkles,
   Star,
   Trash2,
   X,
 } from 'lucide-react';
 import type { Dashboard, RepoSummary, WebhookConfig } from '../shared/types';
 import { api } from './api';
-import { ChangesChart, TrendChart } from './Charts';
+import { Overview } from './Overview';
 import { ActivityFeed } from './Monitoring';
 import { ProjectData } from './ProjectData';
 import { webhookEvents } from '../shared/monitors';
@@ -62,11 +59,9 @@ function Logo({ large = false }: { large?: boolean }) {
   return (
     <div className={`logo ${large ? 'large' : ''}`}>
       <span className="logo-mark">
-        <Star size={large ? 26 : 22} fill="currentColor" />
+        <GitFork size={large ? 28 : 24} />
       </span>
-      <span>
-        RepoTrace<span className="logo-dot">.</span>
-      </span>
+      <span>RepoTrace</span>
     </div>
   );
 }
@@ -145,32 +140,32 @@ function Auth({ status, onSuccess }: { status: AuthStatus; onSuccess: () => void
     <main className="auth-shell">
       <div className="auth-story">
         <Logo large />
-        <span className="eyebrow">YOUR PROJECTS, IN PERSPECTIVE</span>
+        <span className="eyebrow">GitHub 项目观测站</span>
         <h1>
-          每一份关注，
+          从一次关注，
           <br />
-          都有迹可循<span>。</span>
+          到下一次发布
         </h1>
-        <p>
-          看见项目的成长，也看见背后的人。
-          <br />
-          你的 GitHub 项目，值得一个专属观测站。
-        </p>
-        <div className="orbit-art" aria-hidden="true">
-          <div className="orbit orbit-one" />
-          <div className="orbit orbit-two" />
-          <div className="orbit-core">
-            <Star size={58} fill="currentColor" />
+        <p>追踪仓库关注、协作进展与版本下载</p>
+        <div className="auth-trace" aria-label="观测维度">
+          <div>
+            <span className="trace-node" />
+            <span>关注</span>
+            <strong>Star / Fork</strong>
+            <small>记录变化，也看见参与的人</small>
           </div>
-          <span className="orbit-spark one">
-            <Star size={20} fill="currentColor" />
-          </span>
-          <span className="orbit-spark two">
-            <Star size={14} fill="currentColor" />
-          </span>
-          <span className="orbit-label">
-            <span className="status-dot" /> A little more starlight, every day.
-          </span>
+          <div>
+            <span className="trace-node hollow" />
+            <span>协作</span>
+            <strong>Issue / Pull Request</strong>
+            <small>从首次反馈到代码合并</small>
+          </div>
+          <div>
+            <span className="trace-node" />
+            <span>发布</span>
+            <strong>Release / Downloads</strong>
+            <small>版本、产物与真实下载记录</small>
+          </div>
         </div>
         <div className="auth-story-footer">
           <ShieldCheck size={16} /> 私有空间 · 数据由你掌握
@@ -184,12 +179,10 @@ function Auth({ status, onSuccess }: { status: AuthStatus; onSuccess: () => void
           <span className="auth-lock">
             <LockKeyhole size={23} />
           </span>
-          <div className="eyebrow">{setup ? 'WELCOME TO REPOTRACE' : 'WELCOME BACK'}</div>
-          <h2>{setup ? '开启你的项目观测站' : '欢迎回到你的观测站'}</h2>
+          <div className="eyebrow">{setup ? '首次配置' : '管理员登录'}</div>
+          <h2>{setup ? '创建观测站' : '登录观测站'}</h2>
           <p className="muted">
-            {setup
-              ? '先设置管理员密码，为你的数据留一把钥匙。'
-              : '输入管理员密码，继续关注项目的每一步成长。'}
+            {setup ? '设置管理员密码，保护仓库数据。' : '输入管理员密码，查看仓库与记录。'}
           </p>
           <form onSubmit={submit}>
             <label htmlFor="password">{setup ? '设置管理员密码' : '管理员密码'}</label>
@@ -266,9 +259,7 @@ function Auth({ status, onSuccess }: { status: AuthStatus; onSuccess: () => void
             </span>
           </div>
         </div>
-        <span className="auth-bottom">
-          为独立开发者而造 <span>✦</span> Built on Cloudflare
-        </span>
+        <span className="auth-bottom">RepoTrace · 私有 GitHub 项目观测站</span>
       </div>
     </main>
   );
@@ -324,6 +315,8 @@ export default function App() {
 function Workspace({ onLogout }: { onLogout: () => void }) {
   const [view, setView] = useState<View>('overview');
   const [mobileNav, setMobileNav] = useState(false);
+  const [sidebarSearch, setSidebarSearch] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
   const [data, setData] = useState<Dashboard | null>(null);
   const [repo, setRepo] = useState('');
   const [projectRepo, setProjectRepo] = useState('');
@@ -339,6 +332,21 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const requestId = useRef(0);
+  useEffect(() => {
+    const focusSearch = (event: KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.key.toLowerCase() !== 'k' ||
+        document.querySelector('dialog[open]')
+      )
+        return;
+      event.preventDefault();
+      if (window.matchMedia('(max-width: 800px)').matches) setMobileNav(true);
+      requestAnimationFrame(() => searchRef.current?.focus());
+    };
+    window.addEventListener('keydown', focusSearch);
+    return () => window.removeEventListener('keydown', focusSearch);
+  }, []);
   const refresh = useCallback(async () => {
     const id = ++requestId.current;
     try {
@@ -387,13 +395,10 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     }
   }
   const repositories = data?.repositories ?? [];
+  const sidebarRepositories = repositories.filter((project) =>
+    project.full_name.toLowerCase().includes(sidebarSearch.trim().toLowerCase()),
+  );
   const shown = repositories.filter((r) => !repo || r.id === repo);
-  const known = shown.filter((r) => r.current_total !== null);
-  const total = known.reduce((n, r) => n + r.current_total!, 0);
-  const knownForks = shown.filter((r) => r.current_forks !== null);
-  const forkTotal = knownForks.reduce((n, r) => n + r.current_forks!, 0);
-  const knownOpenItems = shown.filter((r) => r.current_open_items != null);
-  const openItemsTotal = knownOpenItems.reduce((n, r) => n + r.current_open_items!, 0);
   const pending = repositories.filter((r) => !r.webhookConfigured || !r.last_received_at).length;
   const navs = [
     { view: 'overview' as const, label: '项目总览', icon: <LayoutDashboard size={19} /> },
@@ -413,14 +418,19 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       )}
       <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
         <Logo />
-        <div className="workspace-badge">
-          <span className="workspace-avatar">R</span>
-          <span>
-            <strong>我的观测站</strong>
-            <small>Personal workspace</small>
-          </span>
-          <LockKeyhole size={14} />
-        </div>
+        <label className="sidebar-search">
+          <Search size={18} />
+          <input
+            ref={searchRef}
+            aria-label="查找项目"
+            placeholder="查找项目"
+            value={sidebarSearch}
+            onChange={(event) => setSidebarSearch(event.target.value)}
+          />
+          <kbd aria-hidden="true">
+            {navigator.platform.toLowerCase().includes('mac') ? '⌘ K' : 'Ctrl K'}
+          </kbd>
+        </label>
         <span className="nav-caption">工作空间</span>
         <nav>
           {navs.map((item) => (
@@ -444,19 +454,65 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
             </button>
           ))}
         </nav>
+        {!!repositories.length && (
+          <div className="sidebar-projects">
+            <span className="nav-caption">项目快捷入口</span>
+            {sidebarRepositories.slice(0, 6).map((project) => (
+              <button
+                key={project.id}
+                className={`sidebar-project ${view === 'data' && projectRepo === project.id ? 'selected' : ''}`}
+                onClick={() => {
+                  setProjectRepo(project.id);
+                  setView('data');
+                  setMobileNav(false);
+                }}
+                title={project.full_name}
+                aria-label={`${project.full_name}，${project.current_total === null ? 'Stars 尚未上报' : `${number(project.current_total)} Stars`}`}
+                aria-current={view === 'data' && projectRepo === project.id ? 'true' : undefined}
+              >
+                <span
+                  className={`status-dot ${project.enabled && project.last_received_at ? 'connected' : ''}`}
+                />
+                <span>{project.full_name.split('/').at(-1)}</span>
+                <small>
+                  {project.current_total === null ? '—' : number(project.current_total)}
+                </small>
+              </button>
+            ))}
+            {!sidebarRepositories.length && <p className="sidebar-search-empty">没有匹配的项目</p>}
+            {sidebarRepositories.length > 6 && (
+              <button
+                className="sidebar-project"
+                onClick={() => {
+                  setRepo('');
+                  setSummary('');
+                  setPage(1);
+                  setView('repositories');
+                  setMobileNav(false);
+                }}
+              >
+                管理全部项目 <ArrowRight size={16} />
+              </button>
+            )}
+          </div>
+        )}
         <div className="sidebar-bottom">
           <div className="event-note">
-            <span className="event-icon">
-              <Activity size={18} />
-            </span>
-            <strong>事件到了，就有记录</strong>
+            <div>
+              <span className="status-dot" />
+              <strong>记录连接</strong>
+            </div>
             <p>
-              Star · Fork · Issue · PR · Release
-              <br />
-              北京时间自然日 · 实时统计
+              {repositories.filter((r) => r.enabled && r.last_received_at).length} /{' '}
+              {repositories.length} 个项目已连接
             </p>
-            <button onClick={() => setView('repositories')}>
-              管理 Webhook <ArrowUpRight size={14} />
+            <button
+              onClick={() => {
+                setView('repositories');
+                setMobileNav(false);
+              }}
+            >
+              管理 Webhook <ArrowUpRight size={16} />
             </button>
           </div>
           <a
@@ -511,23 +567,21 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
         <main className="main-content">
           <div className="page-heading">
             <div>
-              <span className="eyebrow">YOUR PROJECTS, IN PERSPECTIVE</span>
               <h1>
                 {
                   {
                     overview: '项目总览',
-                    activity: '项目的每一步，都有记录',
-                    data: '看见项目的更多维度',
-                    repositories: '我的监控项目',
+                    activity: '项目动态',
+                    data: '项目数据',
+                    repositories: '监控项目',
                     settings: '观测站设置',
                   }[view]
                 }
-                {view === 'overview' && <Sparkles size={23} className="heading-spark" />}
               </h1>
               <p>
                 {
                   {
-                    overview: '让每一次关注，汇成项目成长的轨迹。',
+                    overview: '关注变化、协作进展与仓库状态，一处看清。',
                     activity: '关注、反馈、贡献与发布，汇在同一条时间线。',
                     data: '了解 Fork 增长、Issue 反馈、PR 进度与版本发布。',
                     repositories: '连接 GitHub Webhook，开始记录你的项目。',
@@ -609,7 +663,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 </div>
               </div>
               <span className="filterbar-status">
-                Webhook 实时记录
+                <span className="status-dot" /> Webhook 事件记录
                 <button
                   className="icon-button"
                   aria-label="刷新页面数据"
@@ -627,123 +681,22 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
             </div>
           ) : (
             <>
-              {view === 'overview' && (
-                <>
-                  <section className="stats-grid" aria-label="监控统计">
-                    <Stat
-                      title="Stars(总数 / 新增 / 取消)"
-                      value={`${known.length ? number(total) : '—'}/${number(data.eventCounts.added)}/${number(data.eventCounts.removed)}`}
-                      icon={<Star size={20} />}
-                      note={`${known.length} / ${shown.length} 个项目有总数 · 增减为近 ${days} 天`}
-                      tone="purple"
-                    />
-                    <Stat
-                      title="Issues(未关闭 / 新增 / 关闭)"
-                      value={`${knownOpenItems.length ? number(openItemsTotal) : '—'}/${number(data.metrics.issuesOpened)}/${number(data.metrics.issuesClosed)}`}
-                      icon={<MessageCircle size={20} />}
-                      note={`未关闭含 PR · ${knownOpenItems.length} / ${shown.length} 个项目有总数 · 新增 / 关闭为近 ${days} 天 Issue`}
-                      tone="green"
-                    />
-                    <Stat
-                      title="PRs(新增 / 合并 / 关闭)"
-                      value={`${number(data.metrics.prsOpened)}/${number(data.metrics.prsMerged)}/${number(data.metrics.prsClosed)}`}
-                      icon={<GitPullRequest size={20} />}
-                      note={`近 ${days} 天 · 关闭不含已合并`}
-                      tone="blue"
-                    />
-                    <Stat
-                      title="Forks(总数 / 新增)"
-                      value={`${knownForks.length ? number(forkTotal) : '—'}/${number(data.metrics.forks)}`}
-                      icon={<GitFork size={20} />}
-                      note={`${knownForks.length} / ${shown.length} 个项目有总数 · 新增为近 ${days} 天`}
-                      tone="purple"
-                    />
-                    <Stat
-                      title={`近 ${days} 天事件`}
-                      value={number(data.eventTotal)}
-                      icon={<Activity size={20} />}
-                      note="Star、Fork、Issue、PR、Release 全部事件"
-                      tone="green"
-                    />
-                    <Stat
-                      title="已连接项目(已连接 / 全部)"
-                      value={`${shown.filter((r) => r.enabled && r.last_received_at).length}/${shown.length}`}
-                      icon={<FolderGit2 size={20} />}
-                      note="已启用且收到过签名事件"
-                      tone="blue"
-                    />
-                  </section>
-                  <div className="chart-grid">
-                    <section className="panel">
-                      <div className="panel-header">
-                        <div>
-                          <h2>Star 总量趋势</h2>
-                          <p>每日最近上报值 · 今日随事件实时更新</p>
-                        </div>
-                        <div className="range-switch">
-                          {[7, 30, 90].map((n) => (
-                            <button
-                              key={n}
-                              className={days === n ? 'active' : ''}
-                              onClick={() => {
-                                setDays(n);
-                                setPage(1);
-                              }}
-                            >
-                              {n} 天
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                      <TrendChart history={data.history} />
-                    </section>
-                    <section className="panel">
-                      <div className="panel-header">
-                        <div>
-                          <h2>每日净变化</h2>
-                          <p>北京时间自然日 · 同一用户反向操作相互抵消</p>
-                        </div>
-                      </div>
-                      <ChangesChart history={data.history} />
-                      <div className="chart-legend">
-                        <span>
-                          <i className="legend-dot green" />
-                          新增
-                        </span>
-                        <span>
-                          <i className="legend-dot red" />
-                          取消
-                        </span>
-                      </div>
-                    </section>
-                  </div>
-                  {!repositories.length ? (
-                    <EmptyProjects onAdd={() => setAdding(true)} />
-                  ) : (
-                    <>
-                      <div className="section-heading">
-                        <h2>监控项目</h2>
-                        <button className="text-button" onClick={() => setView('repositories')}>
-                          管理项目 <ArrowRight size={15} />
-                        </button>
-                      </div>
-                      <div className="repo-grid">
-                        {shown.map((r) => (
-                          <RepoCard
-                            key={r.id}
-                            project={r}
-                            onConfigure={() => void configure(r)}
-                            onView={() => {
-                              setProjectRepo(r.id);
-                              setView('data');
-                            }}
-                          />
-                        ))}
-                      </div>
-                    </>
-                  )}
-                </>
-              )}
+              {view === 'overview' &&
+                (repositories.length ? (
+                  <Overview
+                    data={data}
+                    repositories={shown}
+                    days={days}
+                    onView={(id) => {
+                      setProjectRepo(id);
+                      setView('data');
+                    }}
+                    onConfigure={(project) => void configure(project)}
+                    onManage={() => setView('repositories')}
+                  />
+                ) : (
+                  <EmptyProjects onAdd={() => setAdding(true)} />
+                ))}
               {view === 'repositories' &&
                 (!repositories.length ? (
                   <EmptyProjects onAdd={() => setAdding(true)} />
@@ -794,6 +747,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 ))}
               {view === 'data' && (
                 <ProjectData
+                  key={projectRepo}
                   repositories={repositories}
                   projectId={projectRepo}
                   onProjectChange={setProjectRepo}
@@ -919,8 +873,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
             </>
           )}
           <footer className="page-footer">
-            <span>RepoTrace · 每一份关注都有迹可循</span>
-            <span>Powered by Cloudflare · Webhooks</span>
+            <span>RepoTrace · 仓库的每一次变化</span>
+            <span>北京时间 UTC+8 · 仅统计已记录数据</span>
           </footer>
         </main>
       </div>
@@ -989,13 +943,12 @@ function EmptyProjects({ onAdd }: { onAdd: () => void }) {
     <section className="panel empty-projects">
       <div className="empty-illustration">
         <FolderGit2 size={32} />
-        <span>✦</span>
       </div>
       <h2>从第一个项目开始</h2>
       <p>
         添加仓库并连接 GitHub Webhook，
         <br />
-        为每一份关注留下记录。
+        开始追踪关注、协作与发布。
       </p>
       <button className="button primary" onClick={onAdd}>
         <Plus size={17} />
@@ -1274,9 +1227,7 @@ function RepoCard({
           <ArrowUpRight size={14} />
         </a>
       </h3>
-      <p className="repo-description">
-        {r.description || '连接 Webhook，开始记录项目的每一次关注。'}
-      </p>
+      <p className="repo-description">{r.description || '连接 Webhook，开始记录仓库事件。'}</p>
       <div className="repo-metrics">
         <div>
           <span>最近上报 Stars</span>
@@ -1294,7 +1245,7 @@ function RepoCard({
         </div>
       </div>
       <p className="hook-timestamp">
-        总量上报：{time(r.total_reported_at)}
+        Stars 上报：{time(r.total_reported_at)} · Forks 上报：{time(r.forks_reported_at)}
         <br />
         已记录 {number(r.event_count)} 条事件 · 最近收到 {time(r.last_received_at)}
       </p>
@@ -1480,30 +1431,6 @@ function Changes({
         </span>
       </div>
     </section>
-  );
-}
-function Stat({
-  title,
-  value,
-  icon,
-  note,
-  tone,
-}: {
-  title: string;
-  value: string;
-  icon: ReactNode;
-  note: string;
-  tone: string;
-}) {
-  return (
-    <article className={`stat-card ${tone}`} aria-label={title}>
-      <div className="stat-top">
-        <span>{title}</span>
-        <span className="stat-icon">{icon}</span>
-      </div>
-      <strong className="stat-value">{value}</strong>
-      <p>{note}</p>
-    </article>
   );
 }
 function SettingsView({

@@ -7,14 +7,14 @@ export interface DownloadPoint {
   value: string | null;
 }
 const colors = [
-  '#5369ef',
-  '#38a686',
-  '#e4a94f',
-  '#a07bcd',
-  '#e17994',
-  '#4aa5bb',
-  '#8a9462',
-  '#9ba4bd',
+  'var(--chart-primary, #5fcfa4)',
+  'var(--chart-neutral, #81858d)',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 75%, white)',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 70%, var(--surface, #1b1b1d))',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 55%, white)',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 50%, var(--surface, #1b1b1d))',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 35%, white)',
+  'color-mix(in srgb, var(--chart-neutral, #81858d) 35%, var(--surface, #1b1b1d))',
 ];
 const valueOf = (value: string | null) =>
   value !== null && /^\d+$/.test(value) ? BigInt(value) : null;
@@ -117,7 +117,13 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
               y={p.change === 0n ? y(0n) - 1 : Math.min(y(0n), y(p.change))}
               width={width}
               height={p.change === 0n ? 2 : Math.abs(y(p.change) - y(0n))}
-              fill={p.change < 0n ? '#dc8282' : p.change > 0n ? '#38a686' : '#9ba4bd'}
+              fill={
+                p.change < 0n
+                  ? 'var(--chart-negative, #d28d88)'
+                  : p.change > 0n
+                    ? 'var(--chart-positive, #5fcfa4)'
+                    : 'var(--chart-neutral, #81858d)'
+              }
               opacity={i === active ? 1 : 0.65}
             >
               <title>{detail(i)}</title>
@@ -208,7 +214,7 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
           <path
             d={line}
             fill="none"
-            stroke="#4c62e8"
+            stroke="var(--chart-primary, #5fcfa4)"
             strokeWidth="3"
             strokeLinejoin="round"
             strokeLinecap="round"
@@ -218,9 +224,11 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
               key={p.observedAt}
               cx={point(i)[0]}
               cy={point(i)[1]}
-              r={i === active ? 5 : data.length < 10 ? 4 : 2.5}
-              fill="#4c62e8"
-              stroke="white"
+              className="chart-point"
+              r={i === active ? 5 : data.length < 10 ? 4 : 3}
+              opacity={i === active || data.length < 10 || i === 0 ? 1 : 0}
+              fill="var(--chart-primary, #5fcfa4)"
+              stroke="var(--surface, #1b1b1d)"
               strokeWidth="1.5"
             >
               <title>
@@ -274,10 +282,10 @@ export function DownloadComparison({
     <figure className="download-chart" aria-label={label}>
       <figcaption>
         <h3>{label}</h3>
-        <p>当前累计值 · 点击条目查看完整名称和数字</p>
+        <p>按产物比较累计下载量 · 选择条目查看明细</p>
       </figcaption>
       {!known.length ? (
-        <p className="small-empty">暂无可绘制的下载量，请在后台刷新成功后再次读取缓存。</p>
+        <p className="small-empty">暂无已知下载量，产物数据读取成功后显示对比</p>
       ) : (
         <>
           <div className="download-bars" role="list">
@@ -296,8 +304,17 @@ export function DownloadComparison({
                     </span>
                     <strong>{downloadNumber(p.value)}</strong>
                     <svg viewBox="0 0 100 7" preserveAspectRatio="none" aria-hidden="true">
-                      <rect width="100" height="7" rx="3.5" fill="#edf0fa" />
-                      <rect width={width} height="7" rx="3.5" fill="#5369ef" />
+                      <rect width="100" height="7" rx="1" fill="var(--chart-track, #303135)" />
+                      <rect
+                        width={width}
+                        height="7"
+                        rx="1"
+                        fill={
+                          selected === p.id || BigInt(p.value!) === max
+                            ? 'var(--chart-primary, #5fcfa4)'
+                            : 'var(--chart-neutral, #81858d)'
+                        }
+                      />
                     </svg>
                   </button>
                 </div>
@@ -313,7 +330,7 @@ export function DownloadComparison({
       )}
       {known.length > limit && (
         <p className="field-note">
-          图中展示前 {limit} 项，共 {known.length} 项已知数据。
+          图中展示前 {limit} 项，共 {known.length} 项已知数据
         </p>
       )}
       {known.length < points.length && (
@@ -331,7 +348,7 @@ export function DownloadDistribution({ points }: { points: DownloadPoint[] }) {
         <figcaption>
           <h3>产物下载量占比</h3>
         </figcaption>
-        <p className="small-empty">下载量数据完整后显示占比。</p>
+        <p className="small-empty">所有产物的下载量已知后显示占比</p>
       </figure>
     );
   const sorted = [...points].sort((a, b) =>
@@ -359,40 +376,29 @@ export function DownloadDistribution({ points }: { points: DownloadPoint[] }) {
         <h3>产物下载量占比</h3>
         <p>累计 {downloadNumber(String(total))} 次下载 · 点击图例查看</p>
       </figcaption>
-      <div className="download-distribution">
-        <svg viewBox="0 0 160 160" role="img" aria-label="产物下载量占比图">
-          <circle cx="80" cy="80" r="59" fill="none" stroke="#edf0fa" strokeWidth="16" />
+      <div className="download-distribution stacked">
+        <svg viewBox="0 0 600 32" role="img" aria-label="产物下载量占比图">
+          <rect width="600" height="32" rx="4" fill="var(--chart-track, #303135)" />
           {segments.map((p, i) => {
-            const share = percent(p.value!);
-            const offset = -start;
+            const share = total === 0n ? 0 : Number((BigInt(p.value!) * 1000000n) / total) / 10000;
+            const offset = start;
             start += share;
             return (
-              <circle
+              <rect
                 key={p.id}
-                cx="80"
-                cy="80"
-                r="59"
-                pathLength="100"
-                fill="none"
-                stroke={colors[i]}
-                strokeWidth={selected === p.id ? 20 : 16}
-                strokeDasharray={`${share} ${100 - share}`}
-                strokeDashoffset={offset}
-                transform="rotate(-90 80 80)"
-                opacity={active && active.id !== p.id ? 0.3 : 1}
+                x={offset * 6}
+                y="0"
+                width={share * 6}
+                height="32"
+                fill={colors[i]}
+                opacity={active && active.id !== p.id ? 0.35 : 1}
               >
                 <title>
-                  {p.label} · {downloadNumber(p.value)} 次 · {share}%
+                  {p.label} · {downloadNumber(p.value)} 次 · {percent(p.value!)}%
                 </title>
-              </circle>
+              </rect>
             );
           })}
-          <text x="80" y="78" textAnchor="middle" className="download-donut-value">
-            {active ? percent(active.value!) : total === 0n ? 0 : 100}%
-          </text>
-          <text x="80" y="100" textAnchor="middle" className="axis-label">
-            {active ? '所选产物占比' : '全部产物'}
-          </text>
         </svg>
         <div className="download-legend">
           {segments.map((p, i) => (

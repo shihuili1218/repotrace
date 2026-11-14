@@ -361,9 +361,9 @@ export function Monitoring({
                 note="没有收到其他人的人工回复"
               />
               <Metric
-                label={`${period}新建 / 关闭`}
-                value={`${metrics.issuesOpened} / ${metrics.issuesClosed}`}
-                note="分别统计发生过对应操作的 Issue"
+                label={`${period}新建 Issue`}
+                value={metrics.issuesOpened}
+                note={`同期关闭 ${metrics.issuesClosed.toLocaleString()} 个 · 按操作分别去重`}
               />
               <Metric
                 label="平均首条回复耗时"
@@ -384,9 +384,9 @@ export function Monitoring({
                 note="非草稿且尚无有效的已记录评审"
               />
               <Metric
-                label={`${period}新建 / 合并 / 关闭`}
-                value={`${metrics.prsOpened} / ${metrics.prsMerged} / ${metrics.prsClosed}`}
-                note="关闭不含合并；按发生过对应操作的条目去重"
+                label={`${period}已合并 PR`}
+                value={metrics.prsMerged}
+                note={`同期新建 ${metrics.prsOpened.toLocaleString()} 个 · 关闭未合并 ${metrics.prsClosed.toLocaleString()} 个`}
               />
               <Metric
                 label="平均合并耗时"

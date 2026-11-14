@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FolderGit2 } from 'lucide-react';
+import { ArrowUpRight, FolderGit2 } from 'lucide-react';
 import type { Dashboard, RepoSummary, ReleaseBoundary } from '../shared/types';
 import { api } from './api';
 import { Monitoring } from './Monitoring';
@@ -112,6 +112,28 @@ export function ProjectData({
     );
   return (
     <div className="project-data-view">
+      {selected && (
+        <section className="panel project-identity" aria-label="当前项目">
+          <FolderGit2 size={18} />
+          <div>
+            <h2>
+              <a href={`https://github.com/${selected.full_name}`} target="_blank" rel="noreferrer">
+                {selected.full_name} <ArrowUpRight size={16} />
+              </a>
+            </h2>
+            <p>
+              {selected.description || '暂无仓库描述'}
+              {selected.language ? ` · ${selected.language}` : ''}
+            </p>
+          </div>
+          <span
+            className={`pill ${!selected.enabled ? 'neutral' : selected.last_received_at ? 'green' : 'blue'}`}
+          >
+            <span className="status-dot" />
+            {!selected.enabled ? '已暂停' : selected.last_received_at ? '已连接' : '待连接'}
+          </span>
+        </section>
+      )}
       <div className="project-controls">
         <div className="filterbar-controls">
           <div className="select-wrap">
@@ -150,7 +172,6 @@ export function ProjectData({
           </div>
         </div>
       </div>
-      <ScheduledReleaseNote cache={data?.releaseCatalog} />
       {mode === 'releases' && (
         <div className="release-range panel">
           <label>
@@ -195,6 +216,7 @@ export function ProjectData({
           <p>
             按发布时间统计：包含起始时刻，不含结束时刻。版本目录展示最近一次采集结果；历史事件只能覆盖已经收到的数据。
           </p>
+          <ScheduledReleaseNote cache={data?.releaseCatalog} />
         </div>
       )}
       {error && (
