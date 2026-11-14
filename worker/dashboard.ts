@@ -9,6 +9,7 @@ import type {
 } from '../shared/types';
 import { statisticsRange } from './range';
 import { monitorMetrics } from './monitoring';
+import { DAY, localMidnight } from './time';
 import { AppError, nowSeconds } from './types';
 
 // Bind range values directly: nested parameter CTEs exceed production D1's subquery depth limit.
@@ -42,13 +43,6 @@ const historySQL = `WITH RECURSIVE
       COUNT(DISTINCT CASE WHEN category='pull_request' AND action='closed' THEN project_id||':'||object_id END) AS pr_closed
     FROM project_events e JOIN buckets b ON e.received_at>=b.start AND e.received_at<b.end WHERE project_id IN(SELECT id FROM chosen) GROUP BY b.day
   ),
-  recorded_work AS (
-    SELECT b.day,
-      COUNT(CASE WHEN w.kind='issue' THEN 1 END) AS issue_total,
-      COUNT(CASE WHEN w.kind='pull_request' THEN 1 END) AS pr_total
-    FROM buckets b LEFT JOIN work_items w ON w.first_seen_at<b.end AND w.project_id IN(SELECT id FROM chosen)
-    GROUP BY b.day
-  ),
   observed AS (
     SELECT b.day,p.id,COALESCE(
       (SELECT observed_total FROM webhook_deliveries w WHERE w.project_id=p.id AND recorded=1 AND observed_total>=0 AND received_at<b.end ORDER BY received_at DESC,seq DESC LIMIT 1),
@@ -61,9 +55,8 @@ const historySQL = `WITH RECURSIVE
     COALESCE(c.added,0) AS added,COALESCE(c.removed,0) AS removed,
     COALESCE(a.issue_opened,0) AS issue_opened,COALESCE(a.issue_closed,0) AS issue_closed,
     COALESCE(a.pr_opened,0) AS pr_opened,COALESCE(a.pr_merged,0) AS pr_merged,COALESCE(a.pr_closed,0) AS pr_closed,
-    COALESCE(w.issue_total,0) AS issue_total,COALESCE(w.pr_total,0) AS pr_total,
     (SELECT COUNT(*) FROM forks f WHERE project_id IN(SELECT id FROM chosen) AND received_at>=b.start AND received_at<b.end) AS fork_new
-  FROM buckets b LEFT JOIN observed o ON o.day=b.day LEFT JOIN daily_changes c ON c.day=b.day LEFT JOIN daily_activity a ON a.day=b.day LEFT JOIN recorded_work w ON w.day=b.day GROUP BY b.day ORDER BY b.day`;
+  FROM buckets b LEFT JOIN observed o ON o.day=b.day LEFT JOIN daily_changes c ON c.day=b.day LEFT JOIN daily_activity a ON a.day=b.day GROUP BY b.day ORDER BY b.day`;
 
 export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
   const project = url.searchParams.get('repo') || null;
@@ -102,7 +95,9 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     throw new AppError(404, '历史记录不存在。');
   const range = await statisticsRange(db, url, project);
   const { since, until } = range;
-  const [summaries, history, eventCounts, metrics, markers] = await Promise.all([
+  const firstBucketStart = localMidnight(since);
+  const bucketSeconds = range.bucketDays * DAY;
+  const [summaries, history, recordedWork, eventCounts, metrics, markers] = await Promise.all([
     db
       .prepare(
         `SELECT s.*,p.full_name FROM summaries s JOIN projects p ON p.id=s.project_id WHERE (? IS NULL OR project_id=?) ORDER BY period_end DESC,s.rowid DESC LIMIT 100`,
@@ -112,7 +107,20 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     db
       .prepare(historySQL)
       .bind(project, range.startDay, range.endDay, since, until, range.bucketDays)
-      .all<Dashboard['history'][number]>(),
+      .all<Omit<Dashboard['history'][number], 'issue_total' | 'pr_total'>>(),
+    // Keep historySQL at its previously deployed complexity: production D1 has
+    // stricter query depth limits than local tests. Preserve all earlier records
+    // as one baseline, then return at most one count row per displayed bucket.
+    db
+      .prepare(
+        `SELECT CASE WHEN first_seen_at<?2 THEN ?2-1 ELSE ?2+CAST((first_seen_at-?2)/?3 AS INTEGER)*?3 END AS bucket_start,
+          COUNT(CASE WHEN kind='issue' THEN 1 END) AS issues,
+          COUNT(CASE WHEN kind='pull_request' THEN 1 END) AS prs
+        FROM work_items WHERE (?1 IS NULL OR project_id=?1) AND first_seen_at<?4
+        GROUP BY bucket_start ORDER BY bucket_start`,
+      )
+      .bind(project, firstBucketStart, bucketSeconds, until)
+      .all<{ bucket_start: number; issues: number; prs: number }>(),
     db
       .prepare(
         `SELECT COALESCE(SUM(kind='added'),0) AS added,COALESCE(SUM(kind='removed'),0) AS removed FROM star_events WHERE received_at>=? AND received_at<? AND (? IS NULL OR project_id=?)`,
@@ -202,7 +210,23 @@ export async function dashboard(db: D1Database, url: URL): Promise<Dashboard> {
     releaseChoices: choices.results,
     releaseCatalog: catalog ?? { updatedAt: null, error: null },
     starNet: net ?? { added: 0, removed: 0 },
-    history: history.results,
+    history: (() => {
+      let issueTotal = 0;
+      let prTotal = 0;
+      let next = 0;
+      return history.results.map((point, index) => {
+        const bucketEnd = Math.min(firstBucketStart + (index + 1) * bucketSeconds, until);
+        while (
+          next < recordedWork.results.length &&
+          recordedWork.results[next].bucket_start < bucketEnd
+        ) {
+          issueTotal += recordedWork.results[next].issues;
+          prTotal += recordedWork.results[next].prs;
+          next++;
+        }
+        return { ...point, issue_total: issueTotal, pr_total: prTotal };
+      });
+    })(),
     summaries: summaries.results,
     changes: changes.results,
     changeTotal: count ?? 0,
