@@ -20,6 +20,7 @@ import { ensureReleaseSchedules } from './release-scheduler';
 export { ReleaseScheduler } from './release-scheduler';
 import { webhookEvents } from '../shared/monitors';
 import { AppError, type Env, json, nowSeconds } from './types';
+import { failureCode, type RequestStage } from './errors';
 
 async function body(request: Request): Promise<Record<string, unknown>> {
   if (!request.headers.get('Content-Type')?.startsWith('application/json'))
@@ -59,11 +60,18 @@ async function body(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function api(request: Request, env: Env, ctx: ExecutionContext) {
+async function api(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  trace: { stage: RequestStage },
+) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  trace.stage = 'INIT_DB';
   await initDB(env.DB);
+  trace.stage = 'API';
   if (!['GET', 'HEAD'].includes(method)) {
     if (request.headers.get('Origin') !== url.origin)
       throw new AppError(403, '请求来源无效，请从本站操作。');
@@ -71,7 +79,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
       throw new AppError(415, '请使用 JSON 格式。');
   }
   if (path === '/api/auth/status' && method === 'GET') {
+    trace.stage = 'AUTH_ADMIN';
     const admin = await env.DB.prepare('SELECT 1 FROM admin WHERE id = 1').first();
+    trace.stage = 'AUTH_SESSION';
     return json({
       initialized: !!admin,
       authenticated: admin ? await authenticated(request, env.DB) : false,
@@ -99,12 +109,15 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     return json({ ok: true }, 201, { 'Set-Cookie': await createSession(env.DB, request) });
   }
   if (path === '/api/auth/login' && method === 'POST') {
+    trace.stage = 'AUTH_LOGIN';
     await rateLimit(request, env.DB);
     const data = await body(request);
     await verifyPassword(env.DB, data.password);
     return json({ ok: true }, 200, { 'Set-Cookie': await createSession(env.DB, request) });
   }
+  trace.stage = 'AUTH_SESSION';
   if (!(await authenticated(request, env.DB))) throw new AppError(401, '请先登录。');
+  trace.stage = 'API';
   if (path === '/api/auth/logout' && method === 'POST') {
     await logout(request, env.DB);
     return json({ ok: true }, 200, { 'Set-Cookie': cookie(request) });
@@ -124,8 +137,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
     ]);
     return json({ ok: true }, 200, { 'Set-Cookie': await createSession(env.DB, request) });
   }
-  if (path === '/api/dashboard' && method === 'GET') return json(await dashboard(env.DB, url));
-  if (path === '/api/monitoring' && method === 'GET') return json(await monitoring(env.DB, url));
+  if (path === '/api/dashboard' && method === 'GET') {
+    trace.stage = 'DASHBOARD';
+    return json(await dashboard(env.DB, url));
+  }
+  if (path === '/api/monitoring' && method === 'GET') {
+    trace.stage = 'MONITORING';
+    return json(await monitoring(env.DB, url));
+  }
   if (path === '/api/settings' && method === 'GET')
     return json({ timezone: 'Asia/Shanghai', monitors: webhookEvents });
   if (path === '/api/repositories' && method === 'POST') {
@@ -217,20 +236,31 @@ export default {
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     let response: Response;
+    const trace: { stage: RequestStage } = { stage: 'ROUTING' };
     try {
       const path = new URL(request.url).pathname;
       const hook = path.match(/^\/hooks\/github\/([^/]+)$/);
+      trace.stage = hook ? 'WEBHOOK' : path.startsWith('/api/') ? 'API' : 'ASSETS';
       response = hook
         ? await receiveWebhook(request, env, hook[1])
         : path.startsWith('/api/')
-          ? await api(request, env, ctx)
+          ? await api(request, env, ctx, trace)
           : await env.ASSETS.fetch(request);
     } catch (error) {
       if (error instanceof AppError) response = json({ error: error.message }, error.status);
       else {
-        // Log a class only: SQL bindings / upstream errors may contain sensitive data.
-        console.error('Request failed:', error instanceof Error ? error.name : 'UnknownError');
-        response = json({ error: '服务暂时不可用，请稍后重试。' }, 500);
+        const code = failureCode(trace.stage, error);
+        const requestId = crypto.randomUUID();
+        try {
+          console.error('Request failed:', { code, requestId });
+        } catch {
+          // A broken request context must not prevent returning its diagnostic.
+        }
+        response = json(
+          { error: `服务暂时不可用，请稍后重试。（${code}）`, code, requestId },
+          500,
+          { 'X-RepoTrace-Error': code, 'X-Request-ID': requestId },
+        );
       }
     }
     const secured = new Response(response.body, response);
