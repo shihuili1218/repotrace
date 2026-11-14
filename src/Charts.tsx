@@ -8,6 +8,10 @@ const axisNumber = (value: number) =>
     maximumFractionDigits: 1,
   }).format(value);
 
+const countCeiling = (maximum: number) => Math.max(4, Math.ceil(maximum / 4) * 4);
+const bucketLabel = (day: string, bucketDays: number) =>
+  bucketDays === 1 ? day : `${day} 起的分组 · 每 ${bucketDays} 天一组`;
+
 const activitySeries = [
   { key: 'added', label: 'Star 净新增用户', color: 'var(--chart-star, #d9b66f)' },
   { key: 'fork_new', label: '新增 Fork', color: 'var(--chart-fork, #60c9a5)' },
@@ -196,9 +200,11 @@ export function ActivityTrendChart({ history }: { history: Dashboard['history'] 
 export function TrendChart({
   history,
   markers = [],
+  bucketDays = 1,
 }: {
   history: Dashboard['history'];
   markers?: ReleaseRecord[];
+  bucketDays?: number;
 }) {
   const fillId = useId();
   const data = history.filter((p) => p.repos > 0);
@@ -210,15 +216,19 @@ export function TrendChart({
         <span>收到包含仓库总量的 Webhook 后显示趋势</span>
       </div>
     );
-  const max = Math.max(5, ...data.map((p) => p.total));
-  const ceiling = Math.ceil(max / 5) * 5;
+  const ceiling = countCeiling(Math.max(0, ...data.map((p) => p.total)));
   const point = (i: number, total: number) => [
     104 + (i / Math.max(1, data.length - 1)) * 656,
     196 - (total / ceiling) * 164,
   ];
   const line = data.map((p, i) => `${i ? 'L' : 'M'}${point(i, p.total).join(',')}`).join(' ');
   return (
-    <svg className="trend-svg" viewBox="0 0 800 242" role="img" aria-label="每日 Star 总数趋势图">
+    <svg
+      className="trend-svg"
+      viewBox="0 0 800 242"
+      role="img"
+      aria-label={bucketDays === 1 ? '每日 Star 总数趋势图' : `每 ${bucketDays} 天 Star 总数趋势图`}
+    >
       <defs>
         <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="var(--chart-primary, #5fcfa4)" stopOpacity=".12" />
@@ -229,7 +239,7 @@ export function TrendChart({
         <g key={i}>
           <line x1="104" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
           <text x="88" y={201 - i * 41} textAnchor="end" className="axis-label">
-            {axisNumber(Math.round((ceiling / 4) * i))}
+            {axisNumber((ceiling / 4) * i)}
           </text>
         </g>
       ))}
@@ -246,10 +256,13 @@ export function TrendChart({
         strokeLinecap="round"
       />
       {data.map((p, i) => {
+        const bucketStart = Date.parse(`${p.day}T00:00:00+08:00`) / 1000;
+        const bucketEnd = bucketStart + bucketDays * 86400;
         const releases = markers.filter(
-          (r) =>
-            r.published_at &&
-            new Date((r.published_at + 8 * 3600) * 1000).toISOString().slice(0, 10) === p.day,
+          (release) =>
+            release.published_at !== null &&
+            release.published_at >= bucketStart &&
+            release.published_at < bucketEnd,
         );
         return releases.length ? (
           <g key={`release-${p.day}`}>
@@ -289,7 +302,8 @@ export function TrendChart({
           strokeWidth="1.5"
         >
           <title>
-            {p.day} · {p.total.toLocaleString()} Stars · 已有 {p.repos} 个项目的上报数据
+            {bucketLabel(p.day, bucketDays)} · {p.total.toLocaleString()} Stars · 已有 {p.repos}{' '}
+            个项目的上报数据
           </title>
         </circle>
       ))}
@@ -312,14 +326,16 @@ export function TrendChart({
 export function ChangesChart({
   history,
   fullRange = false,
+  bucketDays = 1,
 }: {
   history: Dashboard['history'];
   fullRange?: boolean;
+  bucketDays?: number;
 }) {
   const data = fullRange ? history : history.slice(-14);
   const step = 320 / Math.max(1, data.length);
   const barWidth = Math.min(10, step * 0.65);
-  if (!data.some((p) => p.repos > 0))
+  if (!data.length)
     return (
       <div className="chart-empty compact">
         <Activity size={28} />
@@ -333,7 +349,7 @@ export function ChangesChart({
       className="changes-svg"
       viewBox="0 0 360 232"
       role="img"
-      aria-label={fullRange ? '区间 Star 新增与取消柱状图' : '近 14 天 Star 新增与取消柱状图'}
+      aria-label={`${fullRange ? '区间' : `近 ${14 * bucketDays} 天`} Star 新增与取消柱状图${bucketDays > 1 ? `（每 ${bucketDays} 天分组）` : ''}`}
     >
       {[42, 112, 182].map((y) => (
         <line key={y} x1="20" x2="340" y1={y} y2={y} className="grid-line" />
@@ -349,7 +365,7 @@ export function ChangesChart({
             fill="var(--chart-positive, #5fcfa4)"
           >
             <title>
-              {p.day} · 新增 {p.added}
+              {bucketLabel(p.day, bucketDays)} · 新增 {p.added}
             </title>
           </rect>
           <rect
@@ -361,7 +377,7 @@ export function ChangesChart({
             fill="var(--chart-negative, #d28d88)"
           >
             <title>
-              {p.day} · 取消 {p.removed}
+              {bucketLabel(p.day, bucketDays)} · 取消 {p.removed}
             </title>
           </rect>
           {(i === 0 || i === Math.floor((data.length - 1) / 2) || i === data.length - 1) && (
@@ -373,23 +389,34 @@ export function ChangesChart({
       ))}
       {!data.some((p) => p.added || p.removed) && (
         <text x="180" y="82" textAnchor="middle" className="axis-label">
-          所选时间内暂无每日变化
+          所选时间内暂无分组净变化
         </text>
       )}
     </svg>
   );
 }
 
-export function ForkChart({ history }: { history: Dashboard['history'] }) {
-  const max = Math.max(1, ...history.map((p) => p.fork_new));
+export function ForkChart({
+  history,
+  bucketDays = 1,
+}: {
+  history: Dashboard['history'];
+  bucketDays?: number;
+}) {
+  const ceiling = countCeiling(Math.max(0, ...history.map((p) => p.fork_new)));
   const step = 656 / Math.max(1, history.length);
   return (
-    <svg className="trend-svg" viewBox="0 0 800 242" role="img" aria-label="每日新增 Fork 趋势图">
+    <svg
+      className="trend-svg"
+      viewBox="0 0 800 242"
+      role="img"
+      aria-label={bucketDays === 1 ? '每日新增 Fork 趋势图' : `每 ${bucketDays} 天新增 Fork 趋势图`}
+    >
       {[0, 1, 2, 3, 4].map((i) => (
         <g key={i}>
           <line x1="104" x2="772" y1={196 - i * 41} y2={196 - i * 41} className="grid-line" />
           <text x="88" y={201 - i * 41} textAnchor="end" className="axis-label">
-            {axisNumber(Math.round((max * i) / 4))}
+            {axisNumber((ceiling * i) / 4)}
           </text>
         </g>
       ))}
@@ -397,14 +424,14 @@ export function ForkChart({ history }: { history: Dashboard['history'] }) {
         <rect
           key={p.day}
           x={104 + i * step + step * 0.18}
-          y={196 - (p.fork_new / max) * 164}
+          y={196 - (p.fork_new / ceiling) * 164}
           width={Math.max(1, step * 0.64)}
-          height={p.fork_new ? (p.fork_new / max) * 164 : 0}
+          height={p.fork_new ? (p.fork_new / ceiling) * 164 : 0}
           fill="var(--chart-primary, #5fcfa4)"
           rx="2"
         >
           <title>
-            {p.day} · 新增 {p.fork_new} Fork
+            {bucketLabel(p.day, bucketDays)} · 新增 {p.fork_new} Fork
           </title>
         </rect>
       ))}
@@ -433,9 +460,11 @@ export function ForkChart({ history }: { history: Dashboard['history'] }) {
 export function WorkChart({
   history,
   mode,
+  bucketDays = 1,
 }: {
   history: Dashboard['history'];
   mode: 'issues' | 'pull_requests';
+  bucketDays?: number;
 }) {
   const series =
     mode === 'issues'
@@ -452,8 +481,7 @@ export function WorkChart({
             color: 'var(--chart-secondary, #b1b4bc)',
           },
         ];
-  const ceiling =
-    Math.ceil(Math.max(4, ...history.flatMap((p) => series.map((s) => p[s.key]))) / 4) * 4;
+  const ceiling = countCeiling(Math.max(0, ...history.flatMap((p) => series.map((s) => p[s.key]))));
   const step = 656 / Math.max(1, history.length);
   const width = Math.min(14, (step * 0.75) / series.length);
   return (
@@ -462,7 +490,7 @@ export function WorkChart({
         className="trend-svg"
         viewBox="0 0 800 242"
         role="img"
-        aria-label={`${mode === 'issues' ? 'Issue' : 'PR'} 每日变化图`}
+        aria-label={`${mode === 'issues' ? 'Issue' : 'PR'} ${bucketDays === 1 ? '每日' : `每 ${bucketDays} 天`}变化图`}
       >
         {[0, 1, 2, 3, 4].map((i) => (
           <g key={i}>
@@ -484,7 +512,7 @@ export function WorkChart({
               rx="2"
             >
               <title>
-                {p.day} · {s.label} {p[s.key]}
+                {bucketLabel(p.day, bucketDays)} · {s.label} {p[s.key]}
               </title>
             </rect>
           )),

@@ -160,7 +160,10 @@ test('ranks every collected version with exact large counts and keeps unknown sh
     }),
   );
   await page.getByLabel('项目统计时间').selectOption('7');
-  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await expect(rows).toHaveCount(2);
   await expect(rows.first()).toContainText('newer');
   await expect(rows.first()).toContainText((huge + 1n).toLocaleString('zh-CN'));
@@ -168,13 +171,19 @@ test('ranks every collected version with exact large counts and keeps unknown sh
 
   mode = 'zero';
   await page.getByLabel('项目统计时间').selectOption('90');
-  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await expect(rows.locator('.version-download-value > strong')).toHaveText(['0', '0']);
   await expect(rows.locator('.version-download-value > span')).toHaveText(['—', '—']);
 
   mode = 'unknown';
   await page.getByLabel('项目统计时间').selectOption('30');
-  await page.getByRole('tab', { name: 'Release', exact: true }).click();
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await expect(rows.locator('.version-download-value > strong')).toHaveText(['10', '—']);
   await expect(rows.locator('.version-download-value > span')).toHaveText(['—', '—']);
   for (const width of [1440, 768, 390]) {
@@ -207,4 +216,68 @@ test('opens every managed project from the sidebar after an overview filter', as
   await page.getByRole('button', { name: '管理全部项目', exact: true }).click();
   await expect(page.getByLabel('选择项目', { exact: true })).toHaveValue('');
   await expect(page.locator('.repo-management .repo-card')).toHaveCount(8);
+});
+
+test('keeps the selected monitor when changing days or Release boundaries', async ({ page }) => {
+  const errors: string[] = [];
+  const monitoringRequests: URL[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === '/api/monitoring') monitoringRequests.push(url);
+  });
+  await installDesignFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: '项目数据', exact: true }).click();
+  for (const [tab, type, days, heading] of [
+    ['Issue', 'issues', '7', 'Issue 跟踪'],
+    ['Pull Request', 'pull_requests', '90', 'PR 跟踪'],
+    ['Release', 'releases', '30', '版本下载排行'],
+  ]) {
+    await page.getByRole('tab', { name: tab, exact: true }).click();
+    await page.getByRole('heading', { name: heading, exact: true }).waitFor();
+    await page.getByLabel('项目统计时间').selectOption(days);
+    await expect(page.getByRole('tab', { name: tab, exact: true })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+    await expect(page.locator('.range-description')).toContainText(`近 ${days} 天`);
+    await expect
+      .poll(() => {
+        const parameters = monitoringRequests.at(-1)?.searchParams;
+        return `${parameters?.get('type')}/${parameters?.get('days')}`;
+      })
+      .toBe(`${type}/${days}`);
+  }
+  await page.getByLabel('项目统计时间').selectOption('releases');
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(page.getByRole('heading', { name: '版本下载排行', exact: true })).toBeVisible();
+  await expect.poll(() => monitoringRequests.at(-1)?.searchParams.get('range')).toBe('releases');
+  await page.getByLabel('起始 Release').selectOption('403');
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect.poll(() => monitoringRequests.at(-1)?.searchParams.get('fromRelease')).toBe('403');
+  const end = await page.getByLabel('结束 Release').inputValue();
+  await page.getByLabel('起始 Release').selectOption(end);
+  await expect(page.getByText('请选择两个发布时间不同的 Release。', { exact: true })).toBeVisible();
+  await page.getByLabel('起始 Release').selectOption('403');
+  await expect(page.getByRole('tab', { name: 'Release', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(page.getByRole('heading', { name: '版本下载排行', exact: true })).toBeVisible();
+  await page.locator('.sidebar').getByTitle('shihuili1218/repotrace', { exact: true }).click();
+  await expect(page.getByLabel('项目数据选择项目')).toHaveValue('repotrace');
+  await expect(page.getByLabel('项目统计时间')).toHaveValue('30');
+  await expect(page.getByRole('tab', { name: 'Star', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  expect(errors).toEqual([]);
 });

@@ -317,6 +317,9 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [mobileNav, setMobileNav] = useState(false);
   const [sidebarSearch, setSidebarSearch] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  const navigationReturnFocus = useRef<HTMLElement | null>(null);
   const [data, setData] = useState<Dashboard | null>(null);
   const [repo, setRepo] = useState('');
   const [projectRepo, setProjectRepo] = useState('');
@@ -332,6 +335,12 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const requestId = useRef(0);
+  function openNavigation() {
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && !sidebarRef.current?.contains(focused))
+      navigationReturnFocus.current = focused;
+    setMobileNav(true);
+  }
   useEffect(() => {
     const focusSearch = (event: KeyboardEvent) => {
       if (
@@ -341,12 +350,62 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       )
         return;
       event.preventDefault();
-      if (window.matchMedia('(max-width: 800px)').matches) setMobileNav(true);
+      if (window.matchMedia('(max-width: 800px)').matches) openNavigation();
       requestAnimationFrame(() => searchRef.current?.focus());
     };
     window.addEventListener('keydown', focusSearch);
     return () => window.removeEventListener('keydown', focusSearch);
   }, []);
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 800px)');
+    const closeOnDesktop = () => {
+      if (!media.matches) setMobileNav(false);
+    };
+    media.addEventListener('change', closeOnDesktop);
+    return () => media.removeEventListener('change', closeOnDesktop);
+  }, []);
+  useEffect(() => {
+    if (!mobileNav) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    searchRef.current?.focus();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setMobileNav(false);
+      } else if (event.key === 'Tab') {
+        const controls = Array.from(
+          sidebarRef.current?.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), a[href], input:not(:disabled), [tabindex="0"]',
+          ) ?? [],
+        ).filter((element) => element.getClientRects().length > 0);
+        const first = controls[0];
+        const last = controls.at(-1);
+        if (!sidebarRef.current?.contains(document.activeElement)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first)?.focus();
+        } else if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('keydown', handleKey);
+      document.body.style.overflow = previousOverflow;
+      const previousFocus = navigationReturnFocus.current;
+      const target =
+        previousFocus && previousFocus !== document.body && previousFocus.isConnected
+          ? previousFocus
+          : menuRef.current;
+      if (target?.getClientRects().length) target.focus({ preventScroll: true });
+      else searchRef.current?.focus({ preventScroll: true });
+    };
+  }, [mobileNav]);
   const refresh = useCallback(async () => {
     const id = ++requestId.current;
     try {
@@ -412,12 +471,29 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
       {mobileNav && (
         <button
           className="nav-backdrop"
-          aria-label="关闭导航"
+          aria-hidden="true"
+          tabIndex={-1}
           onClick={() => setMobileNav(false)}
         />
       )}
-      <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
-        <Logo />
+      <aside
+        ref={sidebarRef}
+        id="workspace-navigation"
+        className={`sidebar ${mobileNav ? 'open' : ''}`}
+        role={mobileNav ? 'dialog' : undefined}
+        aria-modal={mobileNav ? true : undefined}
+        aria-label="工作空间导航"
+      >
+        <div className="sidebar-header">
+          <Logo />
+          <button
+            className="icon-button mobile-nav-close"
+            aria-label="关闭导航"
+            onClick={() => setMobileNav(false)}
+          >
+            <X size={18} />
+          </button>
+        </div>
         <label className="sidebar-search">
           <Search size={18} />
           <input
@@ -440,7 +516,8 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               className={`nav-item ${view === item.view ? 'active' : ''}`}
               aria-current={view === item.view ? 'page' : undefined}
               onClick={() => {
-                if (item.view === 'data' && !projectRepo && repo) setProjectRepo(repo);
+                if (item.view === 'data' && !projectRepo)
+                  setProjectRepo(repo || repositories[0]?.id || '');
                 setView(item.view);
                 setPage(1);
                 setMobileNav(false);
@@ -545,13 +622,16 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           </div>
         </div>
       </aside>
-      <div className="main-shell">
+      <div className="main-shell" inert={mobileNav}>
         <header className="topbar">
           <div>
             <button
+              ref={menuRef}
               className="icon-button mobile-menu"
               aria-label="打开导航"
-              onClick={() => setMobileNav(true)}
+              aria-expanded={mobileNav}
+              aria-controls="workspace-navigation"
+              onClick={openNavigation}
             >
               <Menu size={21} />
             </button>
@@ -926,7 +1006,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
         </Dialog>
       )}
       {toast && (
-        <div className="toast" role="status">
+        <div className="toast" role="status" inert={mobileNav}>
           <CheckCircle2 size={18} />
           {toast}
           <button className="icon-button" aria-label="关闭通知" onClick={() => setToast('')}>

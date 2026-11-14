@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, FolderGit2 } from 'lucide-react';
-import type { Dashboard, RepoSummary, ReleaseBoundary } from '../shared/types';
+import type { Dashboard, MonitorType, RepoSummary, ReleaseBoundary } from '../shared/types';
 import { api } from './api';
 import { Monitoring } from './Monitoring';
 import { ScheduledReleaseNote } from './ScheduledReleaseNote';
@@ -24,6 +24,7 @@ export function ProjectData({
   onProjectChange: (value: string) => void;
 }) {
   const [mode, setMode] = useState<'days' | 'releases'>('days');
+  const [monitorType, setMonitorType] = useState<MonitorType>('stars');
   const [days, setDays] = useState(30);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -254,6 +255,8 @@ export function ProjectData({
           </div>
           <Monitoring
             key={projectId}
+            type={monitorType}
+            onTypeChange={setMonitorType}
             repo={projectId}
             days={days}
             metrics={data.metrics}

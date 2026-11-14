@@ -165,6 +165,8 @@ function ItemState({ item }: { item: WorkItem }) {
 
 export function Monitoring({
   repo,
+  type,
+  onTypeChange,
   days,
   metrics,
   history,
@@ -173,6 +175,8 @@ export function Monitoring({
   rangeQuery,
 }: {
   repo: string;
+  type: MonitorType;
+  onTypeChange: (type: MonitorType) => void;
   days: number;
   metrics: MonitorMetrics;
   history: Dashboard['history'];
@@ -180,7 +184,6 @@ export function Monitoring({
   dashboard: Dashboard;
   rangeQuery: string;
 }) {
-  const [type, setType] = useState<MonitorType>('stars');
   const [state, setState] = useState('all');
   const [starMode, setStarMode] = useState('net');
   const [starKind, setStarKind] = useState('all');
@@ -289,7 +292,7 @@ export function Monitoring({
               setAutoAsset(true);
               setAssetId(null);
             }
-            setType(tab.id);
+            onTypeChange(tab.id);
             setState('all');
             setLabel('');
             setPage(1);
@@ -407,18 +410,23 @@ export function Monitoring({
               </p>
             </div>
           </div>
-          <ForkChart history={history} />
+          <ForkChart history={history} bucketDays={dashboard.range.bucketDays} />
         </section>
       )}
       {(type === 'issues' || type === 'pull_requests') && (
         <section className="panel module-chart">
           <div className="panel-header">
             <div>
-              <h2>{type === 'issues' ? 'Issue 每日变化' : 'PR 每日变化'}</h2>
+              <h2>
+                {type === 'issues' ? 'Issue' : 'PR'}{' '}
+                {dashboard.range.bucketDays === 1
+                  ? '每日变化'
+                  : `每 ${dashboard.range.bucketDays} 天变化`}
+              </h2>
               <p>{grouping} · 统计发生过对应操作的条目</p>
             </div>
           </div>
-          <WorkChart history={history} mode={type} />
+          <WorkChart history={history} mode={type} bucketDays={dashboard.range.bucketDays} />
         </section>
       )}
       <section className="panel" aria-label={type === 'releases' ? 'Release 版本' : undefined}>
@@ -666,7 +674,9 @@ export function Monitoring({
                                   {stateLabels[w.review_state] ?? w.review_state}
                                 </span>
                               ) : (
-                                <span className="muted">待评审</span>
+                                <span className="muted">
+                                  {w.state === 'open' && !w.draft ? '待评审' : '无已记录评审'}
+                                </span>
                               )}
                             </td>
                             <td>
@@ -880,7 +890,11 @@ function StarStatistics({
               <p>{dashboard.range.label} · 结束时刻之前最近上报值</p>
             </div>
           </div>
-          <TrendChart history={dashboard.history} markers={dashboard.releaseMarkers} />
+          <TrendChart
+            history={dashboard.history}
+            markers={dashboard.releaseMarkers}
+            bucketDays={dashboard.range.bucketDays}
+          />
           <div className="chart-legend">
             <span>
               <i className="legend-dot purple" />
@@ -900,7 +914,11 @@ function StarStatistics({
               </p>
             </div>
           </div>
-          <ChangesChart history={dashboard.history} fullRange />
+          <ChangesChart
+            history={dashboard.history}
+            fullRange
+            bucketDays={dashboard.range.bucketDays}
+          />
           <div className="chart-legend">
             <span>
               <i className="legend-dot green" />
