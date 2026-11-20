@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { DownloadSummary } from '../shared/types';
+import { ChartSvg } from './ChartSvg';
 
 export interface DownloadPoint {
   id: string;
@@ -95,7 +96,7 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
         <p>每次采集与上一次采集的差值 · 首次记录作为对比基准</p>
       </figcaption>
       <div className="metric-chart-plot download-growth-scroll">
-        <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="下载量增量图">
+        <ChartSvg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="下载量增量图">
           {ticks.map((tick) => (
             <g key={String(tick)}>
               <line
@@ -131,7 +132,7 @@ function DownloadDelta({ history }: { history: DownloadSummary['history'] }) {
             </rect>
           ))}
           <DownloadTimeAxis first={first} duration={duration} />
-        </svg>
+        </ChartSvg>
       </div>
       <div className="metric-chart-footer">
         <label className="download-growth-control">
@@ -205,7 +206,12 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
         </p>
       </figcaption>
       <div className="metric-chart-plot download-growth-scroll">
-        <svg className="trend-svg" viewBox="0 0 480 250" role="img" aria-label="总下载量增长图">
+        <ChartSvg
+          className="trend-svg"
+          viewBox="0 0 480 250"
+          role="img"
+          aria-label="总下载量增长图"
+        >
           {ticks.map((tick) => {
             const y = span ? 196 - Number((tick * 164000n) / span) / 1000 : 114;
             return (
@@ -243,7 +249,7 @@ function DownloadTotal({ history: data }: { history: DownloadSummary['history'] 
             </circle>
           ))}
           <DownloadTimeAxis first={first} duration={duration} />
-        </svg>
+        </ChartSvg>
       </div>
       <div className="metric-chart-footer">
         {data.length > 1 ? (

@@ -845,7 +845,7 @@ svg.lucide {
 }
 .axis-label {
   fill: var(--muted);
-  font: 12px var(--mono);
+  font: var(--chart-axis-size, 12px) var(--mono);
 }
 .grid-line {
   stroke: #ffffff0c;
@@ -1231,11 +1231,6 @@ td small {
   min-height: 0;
   max-height: none;
   padding: 0;
-}
-.metric-chart-plot .axis-label,
-.count-trend-svg .axis-label,
-.changes-svg .axis-label {
-  font-size: 14px;
 }
 .metric-chart-footer {
   min-width: 0;
@@ -2357,9 +2352,6 @@ article .hook-timestamp {
     min-height: 0;
     padding: 0;
   }
-  .activity-trend-svg .axis-label {
-    font-size: 25px;
-  }
   .activity-trend-legend {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 8px 16px 16px;
@@ -2579,9 +2571,6 @@ article .hook-timestamp {
     min-height: 0;
     padding: 8px 0;
   }
-  .trend-svg .axis-label {
-    font-size: 25px;
-  }
   .primary-chart .trend-svg {
     margin-top: 16px;
   }
@@ -2738,14 +2727,6 @@ article .hook-timestamp {
   .panel > .count-trend-chart .count-axis-note {
     margin-right: 16px;
     margin-left: 16px;
-  }
-  .download-growth .axis-label {
-    font-size: 18px;
-  }
-  .metric-chart-plot .axis-label,
-  .count-trend-svg .axis-label,
-  .changes-svg .axis-label {
-    font-size: 18px;
   }
   .download-time-middle {
     display: none;

@@ -1,6 +1,7 @@
 import { useId, useState } from 'react';
 import { Activity, ChartNoAxesCombined } from 'lucide-react';
 import type { Dashboard, ReleaseRecord } from '../shared/types';
+import { ChartSvg } from './ChartSvg';
 
 const axisNumber = (value: number) =>
   new Intl.NumberFormat('zh-CN', {
@@ -50,7 +51,7 @@ export function ActivityTrendChart({ history }: { history: Dashboard['history'] 
 
   return (
     <figure className="activity-trend" aria-label="每日项目活动趋势">
-      <svg
+      <ChartSvg
         className="activity-trend-svg"
         viewBox="0 0 800 316"
         role="img"
@@ -162,7 +163,7 @@ export function ActivityTrendChart({ history }: { history: Dashboard['history'] 
             所选时间内尚未记录这四类变化
           </text>
         )}
-      </svg>
+      </ChartSvg>
       <div className="activity-trend-legend" aria-label="所选日期的各类活动">
         {activitySeries.map((series) => (
           <span key={series.key}>
@@ -281,7 +282,7 @@ export function CountTrendChart({
 
   return (
     <div className="count-trend-chart">
-      <svg
+      <ChartSvg
         className="trend-svg count-trend-svg"
         viewBox="0 0 480 250"
         role="img"
@@ -397,7 +398,7 @@ export function CountTrendChart({
             {data[i].day.slice(5).replace('-', '/')}
           </text>
         ))}
-      </svg>
+      </ChartSvg>
       <p id={`${chartId}-axis-note`} className="count-axis-note">
         {axisNote}
       </p>
@@ -453,7 +454,7 @@ export function ChangesChart({
     );
   const max = Math.max(1, ...data.flatMap((p) => [p.added, p.removed]));
   return (
-    <svg
+    <ChartSvg
       className="changes-svg"
       viewBox="0 0 480 250"
       role="img"
@@ -500,7 +501,7 @@ export function ChangesChart({
           所选时间内暂无分组净变化
         </text>
       )}
-    </svg>
+    </ChartSvg>
   );
 }
 
@@ -514,7 +515,7 @@ export function ForkChart({
   const ceiling = countCeiling(Math.max(0, ...history.map((p) => p.fork_new)));
   const step = 380 / Math.max(1, history.length);
   return (
-    <svg
+    <ChartSvg
       className="trend-svg"
       viewBox="0 0 480 250"
       role="img"
@@ -561,7 +562,7 @@ export function ForkChart({
           所选时间内尚未记录到新增 Fork
         </text>
       )}
-    </svg>
+    </ChartSvg>
   );
 }
 
@@ -594,7 +595,7 @@ export function WorkChart({
   const width = Math.min(14, (step * 0.75) / series.length);
   return (
     <>
-      <svg
+      <ChartSvg
         className="trend-svg"
         viewBox="0 0 480 250"
         role="img"
@@ -643,7 +644,7 @@ export function WorkChart({
             所选时间内暂无对应变化
           </text>
         )}
-      </svg>
+      </ChartSvg>
       <div className="chart-legend">
         <span>
           <i className="legend-dot" style={{ background: series[0].color }} />
